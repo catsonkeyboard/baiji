@@ -1,0 +1,14 @@
+{
+  "llm": {
+    "provider": "MODEL_PROVIDER",
+    "base_url": "BASE_URL",
+    "api_key": "YOUR_API_KEY",
+    "model": "MODEL_NAME",
+    "max_tokens": 4096,
+    "temperature": 0.7
+  },
+  "ui": {
+    "theme": "dark",
+    "show_thoughts": false
+  }
+}
