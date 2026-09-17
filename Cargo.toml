@@ -1,46 +1,95 @@
-[package]
-name = "baiji"
-version = "0.1.0"
+[workspace]
+resolver = "2"
+members = [
+    "crates/baiji-telemetry",
+    "crates/baiji-ai",
+    "crates/baiji-agent",
+    "crates/baiji-tools",
+    "crates/baiji-harness",
+    "crates/baiji-extensions",
+    "crates/baiji-tui",
+]
+
+[workspace.package]
+version = "0.2.0"
 edition = "2024"
 authors = ["catsonkeyboard <leemeany@gmail.com>"]
-description = "A terminal-based AI chat client with ReAct Agent support and MCP integration"
+description = "A terminal AI Agent client: async streaming runtime, multi-vendor providers, coding tools"
+license = "MIT"
+
+[workspace.dependencies]
+baiji-telemetry = { path = "crates/baiji-telemetry" }
+baiji-ai = { path = "crates/baiji-ai" }
+baiji-agent = { path = "crates/baiji-agent" }
+baiji-tools = { path = "crates/baiji-tools" }
+baiji-harness = { path = "crates/baiji-harness" }
+baiji-extensions = { path = "crates/baiji-extensions" }
+baiji-tui = { path = "crates/baiji-tui" }
+
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.13", features = ["json", "stream"] }
+eventsource-stream = "0.2"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+async-trait = "0.1"
+tokio-util = "0.7"
+regex = "1"
+sha2 = "0.10"
+tree-sitter = "0.25"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.23"
+chrono = { version = "0.4", features = ["serde"] }
+ratatui = "0.30"
+crossterm = "0.29"
+dirs = "6"
+unicode-width = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+tempfile = "3"
+libc = "0.2"
+
+[package]
+name = "baiji"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "baiji"
 path = "src/main.rs"
 
 [dependencies]
-# Async runtime
-tokio = { version = "1", features = ["full"] }
+baiji-agent = { workspace = true }
+baiji-ai = { workspace = true }
+baiji-extensions = { workspace = true }
+baiji-harness = { workspace = true }
+baiji-telemetry = { workspace = true }
+baiji-tools = { workspace = true }
+baiji-tui = { workspace = true }
 
-# Terminal UI
-ratatui = "0.30"
-crossterm = "0.29"
-
-# HTTP and SSE
-reqwest = { version = "0.13", features = ["json", "stream"] }
-eventsource-stream = "0.2"
-futures = "0.3"
-
-# Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-# Error handling
-thiserror = "2"
-anyhow = "1"
-
-# Utilities
-dirs = "6"
-async-trait = "0.1"
-tokio-stream = "0.1"
-tokio-util = "0.7"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
-regex = "1"
-chrono = { version = "0.4", features = ["serde"] }
-unicode-width = "0.2"
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+regex = { workspace = true }
+dirs = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }

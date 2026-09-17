@@ -1,0 +1,451 @@
+//! bash 工具：在 workdir 中执行 shell 命令（带超时与输出截断）
+
+use anyhow::Result;
+use async_trait::async_trait;
+use baiji_agent::{AgentTool, ToolOutput};
+use serde_json::Value;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::process::Command;
+
+use crate::env::ExecutionEnv;
+
+/// 单条命令允许的最大超时
+const MAX_TIMEOUT_MS: u64 = 300_000;
+/// 每个输出流在内存中最多保留的字节数（超出部分读走即丢，防止 `yes` 类命令撑爆内存）
+const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
+/// 主进程退出后等待管道读空的宽限期。后台子进程（`server &`）会一直持有管道，
+/// 不能等 EOF，否则调用会挂到超时
+const PIPE_DRAIN_GRACE: Duration = Duration::from_millis(300);
+
+/// 有上限的流捕获：持续读取（避免子进程因管道写满而阻塞），只保留前 `MAX_CAPTURE_BYTES`
+#[derive(Default)]
+struct Captured {
+    data: Vec<u8>,
+    total: usize,
+}
+
+type SharedCapture = Arc<std::sync::Mutex<Captured>>;
+
+fn spawn_capture<R>(reader: Option<R>) -> (SharedCapture, tokio::task::JoinHandle<()>)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    use tokio::io::AsyncReadExt;
+    let shared: SharedCapture = Arc::default();
+    let sink = shared.clone();
+    let handle = tokio::spawn(async move {
+        let Some(mut reader) = reader else { return };
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let mut captured = sink.lock().unwrap();
+                    captured.total += n;
+                    let room = MAX_CAPTURE_BYTES.saturating_sub(captured.data.len());
+                    captured.data.extend_from_slice(&buf[..n.min(room)]);
+                }
+            }
+        }
+    });
+    (shared, handle)
+}
+
+/// 等读取任务在宽限期内结束；超时则放弃（后台进程仍持有管道），取已读到的内容
+async fn finish_capture(
+    shared: SharedCapture,
+    mut handle: tokio::task::JoinHandle<()>,
+    grace: Duration,
+) -> (String, usize) {
+    if tokio::time::timeout(grace, &mut handle).await.is_err() {
+        handle.abort();
+    }
+    let captured = shared.lock().unwrap();
+    let mut text = String::from_utf8_lossy(&captured.data).into_owned();
+    if captured.total > captured.data.len() {
+        text.push_str(&format!(
+            "\n[output capped: kept first {} of {} bytes]",
+            captured.data.len(),
+            captured.total
+        ));
+    }
+    (text, captured.total)
+}
+
+/// 进程组击杀守卫：超时、或 future 被丢弃（取消）时 SIGKILL 整个进程组，
+/// 连同 `npm test` 这类命令派生的孙进程一起清理。正常退出后 disarm——
+/// 用户有意放到后台的进程不受影响。
+struct GroupKillGuard(Option<u32>);
+
+impl GroupKillGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for GroupKillGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.0 {
+            // SAFETY: killpg 只发送信号；pgid 来自我们以 process_group(0) 启动的子进程
+            unsafe {
+                libc::killpg(pgid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// 压缩 shell 输出（启发式规则）：
+/// - 删除进度/噪声行（spinner、进度条、npm reify、纯符号行）
+/// - 连续重复行折叠为一次 + `⟨… repeated N×⟩`（编译警告的经典形态）
+/// - 连续空行折叠为单空行
+pub(crate) fn compress_shell_output(output: &str) -> String {
+    let mut result: Vec<String> = Vec::new();
+    let mut prev: Option<String> = None;
+    let mut repeat = 0usize;
+
+    fn flush(result: &mut Vec<String>, prev: &Option<String>, repeat: usize) {
+        if let Some(p) = prev {
+            result.push(p.clone());
+            // 空行的折叠不加标记（本身无信息量）
+            if repeat > 1 && !p.trim().is_empty() {
+                result.push(format!("⟨… repeated {repeat}×⟩"));
+            }
+        }
+    }
+
+    for line in output.lines() {
+        if is_noise_line(line) {
+            continue;
+        }
+        let normalized = line.trim_end().to_string();
+        if Some(&normalized) == prev.as_ref() {
+            repeat += 1;
+        } else {
+            flush(&mut result, &prev, repeat);
+            prev = Some(normalized);
+            repeat = 1;
+        }
+    }
+    flush(&mut result, &prev, repeat);
+    result.join("\n")
+}
+
+/// 进度/噪声行判定。**宁可漏删也不误删**：测试汇总（`FAILED 3/12 tests`）、
+/// diff 分隔线（`---`）、Markdown/表格线都是模型需要的信息。
+/// 只删"整行除了进度什么都没有"的行。
+fn is_noise_line(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() {
+        return false; // 空行保留（由折叠逻辑处理）
+    }
+    let is_braille = |c: char| ('\u{2800}'..='\u{28FF}').contains(&c);
+    let is_block = |c: char| matches!(c, '█' | '▓' | '▒' | '░' | '▏' | '▎' | '▍' | '▌' | '▋' | '▊' | '▉');
+
+    // 纯 spinner / 方块进度条（必须含 braille 或方块字符；`---`、`===`、`...` 不算）
+    if t.chars().any(|c| is_braille(c) || is_block(c))
+        && t.chars().all(|c| is_braille(c) || is_block(c) || matches!(c, ' ' | '|' | '[' | ']'))
+    {
+        return true;
+    }
+    // spinner 帧行：以 braille 转轮字符开头 + 空格 + 文本
+    if let Some(rest) = t.strip_prefix(is_braille) {
+        if rest.starts_with(' ') {
+            return true;
+        }
+    }
+    // npm 安装进度
+    if t.starts_with("reify:") {
+        return true;
+    }
+    // ASCII 进度条行："[====>    ] 45%"、"[####  ] 12/26"
+    if let (Some(open), Some(close)) = (t.find('['), t.find(']')) {
+        let bar = t.get(open + 1..close).unwrap_or("");
+        if bar.len() >= 3 && bar.chars().all(|c| matches!(c, '=' | '>' | '#' | '-' | '.' | ' ')) {
+            return true;
+        }
+    }
+    // 整行只由进度 token 组成："45%"、"12/26"、"45% 12/26"。
+    // 含任何其它单词（FAILED / passed / 日期上下文）的行一律保留。
+    let is_progress_token = |tok: &str| {
+        let digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit() || c == '.');
+        tok.strip_suffix('%').is_some_and(digits)
+            || tok.split_once('/').is_some_and(|(a, b)| digits(a) && digits(b))
+    };
+    t.split_whitespace().all(is_progress_token)
+}
+
+pub struct BashTool {
+    env: Arc<ExecutionEnv>,
+}
+
+impl BashTool {
+    pub fn new(env: Arc<ExecutionEnv>) -> Self {
+        Self { env }
+    }
+}
+
+#[async_trait]
+impl AgentTool for BashTool {
+    fn name(&self) -> &str {
+        "bash"
+    }
+
+    fn description(&self) -> &str {
+        "Execute a shell command in the working directory. Returns exit code, stdout and stderr. \
+         Commands are killed after a timeout (default 30s)."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "Shell command to execute"},
+                "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds (default 30000, max 300000)"}
+            },
+            "required": ["command"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<ToolOutput> {
+        let Some(command) = args["command"].as_str() else {
+            return Ok(ToolOutput::err("[Error] missing required argument 'command'"));
+        };
+        let timeout_ms = args["timeout_ms"]
+            .as_u64()
+            .unwrap_or(self.env.command_timeout.as_millis() as u64)
+            .min(MAX_TIMEOUT_MS);
+        let timeout = Duration::from_millis(timeout_ms.max(1));
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(command)
+            .current_dir(&self.env.workdir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        // 独立进程组：超时/取消时可整组击杀，不残留孙进程
+        #[cfg(unix)]
+        cmd.process_group(0);
+        cmd.kill_on_drop(true);
+
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => return Ok(ToolOutput::err(format!("[Error] spawning command: {e}"))),
+        };
+        let mut guard = GroupKillGuard(child.id());
+        let (out_buf, out_task) = spawn_capture(child.stdout.take());
+        let (err_buf, err_task) = spawn_capture(child.stderr.take());
+
+        // 等主进程退出（而不是等管道 EOF：后台子进程会一直持有管道）
+        let status = match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(e)) => return Ok(ToolOutput::err(format!("[Error] waiting for command: {e}"))),
+            Err(_) => {
+                drop(guard); // SIGKILL 整个进程组
+                child.wait().await.ok(); // 回收，避免僵尸进程
+                let (stdout, _) = finish_capture(out_buf, out_task, PIPE_DRAIN_GRACE).await;
+                let (stderr, _) = finish_capture(err_buf, err_task, PIPE_DRAIN_GRACE).await;
+                let mut message = format!(
+                    "[Timeout] command killed after {}ms: {}",
+                    timeout_ms, command
+                );
+                for (label, text) in [("stdout", stdout), ("stderr", stderr)] {
+                    let text = compress_shell_output(&text);
+                    if !text.is_empty() {
+                        message.push_str(&format!("\n\n[partial {label}]\n{text}"));
+                    }
+                }
+                return Ok(ToolOutput::err(self.env.truncate_output(&message)));
+            }
+        };
+        guard.disarm();
+
+        let (stdout, stdout_total) = finish_capture(out_buf, out_task, PIPE_DRAIN_GRACE).await;
+        let (stderr, stderr_total) = finish_capture(err_buf, err_task, PIPE_DRAIN_GRACE).await;
+        let original_bytes = stdout_total + stderr_total;
+
+        // 输出压缩：噪声行过滤 + 连续重复行折叠
+        let stdout = compress_shell_output(&stdout);
+        let stderr = compress_shell_output(&stderr);
+
+        let mut combined = format!("exit: {}\n", status.code().unwrap_or(-1));
+        if !stdout.is_empty() {
+            combined.push_str(&format!("\n[stdout]\n{stdout}"));
+        }
+        if !stderr.is_empty() {
+            combined.push_str(&format!("\n[stderr]\n{stderr}"));
+        }
+
+        let (delivered, truncated_at) = self.env.truncate_with_meta(&combined);
+        // 规则折叠或截断任一生效都计入台账原始字节
+        let original = truncated_at.unwrap_or(original_bytes as u64);
+        let mut result = if (delivered.len() as u64) < original {
+            ToolOutput::ok(delivered).with_original_bytes(original)
+        } else {
+            ToolOutput::ok(delivered)
+        };
+        result.is_error = !status.success();
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_bash_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = BashTool::new(Arc::new(ExecutionEnv::new(dir.path())));
+
+        let out = tool
+            .execute(serde_json::json!({"command": "echo hello && echo err >&2"}))
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(out.content.contains("exit: 0"));
+        assert!(out.content.contains("hello"));
+        assert!(out.content.contains("err"));
+    }
+
+    #[tokio::test]
+    async fn test_bash_nonzero_exit_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = BashTool::new(Arc::new(ExecutionEnv::new(dir.path())));
+
+        let out = tool
+            .execute(serde_json::json!({"command": "exit 3"}))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("exit: 3"));
+    }
+
+    #[tokio::test]
+    async fn test_bash_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = BashTool::new(Arc::new(ExecutionEnv::new(dir.path())));
+
+        let out = tool
+            .execute(serde_json::json!({"command": "sleep 5", "timeout_ms": 100}))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("[Timeout]"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_bash_timeout_kills_grandchildren() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = BashTool::new(Arc::new(ExecutionEnv::new(dir.path())));
+
+        // 子 shell 里的孙进程 2 秒后写标记文件；超时击杀整个进程组后它不应存活
+        let out = tool
+            .execute(serde_json::json!({
+                "command": "(sleep 2; touch survived) & wait",
+                "timeout_ms": 200
+            }))
+            .await
+            .unwrap();
+        assert!(out.content.contains("[Timeout]"));
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(!dir.path().join("survived").exists(), "grandchild survived timeout");
+    }
+
+    #[tokio::test]
+    async fn test_bash_background_process_does_not_hang() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = BashTool::new(Arc::new(ExecutionEnv::new(dir.path())));
+
+        // 后台进程继承并持有 stdout；调用应在主 shell 退出后很快返回
+        let started = std::time::Instant::now();
+        let out = tool
+            .execute(serde_json::json!({"command": "sleep 20 & echo started"}))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("started"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn test_bash_output_is_capped_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = BashTool::new(Arc::new(ExecutionEnv::new(dir.path())));
+
+        // ~4MB 不重复输出：内存只保留 1MB，并标注总量
+        let out = tool
+            .execute(serde_json::json!({"command": "seq 1 600000"}))
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(out.original_bytes.unwrap() > MAX_CAPTURE_BYTES as u64);
+    }
+
+    #[tokio::test]
+    async fn test_bash_output_compression_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = BashTool::new(Arc::new(ExecutionEnv::new(dir.path())));
+
+        // 连续重复行（编译警告形态）+ 噪声行
+        let script = "printf 'warning: unused var\\nwarning: unused var\\nwarning: unused var\\nreify:iterables@2.0.2\\n45%% 12/26\\nok\\n'";
+        let out = tool
+            .execute(serde_json::json!({"command": script}))
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        // 重复折叠（3 次相同行）
+        assert!(out.content.contains("⟨… repeated 3×⟩"), "{}", out.content);
+        // 噪声行被删
+        assert!(!out.content.contains("reify:"));
+        assert!(!out.content.contains("12/26"));
+        // 台账记录了原始字节
+        assert!(out.original_bytes.is_some());
+        assert!(out.bytes_saved() > 0);
+    }
+
+    #[test]
+    fn test_compress_shell_output_rules() {
+        // 连续重复折叠（3 行相同 → 1 行 + 总次数标记）
+        let input = "A\nA\nA\nB\n";
+        assert_eq!(compress_shell_output(input), "A\n⟨… repeated 3×⟩\nB");
+
+        // 噪声行删除
+        let input = "⠋ building\n⠙ building\nreal line";
+        assert_eq!(compress_shell_output(input), "real line");
+
+        // 空行折叠（连续多个空行 → 单个）
+        let input = "x\n\n\n\ny";
+        assert_eq!(compress_shell_output(input), "x\n\ny");
+
+        // 不连续的重复不折叠
+        let input = "A\nB\nA";
+        assert_eq!(compress_shell_output(input), "A\nB\nA");
+
+        // 曾被误删的有信息行：测试汇总、日期、diff/Markdown 分隔线
+        for keep in [
+            "FAILED 3/12 tests",
+            "test result: 1/2 passed",
+            "released 2024/05",
+            "---",
+            "===",
+            "-",
+            "| a | b |",
+            "...",
+            "coverage: 45%",
+        ] {
+            assert_eq!(compress_shell_output(keep), keep, "must keep: {keep}");
+        }
+        // 纯进度行仍然删除
+        for noise in ["45% 12/26", "12/26", "[====>     ] 45%", "████░░░░", "[###   ] 3/9"] {
+            assert_eq!(compress_shell_output(noise), "", "must drop: {noise}");
+        }
+
+        // 有信息的行保留（git/npm 树、百分比以外的数字）
+        assert_eq!(compress_shell_output("12 files changed"), "12 files changed");
+        assert_eq!(compress_shell_output("├── left-pad@1.0.0"), "├── left-pad@1.0.0");
+    }
+}

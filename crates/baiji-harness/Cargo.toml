@@ -1,0 +1,25 @@
+[package]
+name = "baiji-harness"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "AgentHarness: session tree, JSONL persistence, compaction, skills, templates, run loop"
+
+[dependencies]
+baiji-agent = { workspace = true }
+baiji-ai = { workspace = true }
+baiji-telemetry = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+sha2 = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }
+tempfile = { workspace = true }

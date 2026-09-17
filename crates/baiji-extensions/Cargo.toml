@@ -1,0 +1,23 @@
+[package]
+name = "baiji-extensions"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Plugin layer for baiji"
+
+[dependencies]
+futures = { workspace = true }
+baiji-agent = { workspace = true }
+baiji-ai = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }

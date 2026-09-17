@@ -1,298 +1,406 @@
-use crate::agent::tool_policy::PolicyConfig;
-use anyhow::{Context, Result};
-use regex::Regex;
+//! 应用配置：厂商预设 + API Key 解析 + 策略项
+//!
+//! 路径：`~/.baiji/config.json`（不存在时自动生成模板）。
+//! 最小配置只需 `vendor` + `api_key`，其余字段均可选：
+//!
+//! ```json
+//! { "vendor": "glm", "api_key": "$ZHIPU_API_KEY" }
+//! ```
+
+use anyhow::{anyhow, Context, Result};
+use baiji_ai::{self, Protocol, ProviderConfig, VendorPreset};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// 应用配置根结构
+/// 应用配置根
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Config {
-    /// LLM 配置
-    pub llm: LLMConfig,
-    /// 工具策略配置（可选，缺省使用安全默认值）
+pub struct AppConfig {
+    /// 厂商 ID 或别名（openai/anthropic/openrouter/bailian/tencent/glm/kimi/deepseek/minimax/mimo/opencode/xai）
+    pub vendor: String,
+    /// API Key，支持 $ENV_VAR / ${ENV_VAR} 展开；缺省读厂商推荐的环境变量
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// 模型名（缺省时自动发现并取厂商首个模型）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// 厂商端点选择（默认 "api" 按量付费；如 glm 的 Coding Plan：
+    /// "anthropic" / "coding" / "responses"）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// Base URL 覆盖（默认厂商预设端点）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// 协议覆盖：anthropic / chat / responses（默认厂商预设）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// 用 LLM 生成上下文压缩摘要（默认 false = 确定性摘要）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_compaction: Option<bool>,
     #[serde(default)]
     pub policy: PolicyConfig,
-    /// UI 配置（可选）
-    #[serde(default)]
-    pub ui: Option<UIConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui: Option<UiConfig>,
 }
 
-/// LLM 提供商配置
+/// 工具策略
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct LLMConfig {
-    /// 提供商类型: "anthropic", "openai"
-    pub provider: String,
-    /// API 基础 URL
-    pub base_url: String,
-    /// API 密钥
-    pub api_key: String,
-    /// 模型名称
-    pub model: String,
-    /// 最大 token 数（可选）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u32>,
-    /// 温度参数（可选）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
+pub struct PolicyConfig {
+    /// 额外允许访问的目录（相对当前目录；默认白名单 = 当前目录）
+    #[serde(default)]
+    pub allowed_paths: Vec<String>,
+    /// 需要用户确认（HITL）的工具名；非空时执行前弹确认框
+    #[serde(default)]
+    pub require_confirmation_tools: Vec<String>,
+    /// 单次工具输出最大字节数
+    #[serde(default = "default_max_output_bytes")]
+    pub max_tool_output_bytes: usize,
+    /// bash 默认超时（秒）
+    #[serde(default = "default_bash_timeout")]
+    pub bash_timeout_secs: u64,
+}
+
+fn default_max_output_bytes() -> usize {
+    32 * 1024
+}
+
+fn default_bash_timeout() -> u64 {
+    30
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            allowed_paths: Vec::new(),
+            require_confirmation_tools: Vec::new(),
+            max_tool_output_bytes: default_max_output_bytes(),
+            bash_timeout_secs: default_bash_timeout(),
+        }
+    }
 }
 
 /// UI 配置
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct UIConfig {
-    /// 主题: "dark", "light"
+pub struct UiConfig {
     #[serde(default = "default_theme")]
     pub theme: String,
-    /// 是否显示思考过程
-    #[serde(default = "default_show_thoughts")]
-    pub show_thoughts: bool,
 }
 
 fn default_theme() -> String {
     "dark".to_string()
 }
 
-fn default_show_thoughts() -> bool {
-    false
-}
-
-impl Default for UIConfig {
+impl Default for UiConfig {
     fn default() -> Self {
         Self {
             theme: default_theme(),
-            show_thoughts: default_show_thoughts(),
         }
     }
 }
 
-impl Config {
-    /// 从默认路径加载配置
-    /// 默认路径: ~/.baiji/config.json，不存在时自动创建默认配置
+/// 解析后的 Provider 接入信息
+#[derive(Debug, Clone)]
+pub struct ResolvedProvider {
+    pub vendor: &'static VendorPreset,
+    pub config: ProviderConfig,
+    /// api_key 的来源（显式配置 / 环境变量名）
+    pub key_source: String,
+}
+
+impl AppConfig {
+    /// 默认配置路径 ~/.baiji/config.json；不存在时生成模板
     pub fn load() -> Result<Self> {
-        let config_path = Self::default_config_path()?;
-        if !config_path.exists() {
-            let default_config = Config::default();
-            default_config.save_to_path(&config_path)?;
-            eprintln!(
-                "已创建默认配置文件: {}\n请编辑该文件填写 API 密钥后重新启动。",
-                config_path.display()
-            );
-            return Ok(default_config);
-        }
-        Self::load_from_path(&config_path)
-    }
-
-    /// 从指定路径加载配置
-    pub fn load_from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let path = path.as_ref();
-
+        let path = Self::default_path()?;
         if !path.exists() {
-            return Err(anyhow::anyhow!(
-                "配置文件不存在: {}",
-                path.display()
-            ));
+            let template = Self::template();
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, &template)
+                .with_context(|| format!("写入默认配置 {}", path.display()))?;
+            // 配置会存放 API Key：仅属主可读写
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).ok();
+            }
+            eprintln!(
+                "已生成默认配置 {}\n编辑该文件填写 api_key 后重新启动。\n支持厂商: {}",
+                path.display(),
+                baiji_ai::all_vendors()
+                    .iter()
+                    .map(|v| v.id)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            return serde_json::from_str(&template).context("解析默认配置模板");
         }
-
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("无法读取配置文件: {}", path.display()))?;
-
-        // 扩展环境变量
-        let expanded_content = Self::expand_env_vars(&content)?;
-
-        let config: Config = serde_json::from_str(&expanded_content)
-            .with_context(|| format!("解析配置文件失败，请检查 JSON 格式: {}", path.display()))?;
-
-        config.validate()?;
-
-        Ok(config)
+        Self::load_from(&path)
     }
 
-    /// 获取默认配置文件路径
-    /// 路径: ~/.baiji/config.json
-    pub fn default_config_path() -> Result<PathBuf> {
-        let config_dir = dirs::home_dir()
+    pub fn load_from(path: &Path) -> Result<Self> {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("读取配置 {}", path.display()))?;
+        let expanded = expand_env_vars(&raw)?;
+        serde_json::from_str(&expanded)
+            .with_context(|| format!("解析配置失败，请检查 JSON 格式: {}", path.display()))
+    }
+
+    pub fn default_path() -> Result<PathBuf> {
+        Ok(dirs::home_dir()
             .context("无法获取用户主目录")?
-            .join(".baiji");
-
-        // 确保配置目录存在
-        if !config_dir.exists() {
-            std::fs::create_dir_all(&config_dir)
-                .with_context(|| format!("无法创建配置目录: {}", config_dir.display()))?;
-        }
-
-        Ok(config_dir.join("config.json"))
+            .join(".baiji")
+            .join("config.json"))
     }
 
-    /// 验证配置有效性
-    pub fn validate(&self) -> Result<()> {
-        // 验证 LLM 配置
-        match self.llm.provider.as_str() {
-            "anthropic" | "openai" => {}
-            _ => {
-                return Err(anyhow::anyhow!(
-                    "不支持的 LLM 提供商: {}，支持的提供商: anthropic, openai",
-                    self.llm.provider
+    /// 首次生成的模板
+    pub fn template() -> String {
+        serde_json::to_string_pretty(&serde_json::json!({
+            "vendor": "glm",
+            "api_key": "$ZHIPU_API_KEY",
+            "model": null,
+            "endpoint": null,
+            "protocol": null,
+            "base_url": null,
+            "max_tokens": 8192,
+            "llm_compaction": false,
+            "policy": {
+                "allowed_paths": [],
+                "require_confirmation_tools": ["bash", "write", "edit"],
+                "max_tool_output_bytes": 32768,
+                "bash_timeout_secs": 30
+            },
+            "ui": { "theme": "dark" }
+        }))
+        .unwrap()
+            + "\n"
+    }
+
+    /// 校验 + 解析为 Provider 配置
+    pub fn resolve(&self) -> Result<ResolvedProvider> {
+        let vendor = baiji_ai::find_vendor(&self.vendor).ok_or_else(|| {
+            anyhow!(
+                "未知的 vendor '{}'，支持: {}",
+                self.vendor,
+                baiji_ai::all_vendors()
+                    .iter()
+                    .map(|v| v.id)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+
+        // 协议校验（覆盖值必须合法）
+        if let Some(protocol) = &self.protocol {
+            if Protocol::parse(protocol).is_none() {
+                return Err(anyhow!(
+                    "未知的 protocol '{protocol}'，可选: anthropic / chat / responses"
                 ));
             }
         }
 
-        if self.llm.api_key.is_empty() {
-            return Err(anyhow::anyhow!("LLM API 密钥不能为空"));
+        // 端点校验（未知端点直接列出可选项，避免运行期才失败）
+        if let Some(endpoint) = &self.endpoint {
+            if endpoint != "api" && vendor.find_endpoint(endpoint).is_none() {
+                return Err(anyhow!(
+                    "厂商 '{}' 无端点 '{}'，可选: {}",
+                    vendor.id,
+                    endpoint,
+                    vendor.endpoint_names().join(", ")
+                ));
+            }
         }
 
-        if self.llm.base_url.is_empty() {
-            return Err(anyhow::anyhow!("LLM base_url 不能为空"));
-        }
-
-        if self.llm.model.is_empty() {
-            return Err(anyhow::anyhow!("LLM 模型名称不能为空"));
-        }
-
-        Ok(())
-    }
-
-    /// 扩展环境变量
-    /// 支持格式: $VAR_NAME 或 ${VAR_NAME}
-    fn expand_env_vars(content: &str) -> Result<String> {
-        // 匹配 $VAR_NAME 或 ${VAR_NAME}
-        let re = Regex::new(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?").context("无法编译正则表达式")?;
-
-        let result = re.replace_all(content, |caps: &regex::Captures| {
-            let var_name = &caps[1];
-            match std::env::var(var_name) {
-                Ok(value) => value,
-                Err(_) => {
-                    // 如果环境变量不存在，保留原样
-                    caps[0].to_string()
+        // API Key：显式配置 > 厂商推荐环境变量
+        let (api_key, key_source) = match &self.api_key {
+            Some(key) if !key.is_empty() => (key.clone(), "config".to_string()),
+            _ => {
+                let env = vendor.api_key_env;
+                let key = std::env::var(env).unwrap_or_default();
+                if key.is_empty() {
+                    return Err(anyhow!(
+                        "缺少 API Key：请在配置中设置 api_key，或导出环境变量 {env}"
+                    ));
                 }
+                (key, env.to_string())
             }
-        });
+        };
 
-        Ok(result.to_string())
-    }
+        let mut config = baiji_ai::resolve_vendor(
+            vendor,
+            self.endpoint.as_deref(),
+            self.base_url.as_deref(),
+            self.protocol.as_deref(),
+        )?;
+        config.api_key = api_key;
 
-    /// 保存配置到默认路径
-    pub fn save(&self) -> Result<()> {
-        let path = Self::default_config_path()?;
-        self.save_to_path(&path)
-    }
-
-    /// 保存配置到指定路径
-    pub fn save_to_path<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let path = path.as_ref();
-
-        // 确保父目录存在
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("无法创建目录: {}", parent.display()))?;
-            }
-        }
-
-        let content = serde_json::to_string_pretty(self).context("无法序列化配置为 JSON")?;
-
-        std::fs::write(path, content)
-            .with_context(|| format!("无法写入配置文件: {}", path.display()))?;
-
-        Ok(())
+        Ok(ResolvedProvider {
+            vendor,
+            config,
+            key_source,
+        })
     }
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            llm: LLMConfig::default(),
-            policy: PolicyConfig::default(),
-            ui: Some(UIConfig::default()),
-        }
-    }
-}
-
-impl Default for LLMConfig {
-    fn default() -> Self {
-        Self {
-            provider: "anthropic".to_string(),
-            base_url: "https://api.anthropic.com".to_string(),
-            api_key: String::new(),
-            model: "claude-3-5-sonnet-20241022".to_string(),
-            max_tokens: Some(4096),
-            temperature: Some(0.7),
-        }
-    }
+/// 展开 $VAR / ${VAR}（未定义的变量原样保留）；实现见 baiji-ai
+pub fn expand_env_vars(content: &str) -> Result<String> {
+    Ok(baiji_ai::expand_env_vars(content))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use tempfile::NamedTempFile;
-
-    #[test]
-    fn test_load_valid_config() {
-        let config_json = r#"{
-            "llm": {
-                "provider": "anthropic",
-                "base_url": "https://api.anthropic.com",
-                "api_key": "test-api-key",
-                "model": "claude-3-5-sonnet-20241022",
-                "max_tokens": 4096,
-                "temperature": 0.7
-            }
-        }"#;
-
-        let mut temp_file = NamedTempFile::new().unwrap();
-        temp_file.write_all(config_json.as_bytes()).unwrap();
-
-        let config = Config::load_from_path(temp_file.path()).unwrap();
-
-        assert_eq!(config.llm.provider, "anthropic");
-        assert_eq!(config.llm.api_key, "test-api-key");
-    }
 
     #[test]
     fn test_expand_env_vars() {
-        // SAFETY: This test runs in isolation; setting env var is safe here.
-        unsafe { std::env::set_var("TEST_API_KEY", "secret123"); }
+        // SAFETY: 测试进程内设置环境变量
+        unsafe { std::env::set_var("BAIJI_TEST_KEY", "secret123") };
 
-        let input = r#"{"api_key": "$TEST_API_KEY"}"#;
-        let result = Config::expand_env_vars(input).unwrap();
-
-        assert!(result.contains("secret123"));
-        assert!(!result.contains("$TEST_API_KEY"));
+        assert_eq!(
+            expand_env_vars(r#"{"api_key": "$BAIJI_TEST_KEY"}"#).unwrap(),
+            r#"{"api_key": "secret123"}"#
+        );
+        assert_eq!(
+            expand_env_vars(r#"{"api_key": "${BAIJI_TEST_KEY}"}"#).unwrap(),
+            r#"{"api_key": "secret123"}"#
+        );
+        // 未定义变量保留原样
+        assert_eq!(
+            expand_env_vars(r#"{"k": "$NOT_DEFINED_VAR_XYZ"}"#).unwrap(),
+            r#"{"k": "$NOT_DEFINED_VAR_XYZ"}"#
+        );
+        // 普通文本不受影响
+        assert_eq!(
+            expand_env_vars(r#"{"model": "glm-4.7", "n": 1.5}"#).unwrap(),
+            r#"{"model": "glm-4.7", "n": 1.5}"#
+        );
     }
 
     #[test]
-    fn test_validate_empty_api_key() {
-        let config = Config {
-            llm: LLMConfig {
-                provider: "anthropic".to_string(),
-                base_url: "https://api.anthropic.com".to_string(),
-                api_key: "".to_string(),
-                model: "claude-3-5-sonnet".to_string(),
-                max_tokens: None,
-                temperature: None,
-            },
+    fn test_resolve_vendor_and_key_precedence() {
+        let config = AppConfig {
+            vendor: "glm".to_string(),
+            api_key: Some("explicit-key".to_string()),
+            model: None,
+            endpoint: None,
+            base_url: None,
+            protocol: None,
+            max_tokens: None,
+            llm_compaction: None,
             policy: PolicyConfig::default(),
             ui: None,
         };
-
-        assert!(config.validate().is_err());
+        let resolved = config.resolve().unwrap();
+        assert_eq!(resolved.vendor.id, "glm");
+        assert_eq!(resolved.config.api_key, "explicit-key");
+        assert_eq!(resolved.config.base_url, "https://open.bigmodel.cn/api/paas/v4");
+        assert_eq!(resolved.config.protocol, Protocol::OpenAIChat);
     }
 
     #[test]
-    fn test_validate_unsupported_provider() {
-        let config = Config {
-            llm: LLMConfig {
-                provider: "unsupported".to_string(),
-                base_url: "https://api.example.com".to_string(),
-                api_key: "test".to_string(),
-                model: "test-model".to_string(),
-                max_tokens: None,
-                temperature: None,
-            },
+    fn test_resolve_unknown_vendor_and_protocol() {
+        let config = AppConfig {
+            vendor: "nope".to_string(),
+            api_key: Some("k".to_string()),
+            model: None,
+            endpoint: None,
+            base_url: None,
+            protocol: None,
+            max_tokens: None,
+            llm_compaction: None,
             policy: PolicyConfig::default(),
             ui: None,
         };
+        assert!(config.resolve().is_err());
 
-        assert!(config.validate().is_err());
+        let config = AppConfig {
+            vendor: "glm".to_string(),
+            api_key: Some("k".to_string()),
+            model: None,
+            endpoint: None,
+            base_url: None,
+            protocol: Some("bogus".to_string()),
+            max_tokens: None,
+            llm_compaction: None,
+            policy: PolicyConfig::default(),
+            ui: None,
+        };
+        assert!(config.resolve().is_err());
+    }
+
+    #[test]
+    fn test_resolve_missing_key_reports_env_hint() {
+        let config = AppConfig {
+            vendor: "kimi".to_string(),
+            api_key: None,
+            model: None,
+            endpoint: None,
+            base_url: None,
+            protocol: None,
+            max_tokens: None,
+            llm_compaction: None,
+            policy: PolicyConfig::default(),
+            ui: None,
+        };
+        let err = config.resolve().unwrap_err().to_string();
+        assert!(err.contains("MOONSHOT_API_KEY"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn test_resolve_coding_plan_endpoints() {
+        // GLM Coding Plan：三种协议端点各自生效
+        let config = AppConfig {
+            vendor: "glm".to_string(),
+            api_key: Some("k".to_string()),
+            model: Some("glm-4.7".to_string()),
+            endpoint: Some("coding".to_string()),
+            base_url: None,
+            protocol: None,
+            max_tokens: None,
+            llm_compaction: None,
+            policy: PolicyConfig::default(),
+            ui: None,
+        };
+        let resolved = config.resolve().unwrap();
+        assert_eq!(resolved.config.protocol, Protocol::OpenAIChat);
+        assert_eq!(
+            resolved.config.base_url,
+            "https://open.bigmodel.cn/api/coding/paas/v4"
+        );
+
+        let config = AppConfig {
+            endpoint: Some("responses".to_string()),
+            ..config
+        };
+        let resolved = config.resolve().unwrap();
+        assert_eq!(resolved.config.protocol, Protocol::OpenAIResponses);
+        assert_eq!(resolved.config.base_url, "https://open.bigmodel.cn/api/v1");
+
+        let config = AppConfig {
+            endpoint: Some("anthropic".to_string()),
+            ..config
+        };
+        let resolved = config.resolve().unwrap();
+        assert_eq!(resolved.config.protocol, Protocol::Anthropic);
+        assert_eq!(
+            resolved.config.base_url,
+            "https://open.bigmodel.cn/api/anthropic"
+        );
+
+        // 未知端点 → 报错列出可选项
+        let config = AppConfig {
+            endpoint: Some("bogus".to_string()),
+            ..config
+        };
+        let err = config.resolve().unwrap_err().to_string();
+        assert!(err.contains("api, anthropic, coding, responses"), "{err}");
+    }
+
+    #[test]
+    fn test_template_is_valid_config() {
+        let template = AppConfig::template();
+        let config: AppConfig = serde_json::from_str(&template).unwrap();
+        assert_eq!(config.vendor, "glm");
     }
 }
