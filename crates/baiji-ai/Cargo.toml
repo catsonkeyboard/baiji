@@ -1,0 +1,20 @@
+[package]
+name = "baiji-ai"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "AI provider layer: Anthropic Messages, OpenAI-compatible Chat Completions/Responses, vendor registry, model discovery"
+
+[dependencies]
+tokio = { workspace = true }
+reqwest = { workspace = true }
+eventsource-stream = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

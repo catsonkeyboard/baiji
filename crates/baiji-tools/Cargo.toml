@@ -1,0 +1,31 @@
+[package]
+name = "baiji-tools"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Coding tools (read/write/edit/bash/grep/find/ls) + ExecutionEnv"
+
+[dependencies]
+baiji-agent = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+regex = { workspace = true }
+sha2 = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-python = { workspace = true }
+tree-sitter-javascript = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+tree-sitter-go = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+ignore = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

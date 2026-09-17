@@ -1,0 +1,892 @@
+//! baiji-harness — AgentHarness
+//!
+//! 组装 Runtime 与工程化设施：
+//! - [`Session`] / [`SessionTree`]：会话与分支树
+//! - [`JsonlStore`]：JSONL 逐条追加持久化
+//! - [`CompactionPolicy`]：token 估算 + 分层上下文压缩
+//! - skills 加载与 prompt 模板
+//! - run loop：用户输入 → runtime → 持久化
+
+pub mod compaction;
+pub mod memory;
+pub mod persist;
+pub mod session;
+pub mod skills;
+pub mod templates;
+
+pub use compaction::{compact, compact_with_llm, estimate_tokens, CompactionPolicy};
+pub use memory::{memory_section, project_key, MemoryEntry, MemoryKind, MemoryStore, MemoryTool};
+pub use persist::{JsonlStore, Record};
+pub use session::{new_session_id, Session, SessionMeta, SessionTree};
+pub use skills::{load_skills, Skill, SkillTool};
+pub use templates::{load_templates, PromptTemplate};
+pub use templates::render;
+
+use anyhow::Result;
+use baiji_agent::{AgentEvent, AgentRuntime, SteeringQueue};
+use baiji_ai::Message;
+use baiji_telemetry::NoopTelemetry;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio_util::sync::CancellationToken;
+use tracing::info;
+
+/// 默认 coding-agent 系统提示
+pub const DEFAULT_PROMPT: &str = "\
+You are baiji, a terminal coding agent.
+
+- Work in the current directory; use tools (read/write/edit/bash/grep/find/ls) to explore and modify code.
+- Reading files: prefer read with mode=signatures first (symbol outline with line spans), \
+then read the exact range with offset/limit. Use mode=map for directory overviews. \
+Avoid mode=full on large files. If output was truncated, use the expand tool with the ctx: handle.
+- Finding code: use search (BM25 keywords, no exact pattern needed) to locate relevant symbols, \
+imports (direction=incoming) to see who depends on a file before changing it; grep for exact patterns.
+- Prefer precise edits (edit tool) over rewriting whole files.
+- Persist durable project knowledge (build commands, conventions, decisions, pitfalls) with the memory tool; it survives across sessions.
+- Verify changes by reading back or running quick commands when practical.
+- Keep answers concise; show the final result and any commands the user should run.
+- If a request is ambiguous, state your assumption and proceed.
+
+## Environment
+- Working directory: {{cwd}}
+- Date: {{date}}
+- OS: {{os}}
+- Model: {{model}}";
+
+/// AgentHarness：会话 + 持久化 + runtime 的门面
+pub struct AgentHarness {
+    runtime: Arc<AgentRuntime>,
+    store: JsonlStore,
+    session: Session,
+    base_prompt: String,
+    skills_prompt: Option<String>,
+    /// 用户 prompt 模板（`/name 参数` 调用）
+    templates: Vec<templates::PromptTemplate>,
+    compaction: CompactionPolicy,
+    /// 上一次 LLM 调用厂商上报的真实上下文占用（input + output token）
+    last_context_tokens: Option<usize>,
+    /// 用 LLM 生成压缩摘要（失败回退确定性摘要）
+    llm_compaction: bool,
+    /// 跨会话项目记忆（None = 未启用）
+    memory: Option<(Arc<MemoryStore>, String)>,
+    telemetry: Arc<dyn baiji_telemetry::Telemetry>,
+}
+
+impl AgentHarness {
+    /// 创建新会话
+    pub fn new(runtime: Arc<AgentRuntime>, store_dir: impl Into<PathBuf>) -> Result<Self> {
+        let store = JsonlStore::new(store_dir);
+        let session = Session::new(None);
+        store.append(&session.meta.id, &Record::Started { meta: session.meta.clone() })?;
+        Ok(Self {
+            runtime,
+            store,
+            session,
+            base_prompt: DEFAULT_PROMPT.to_string(),
+            skills_prompt: None,
+            templates: Vec::new(),
+            compaction: CompactionPolicy::default(),
+            last_context_tokens: None,
+            llm_compaction: false,
+            memory: None,
+            telemetry: Arc::new(NoopTelemetry),
+        })
+    }
+
+    /// 恢复已有会话
+    pub fn load(
+        runtime: Arc<AgentRuntime>,
+        store_dir: impl Into<PathBuf>,
+        session_id: &str,
+    ) -> Result<Self> {
+        let store = JsonlStore::new(store_dir);
+        let session = store.load(session_id)?;
+        Ok(Self {
+            runtime,
+            store,
+            session,
+            base_prompt: DEFAULT_PROMPT.to_string(),
+            skills_prompt: None,
+            templates: Vec::new(),
+            compaction: CompactionPolicy::default(),
+            last_context_tokens: None,
+            llm_compaction: false,
+            memory: None,
+            telemetry: Arc::new(NoopTelemetry),
+        })
+    }
+
+    /// 从当前会话分叉：新会话继承全部历史，parent 指向原会话
+    pub fn branch(&mut self) -> Result<()> {
+        self.branch_rewind(0).map(|_| ())
+    }
+
+    /// 从历史中的某个点分叉：丢掉最近 `turns_back` 轮（一轮 = 一条 user 消息及其后的
+    /// 全部回复/工具往来），其余历史继承到新会话。`0` = 继承全部。
+    /// 原会话不受影响——可随时切回去，这就是"回到那次提问之前重来"。
+    /// 返回被丢弃的那条 user 消息（便于 UI 回填输入框供修改后重发）。
+    pub fn branch_rewind(&mut self, turns_back: usize) -> Result<Option<String>> {
+        let messages = &self.session.messages;
+        let mut keep = messages.len();
+        let mut dropped_input = None;
+        if turns_back > 0 {
+            let user_positions: Vec<usize> = messages
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| m.role == baiji_ai::Role::User)
+                .map(|(i, _)| i)
+                .collect();
+            if turns_back > user_positions.len() {
+                anyhow::bail!(
+                    "只有 {} 轮对话，无法回退 {turns_back} 轮",
+                    user_positions.len()
+                );
+            }
+            // 在 user 消息边界切：不会拆开 tool_use 与 tool_result
+            keep = user_positions[user_positions.len() - turns_back];
+            dropped_input = Some(messages[keep].content.clone());
+        }
+
+        let mut child = Session::new(Some(self.session.meta.id.clone()));
+        child.messages = messages[..keep].to_vec();
+        // 标题随 Started 一起写入（分叉时历史已知）
+        child.meta.title = self.session.meta.title.clone();
+        child.derive_title();
+        self.store
+            .append(&child.meta.id, &Record::Started { meta: child.meta.clone() })?;
+        for message in &child.messages {
+            self.store
+                .append(&child.meta.id, &Record::Message { message: message.clone() })?;
+        }
+        self.session = child;
+        self.last_context_tokens = None; // 历史变短了，旧读数作废
+        info!(
+            "branched session -> {} (rewound {turns_back} turn(s))",
+            self.session.meta.id
+        );
+        Ok(dropped_input)
+    }
+
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+
+    /// 热切换 Provider（TUI 配置变更时，下一次 LLM 调用生效）
+    pub fn swap_provider(&self, provider: Arc<dyn baiji_ai::Provider>) {
+        self.runtime.swap_provider(provider);
+    }
+
+    pub fn set_base_prompt(&mut self, prompt: impl Into<String>) {
+        self.base_prompt = prompt.into();
+    }
+
+    pub fn set_skills(&mut self, skills: &[Skill]) {
+        self.skills_prompt = skills::skills_section(skills);
+    }
+
+    /// 按模型上下文窗口重设压缩阈值（启动与热切换模型时调用）
+    pub fn set_context_window(&mut self, context_length: u64) {
+        self.compaction = CompactionPolicy {
+            keep_recent_turns: self.compaction.keep_recent_turns,
+            ..CompactionPolicy::for_context(context_length, self.runtime.max_tokens())
+        };
+        // 运行中的预算比轮次间压缩阈值（70%）宽：85% 窗口再扣输出预留
+        let in_run = ((context_length as f64 * 0.85) as u64)
+            .saturating_sub(self.runtime.max_tokens() as u64)
+            .max(16_000);
+        self.runtime.set_context_budget(in_run as usize);
+    }
+
+    pub fn set_compaction_policy(&mut self, policy: CompactionPolicy) {
+        self.compaction = policy;
+    }
+
+    /// 启用/禁用 LLM 压缩摘要（默认关闭 = 确定性摘要）
+    pub fn set_llm_compaction(&mut self, enabled: bool) {
+        self.llm_compaction = enabled;
+    }
+
+    /// 启用跨会话项目记忆：有效条目注入系统提示
+    pub fn set_memory(&mut self, store: Arc<MemoryStore>, project: impl Into<String>) {
+        self.memory = Some((store, project.into()));
+    }
+
+    /// 列出存储中的全部会话（供 UI 选择器）
+    pub fn list_sessions(&self) -> Result<Vec<SessionMeta>> {
+        self.store.list()
+    }
+
+    /// 切换到已有会话（历史从 JSONL 重放）
+    pub fn switch_session(&mut self, session_id: &str) -> Result<()> {
+        self.session = self.store.load(session_id)?;
+        info!("switched to session {session_id}");
+        Ok(())
+    }
+
+    pub fn set_telemetry(&mut self, telemetry: Arc<dyn baiji_telemetry::Telemetry>) {
+        self.telemetry = telemetry;
+    }
+
+    pub fn set_templates(&mut self, templates: Vec<templates::PromptTemplate>) {
+        self.templates = templates;
+    }
+
+    /// 已加载的用户 prompt 模板：(调用名, 描述)
+    pub fn template_list(&self) -> Vec<(String, String)> {
+        self.templates
+            .iter()
+            .map(|t| (t.name.clone(), t.description.clone()))
+            .collect()
+    }
+
+    /// 模板可用的环境变量
+    fn template_vars(&self) -> std::collections::HashMap<&'static str, String> {
+        let mut vars = std::collections::HashMap::new();
+        vars.insert(
+            "cwd",
+            std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        );
+        vars.insert("date", chrono::Local::now().format("%Y-%m-%d").to_string());
+        vars.insert("os", std::env::consts::OS.to_string());
+        vars.insert("model", self.runtime.provider().model().to_string());
+        vars
+    }
+
+    fn system_prompt(&self) -> String {
+        // 基础 prompt（内置或用户的 system.md）是模板：{{cwd}} {{date}} {{os}} {{model}}
+        let mut prompt = templates::render(&self.base_prompt, &self.template_vars());
+        if let Some(skills) = &self.skills_prompt {
+            prompt.push_str("\n\n");
+            prompt.push_str(skills);
+        }
+        if let Some((store, project)) = &self.memory {
+            if let Some(section) = memory_section(&store.active(project)) {
+                prompt.push_str("\n\n");
+                prompt.push_str(&section);
+            }
+        }
+        prompt
+    }
+
+    /// 执行一轮对话：持久化 → 压缩 → runtime 循环 → 持久化新增消息
+    pub async fn run(
+        &mut self,
+        user_input: impl Into<String>,
+        events: &UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+        steering: &SteeringQueue,
+    ) -> Result<String> {
+        let user_input = user_input.into();
+        // `/name 参数` 形式且 name 是已加载的 prompt 模板 → 展开为模板正文
+        let user_input =
+            templates::expand_invocation(&user_input, &self.templates, &self.template_vars())
+                .unwrap_or(user_input);
+
+        // 1. 记录用户输入
+        self.session.messages.push(Message::user(&user_input));
+        self.store.append(
+            &self.session.meta.id,
+            &Record::Message {
+                message: Message::user(&user_input),
+            },
+        )?;
+
+        // 标题：首条用户消息确定后落盘一次（会话列表据此显示，而不是"(无标题)"）
+        if self.session.meta.title.is_none() {
+            self.session.derive_title();
+            if let Some(title) = self.session.meta.title.clone() {
+                self.store
+                    .append(&self.session.meta.id, &Record::Title { title })?;
+            }
+        }
+
+        // 2. 上下文压缩（超限时旧轮次折叠为摘要；会缩短消息列表，须在其后取 checkpoint）
+        let run_span = self.telemetry.span("harness.run", vec![]);
+        // 启发式估算之外，再看厂商上报的真实占用：真实值已超阈值则强制压缩
+        // （估算不含系统提示与工具定义，对代码/中文也常偏低）
+        let policy = match self.last_context_tokens {
+            Some(observed) if observed > self.compaction.max_estimated_tokens => {
+                info!(
+                    "observed context {observed} tokens exceeds budget {}, forcing compaction",
+                    self.compaction.max_estimated_tokens
+                );
+                CompactionPolicy {
+                    max_estimated_tokens: 0,
+                    ..self.compaction.clone()
+                }
+            }
+            _ => self.compaction.clone(),
+        };
+        let compacted = if self.llm_compaction {
+            compact_with_llm(
+                self.runtime.provider().as_ref(),
+                &mut self.session.messages,
+                &policy,
+            )
+            .await
+        } else {
+            compact(&mut self.session.messages, &policy)
+        };
+        if let Some(summary) = compacted {
+            self.last_context_tokens = None; // 压缩后旧读数作废
+            info!("context compacted (summary {} chars)", summary.len());
+            // 压缩后 = [摘要] + 保留的最近消息（含刚写入的 user 输入，均已在文件中）
+            let kept_messages = Some(self.session.messages.len().saturating_sub(1));
+            self.store.append(
+                &self.session.meta.id,
+                &Record::Summary {
+                    content: summary,
+                    kept_messages,
+                },
+            )?;
+        }
+        let checkpoint = self.session.messages.len();
+
+        // 3. runtime 循环（新增消息直接追加进 session.messages）。
+        //    事件经 tap 转发：统计工具输出的压缩台账（Context IR 摘要）
+        let (tap_tx, mut tap_rx) = tokio::sync::mpsc::unbounded_channel::<baiji_agent::AgentEvent>();
+        let events_out = events.clone();
+        let store = self.store.clone();
+        let session_id = self.session.meta.id.clone();
+        let forward = tokio::spawn(async move {
+            let (mut calls, mut original, mut delivered) = (0u32, 0u64, 0u64);
+            // 已增量落盘的消息数；一旦写失败就停止，剩余的留给运行结束后补写（保持顺序）
+            let mut persisted = 0usize;
+            let mut persist_ok = true;
+            let mut context_tokens: Option<usize> = None;
+            while let Some(event) = tap_rx.recv().await {
+                if let baiji_agent::AgentEvent::MessageCommitted { message } = event {
+                    if persist_ok {
+                        match store.append(&session_id, &Record::Message { message }) {
+                            Ok(()) => persisted += 1,
+                            Err(e) => {
+                                tracing::warn!("incremental persist failed: {e}");
+                                persist_ok = false;
+                            }
+                        }
+                    }
+                    continue; // 内部事件，不转发给 UI
+                }
+                if let baiji_agent::AgentEvent::UsageReported {
+                    input_tokens,
+                    output_tokens,
+                } = &event
+                {
+                    context_tokens = Some((*input_tokens as usize) + (*output_tokens as usize));
+                }
+                if let baiji_agent::AgentEvent::ToolFinished {
+                    output,
+                    original_bytes,
+                    ..
+                } = &event
+                {
+                    calls += 1;
+                    let delivered_bytes = output.len() as u64;
+                    delivered += delivered_bytes;
+                    original += original_bytes.unwrap_or(delivered_bytes);
+                }
+                if events_out.send(event).is_err() {
+                    break;
+                }
+            }
+            (calls, original, delivered, persisted, context_tokens)
+        });
+
+        let answer = self
+            .runtime
+            .run(
+                &self.system_prompt(),
+                &mut self.session.messages,
+                &tap_tx,
+                cancel,
+                steering,
+            )
+            .await;
+        drop(tap_tx);
+        let (tool_calls, original_bytes, delivered_bytes, persisted, context_tokens) =
+            forward.await.unwrap_or((0, 0, 0, 0, None));
+        if context_tokens.is_some() {
+            self.last_context_tokens = context_tokens;
+        }
+
+        // 4. 补写尚未增量落盘的新增消息（无论成败都保留进度）
+        let unpersisted = (checkpoint + persisted).min(self.session.messages.len());
+        for message in &self.session.messages[unpersisted..] {
+            self.store
+                .append(&self.session.meta.id, &Record::Message { message: message.clone() })?;
+        }
+        // 台账（有工具调用才记录）
+        if tool_calls > 0 {
+            self.store.append(
+                &self.session.meta.id,
+                &Record::Ledger {
+                    tool_calls,
+                    original_bytes,
+                    delivered_bytes,
+                },
+            )?;
+            info!(
+                "context ledger: {tool_calls} tool calls, {} -> {} bytes ({:.1}% saved)",
+                original_bytes,
+                delivered_bytes,
+                if original_bytes > 0 {
+                    original_bytes.saturating_sub(delivered_bytes) as f64 / original_bytes as f64 * 100.0
+                } else {
+                    0.0
+                }
+            );
+        }
+        run_span.end();
+
+        answer
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use baiji_agent::ToolRegistry;
+    use baiji_ai::{ChatRequest, ChatResponse, Protocol, Provider, StreamChunk};
+    use futures::stream::BoxStream;
+    use futures::StreamExt as _;
+
+    /// 固定回答的 Mock Provider
+    struct EchoProvider;
+
+    #[async_trait]
+    impl Provider for EchoProvider {
+        async fn chat(&self, _: ChatRequest) -> Result<ChatResponse> {
+            unreachable!()
+        }
+        async fn chat_stream(
+            &self,
+            _: ChatRequest,
+        ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+            Ok(futures::stream::iter(vec![
+                Ok(StreamChunk::Content("收到：".into())),
+                Ok(StreamChunk::Done),
+            ])
+            .boxed())
+        }
+        fn protocol(&self) -> Protocol {
+            Protocol::OpenAIChat
+        }
+        fn model(&self) -> &str {
+            "mock"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    /// chat() 返回固定摘要的 Mock Provider（LLM 压缩测试用）
+    struct SummarizeProvider {
+        fail_chat: bool,
+    }
+
+    #[async_trait]
+    impl Provider for SummarizeProvider {
+        async fn chat(&self, _: ChatRequest) -> Result<ChatResponse> {
+            if self.fail_chat {
+                anyhow::bail!("summarize API down")
+            }
+            Ok(ChatResponse {
+                content: "· 用户在测试压缩\n· 决定使用 LLM 摘要".to_string(),
+                tool_calls: None,
+                usage: None,
+            })
+        }
+        async fn chat_stream(
+            &self,
+            _: ChatRequest,
+        ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+            Ok(futures::stream::iter(vec![Ok(StreamChunk::Done)]).boxed())
+        }
+        fn protocol(&self) -> Protocol {
+            Protocol::OpenAIChat
+        }
+        fn model(&self) -> &str {
+            "mock"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_harness_run_persists_and_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("sessions");
+
+        let session_id = {
+            let runtime = Arc::new(AgentRuntime::new(Arc::new(EchoProvider)));
+            let mut harness =
+                AgentHarness::new(runtime, store_dir.clone()).expect("create harness");
+
+            assert!(harness.session().messages.is_empty());
+
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let answer = harness
+                .run("你好", &tx, &CancellationToken::new(), &SteeringQueue::new())
+                .await
+                .expect("run");
+            assert_eq!(answer, "收到：");
+
+            // 内存态：user + assistant
+            assert_eq!(harness.session().messages.len(), 2);
+            harness.session().meta.id.clone()
+        };
+
+        // JSONL 回放恢复
+        let runtime = Arc::new(AgentRuntime::new(Arc::new(EchoProvider)));
+        let reloaded = AgentHarness::load(runtime, store_dir, &session_id).unwrap();
+        assert_eq!(reloaded.session().messages.len(), 2);
+        assert_eq!(reloaded.session().messages[0].content, "你好");
+        assert_eq!(reloaded.session().messages[1].content, "收到：");
+        assert!(reloaded.session().meta.title.as_deref().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_branch_inherits_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(AgentRuntime::new(Arc::new(EchoProvider)).with_tools(ToolRegistry::new()));
+        let mut harness = AgentHarness::new(runtime, dir.path().join("sessions")).unwrap();
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        harness
+            .run("first question", &tx, &CancellationToken::new(), &SteeringQueue::new())
+            .await
+            .unwrap();
+
+        let parent_id = harness.session().meta.id.clone();
+        let history_len = harness.session().messages.len();
+
+        harness.branch().unwrap();
+        assert_eq!(harness.session().meta.parent_id.as_deref(), Some(parent_id.as_str()));
+        assert_eq!(harness.session().messages.len(), history_len);
+
+        // 分叉后继续对话，互不影响（各自 JSONL 独立）
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        harness
+            .run("branched question", &tx, &CancellationToken::new(), &SteeringQueue::new())
+            .await
+            .unwrap();
+        assert_eq!(harness.session().messages.len(), history_len + 2);
+    }
+
+    #[tokio::test]
+    async fn test_branch_rewind_and_title_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        let runtime =
+            Arc::new(AgentRuntime::new(Arc::new(EchoProvider)).with_tools(ToolRegistry::new()));
+        let mut harness = AgentHarness::new(runtime, &sessions).unwrap();
+
+        for question in ["q1 about alpha", "q2", "q3"] {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            harness
+                .run(question, &tx, &CancellationToken::new(), &SteeringQueue::new())
+                .await
+                .unwrap();
+        }
+        let parent_id = harness.session().meta.id.clone();
+        assert_eq!(harness.session().messages.len(), 6);
+
+        // 回退 2 轮：只剩 q1 及其回答；返回被丢弃的那条提问
+        let dropped = harness.branch_rewind(2).unwrap();
+        assert_eq!(dropped.as_deref(), Some("q2"));
+        assert_eq!(harness.session().messages.len(), 2);
+        assert_eq!(harness.session().meta.parent_id.as_deref(), Some(parent_id.as_str()));
+        assert!(harness.branch_rewind(5).is_err(), "cannot rewind past the start");
+
+        // 原会话完好；两个会话的标题都已落盘，列表不再是"(无标题)"
+        let store = JsonlStore::new(&sessions);
+        assert_eq!(store.load(&parent_id).unwrap().messages.len(), 6);
+        let metas = store.list().unwrap();
+        assert_eq!(metas.len(), 2);
+        assert!(metas.iter().all(|m| m.title.as_deref() == Some("q1 about alpha")));
+    }
+
+    #[tokio::test]
+    async fn test_memory_injected_into_run() {
+        /// 捕获 system prompt 的 Mock
+        struct CaptureProvider(std::sync::Mutex<Vec<String>>);
+
+        #[async_trait]
+        impl Provider for CaptureProvider {
+            async fn chat(&self, _: ChatRequest) -> Result<ChatResponse> {
+                unreachable!()
+            }
+            async fn chat_stream(
+                &self,
+                request: ChatRequest,
+            ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+                let system = request
+                    .messages
+                    .iter()
+                    .find(|m| m.role == baiji_ai::Role::System)
+                    .map(|m| m.content.clone())
+                    .unwrap_or_default();
+                self.0.lock().unwrap().push(system);
+                Ok(futures::stream::iter(vec![
+                    Ok(StreamChunk::Content("ok".into())),
+                    Ok(StreamChunk::Done),
+                ])
+                .boxed())
+            }
+            fn protocol(&self) -> Protocol {
+                Protocol::OpenAIChat
+            }
+            fn model(&self) -> &str {
+                "mock"
+            }
+            fn provider_name(&self) -> &str {
+                "mock"
+            }
+        }
+
+        let captured = Arc::new(CaptureProvider(std::sync::Mutex::new(Vec::new())));
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::open(dir.path().join("mem")));
+        store
+            .add("proj", "构建前必须 cargo fmt", MemoryKind::Gotcha, None, "agent")
+            .unwrap();
+
+        let runtime = Arc::new(AgentRuntime::new(captured.clone()).with_tools(ToolRegistry::new()));
+        let mut harness = AgentHarness::new(runtime, dir.path().join("sessions")).unwrap();
+        harness.set_memory(store, "proj");
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        harness
+            .run("hi", &tx, &CancellationToken::new(), &SteeringQueue::new())
+            .await
+            .unwrap();
+
+        let systems = captured.0.lock().unwrap().clone();
+        assert_eq!(systems.len(), 1);
+        assert!(systems[0].contains("Project memory"), "{}", systems[0]);
+        assert!(systems[0].contains("构建前必须 cargo fmt"));
+        assert!(systems[0].contains("gotcha"));
+    }
+
+    #[tokio::test]
+    async fn test_list_and_switch_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("sessions");
+        let runtime = Arc::new(AgentRuntime::new(Arc::new(EchoProvider)).with_tools(ToolRegistry::new()));
+
+        // 会话 A：一轮对话
+        let mut harness_a = AgentHarness::new(Arc::clone(&runtime), store_dir.clone()).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        harness_a
+            .run("question in A", &tx, &CancellationToken::new(), &SteeringQueue::new())
+            .await
+            .unwrap();
+        let id_a = harness_a.session().meta.id.clone();
+        drop(harness_a);
+
+        // 会话 B：另一轮
+        let mut harness_b = AgentHarness::new(Arc::clone(&runtime), store_dir.clone()).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        harness_b
+            .run("question in B", &tx, &CancellationToken::new(), &SteeringQueue::new())
+            .await
+            .unwrap();
+        let _id_b = harness_b.session().meta.id.clone();
+
+        // 列表包含两个会话
+        let sessions = harness_b.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 2);
+
+        // 切回 A：历史恢复
+        harness_b.switch_session(&id_a).unwrap();
+        let contents: Vec<&str> = harness_b
+            .session()
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(contents.contains(&"question in A"));
+        assert_eq!(harness_b.session().meta.id, id_a);
+
+        // 切换到不存在的会话报错
+        assert!(harness_b.switch_session("sess_nope").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_llm_compaction_summarizes_via_provider() {
+        let provider = SummarizeProvider { fail_chat: false };
+        let mut messages = Vec::new();
+        for i in 0..8 {
+            messages.push(Message::user(format!(
+                "问题 {} 一些足够长的内容用于触发 token 超限估计",
+                i + 1
+            )));
+            messages.push(Message::assistant("简短回答"));
+        }
+
+        let summary = compact_with_llm(
+            &provider,
+            &mut messages,
+            &CompactionPolicy { max_estimated_tokens: 100, keep_recent_turns: 2 },
+        )
+        .await
+        .expect("should compact");
+
+        assert!(summary.contains("LLM 摘要"), "LLM summary used: {summary}");
+        assert!(messages[0].content.contains("[Conversation Summary]"));
+        // 最近 2 轮保持原文
+        assert!(messages.last().unwrap().content.contains("简短回答"));
+    }
+
+    #[tokio::test]
+    async fn test_llm_compaction_falls_back_on_provider_error() {
+        let messages = {
+            let mut m = Vec::new();
+            for i in 0..6 {
+                m.push(Message::user(format!("问题 {} 内容", i + 1)));
+                m.push(Message::assistant("回答"));
+            }
+            m
+        };
+        let mut messages = messages;
+        let provider = SummarizeProvider { fail_chat: true };
+        let summary = compact_with_llm(
+            &provider,
+            &mut messages,
+            &CompactionPolicy { max_estimated_tokens: 50, keep_recent_turns: 2 },
+        )
+        .await
+        .expect("should still compact");
+
+        // 回退到确定性摘要
+        assert!(summary.contains("Turn 1:"), "fallback summary: {summary}");
+    }
+
+    // ===== 上下文节省台账（Context IR）=====
+
+    /// 第一轮调用 big 工具、第二轮直接回答的 Mock
+    struct ToolCallProvider;
+
+    #[async_trait]
+    impl Provider for ToolCallProvider {
+        async fn chat(&self, _: ChatRequest) -> Result<ChatResponse> {
+            unreachable!()
+        }
+        async fn chat_stream(
+            &self,
+            _: ChatRequest,
+        ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static CALLS: AtomicU32 = AtomicU32::new(0);
+            let n = CALLS.fetch_add(1, Ordering::SeqCst);
+            let chunks: Vec<Result<StreamChunk>> = if n == 0 {
+                vec![
+                    Ok(StreamChunk::ToolCallStart {
+                        id: "t1".into(),
+                        name: "big".into(),
+                    }),
+                    Ok(StreamChunk::ToolCallArguments {
+                        id: "t1".into(),
+                        arguments: "{}".into(),
+                    }),
+                    Ok(StreamChunk::Done),
+                ]
+            } else {
+                vec![
+                    Ok(StreamChunk::Content("done".into())),
+                    Ok(StreamChunk::Done),
+                ]
+            };
+            Ok(futures::stream::iter(chunks).boxed())
+        }
+        fn protocol(&self) -> Protocol {
+            Protocol::OpenAIChat
+        }
+        fn model(&self) -> &str {
+            "mock"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    struct BigOutputTool;
+
+    #[async_trait]
+    impl baiji_agent::AgentTool for BigOutputTool {
+        fn name(&self) -> &str {
+            "big"
+        }
+        fn description(&self) -> &str {
+            "emits a large compressed output"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> Result<baiji_agent::ToolOutput> {
+            // 模拟：原始 10KB 压缩到 100B
+            Ok(baiji_agent::ToolOutput::ok("x".repeat(100)).with_original_bytes(10_000))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ledger_recorded_and_ignored_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("sessions");
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(BigOutputTool));
+        let runtime = Arc::new(AgentRuntime::new(Arc::new(ToolCallProvider)).with_tools(tools));
+        let mut harness = AgentHarness::new(runtime, store_dir.clone()).unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let collector = tokio::spawn(async move {
+            let mut saved = 0u64;
+            while let Some(event) = rx.recv().await {
+                if let baiji_agent::AgentEvent::ToolFinished {
+                    output, original_bytes, ..
+                } = event
+                {
+                    saved += original_bytes.unwrap_or(0).saturating_sub(output.len() as u64);
+                }
+            }
+            saved
+        });
+
+        harness
+            .run("run the tool", &tx, &CancellationToken::new(), &SteeringQueue::new())
+            .await
+            .unwrap();
+        drop(tx);
+        // 转发出的事件保留了原始字节数（UI 可统计）
+        assert_eq!(collector.await.unwrap(), 10_000 - 100);
+
+        // JSONL 末尾有台账记录
+        let file = store_dir
+            .join(format!("{}.jsonl", harness.session().meta.id));
+        let content = std::fs::read_to_string(&file).unwrap();
+        let last = content.lines().last().unwrap();
+        assert!(last.contains("\"ledger\""), "last line: {last}");
+        assert!(last.contains("\"tool_calls\":1"));
+
+        // 加载时台账不进入对话历史
+        let runtime2 = Arc::new(AgentRuntime::new(Arc::new(EchoProvider)));
+        let reloaded = AgentHarness::load(runtime2, store_dir, &harness.session().meta.id).unwrap();
+        let roles: Vec<_> = reloaded
+            .session()
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(!roles.iter().any(|c| c.contains("ledger")));
+    }
+}

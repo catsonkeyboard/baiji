@@ -1,0 +1,21 @@
+[package]
+name = "baiji-agent"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Agent runtime: loop, AgentTool trait, events, hooks, queues"
+
+[dependencies]
+baiji-ai = { workspace = true }
+baiji-telemetry = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

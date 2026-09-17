@@ -1,0 +1,26 @@
+[package]
+name = "baiji-tui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Terminal UI layer for baiji"
+
+[dependencies]
+baiji-agent = { workspace = true }
+baiji-ai = { workspace = true }
+baiji-harness = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+unicode-width = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+baiji-telemetry = { workspace = true }
+tempfile = { workspace = true }

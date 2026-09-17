@@ -1,0 +1,10 @@
+[package]
+name = "baiji-telemetry"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Telemetry span/event contracts for baiji (noop default)"
+
+[dependencies]
+serde_json = { workspace = true }
