@@ -10,6 +10,7 @@ description = "Terminal UI layer for baiji"
 baiji-agent = { workspace = true }
 baiji-ai = { workspace = true }
 baiji-harness = { workspace = true }
+baiji-tools = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }

@@ -223,6 +223,7 @@ dependencies = [
  "baiji-ai",
  "baiji-harness",
  "baiji-telemetry",
+ "baiji-tools",
  "crossterm",
  "futures",
  "ratatui",

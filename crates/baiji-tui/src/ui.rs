@@ -33,32 +33,14 @@ const LOGO: &[&str] = &[
 /// 渲染一帧。消耗 &mut App：滚动哨兵值在每帧渲染后钳制，帧计数驱动指示器动画。
 pub fn draw(frame: &mut Frame, app: &mut App) {
     app.bump_frame();
-    // 斜杠命令提示：向导打开时抑制（其输入框不属于命令语义）
-    let hints = if app.wizard_active() {
-        None
-    } else {
-        app.slash_hints_view().filter(|(_, h)| !h.is_empty())
-    };
-    let hints_active = hints.is_some();
-    // [顶栏, 聊天区, (斜杠提示), 输入框, 状态栏]
-    let chunks = if hints_active {
-        Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Min(3),
-            Constraint::Length(2),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
-        .split(frame.area())
-    } else {
-        Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Min(3),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
-        .split(frame.area())
-    };
+    // [顶栏, 聊天区, 输入框, 状态栏]；斜杠补全在输入框内以灰色 ghost 呈现
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(3),
+        Constraint::Length(3),
+        Constraint::Length(1),
+    ])
+    .split(frame.area());
 
     draw_header(frame, app, chunks[0]);
     let chat = chunks[1];
@@ -68,16 +50,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_chat(frame, app, chat);
     }
     draw_todo_panel(frame, app, chat);
-    let (input_area, status_area) = if hints_active {
-        (chunks[3], chunks[4])
-    } else {
-        (chunks[2], chunks[3])
-    };
-    if let Some((selected, hints)) = hints {
-        draw_slash_hints(frame, app, chunks[2], selected, &hints);
-    }
-    draw_input(frame, app, input_area);
-    draw_status(frame, app, status_area);
+    draw_input(frame, app, chunks[2]);
+    draw_status(frame, app, chunks[3]);
 
     if let Some(rows) = app.picker_rows() {
         draw_picker(frame, app, rows);
@@ -420,6 +394,7 @@ fn draw_todo_panel(frame: &mut Frame, app: &App, chat: Rect) {
 }
 
 /// 输入框：圆角边框 + `> ` 提示符；厂商·模型退到右下角边框标题。
+/// 命令输入态在光标后以灰色 ghost 展示首个匹配命令的余下部分（Tab 接受）；
 /// 运行中边框转强调色，顶边提示 steering 语义
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme();
@@ -454,50 +429,28 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::raw(app.input().to_string()));
     }
     spans.push(Span::raw("▏"));
+    if let Some(ghost) = ghost_remainder(app) {
+        spans.push(Span::styled(ghost, dim));
+    }
 
     frame.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
 }
 
-/// 斜杠命令提示条：命令列表（选中高亮）+ 选中命令用法
-fn draw_slash_hints(
-    frame: &mut Frame,
-    app: &App,
-    area: ratatui::layout::Rect,
-    selected: usize,
-    hints: &[(&'static str, &'static str)],
-) {
-    let theme = app.theme();
-    let mut spans: Vec<Span> = Vec::new();
-    for (i, (name, _)) in hints.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw("  "));
-        }
-        let style = if i == selected {
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.system)
-        };
-        spans.push(Span::styled(format!("/{name}"), style));
+/// ghost 补全的可见部分：完整 "/name " 去掉已输入前缀（大小写不敏感比较，
+/// 命令名是 ASCII，按字节切片安全）
+fn ghost_remainder(app: &App) -> Option<String> {
+    let (name, _) = app.slash_ghost()?;
+    let typed = app.input();
+    let full = format!("/{name} ");
+    if full.to_lowercase().starts_with(&typed.to_lowercase()) {
+        Some(full[typed.len()..].to_string())
+    } else {
+        None
     }
-    spans.push(Span::styled(
-        "   Tab=补全 ↑↓=选择",
-        Style::default().fg(theme.system),
-    ));
-
-    let usage = hints
-        .get(selected)
-        .map(|(_, u)| u.to_string())
-        .unwrap_or_default();
-    let paragraph = Paragraph::new(vec![
-        Line::from(spans),
-        Line::styled(usage, Style::default().fg(theme.tool)),
-    ]);
-    frame.render_widget(paragraph, area);
 }
 
-/// 状态栏一行：左侧运行状态（旋转指示器），右侧会话台账（暗色退后）
+/// 状态栏一行：左侧运行状态（旋转指示器），右侧会话台账（暗色退后）。
+/// 命令输入态时右侧临时换成 ghost 命令的用法说明
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme();
     let dim = Style::default().fg(theme.system);
@@ -509,13 +462,14 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         Line::styled("就绪".to_string(), dim)
     };
+    let right = match app.slash_ghost() {
+        Some((_, usage)) => Line::styled(usage.to_string(), dim),
+        None => Line::styled(app.status_right(), dim),
+    };
     let cols =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
     frame.render_widget(Paragraph::new(left), cols[0]);
-    frame.render_widget(
-        Paragraph::new(Line::styled(app.status_right(), dim)).right_aligned(),
-        cols[1],
-    );
+    frame.render_widget(Paragraph::new(right).right_aligned(), cols[1]);
 }
 
 /// HITL 确认对话框：居中弹窗，完整展示待执行内容（按显示宽度折行）。

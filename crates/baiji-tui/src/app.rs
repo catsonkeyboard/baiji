@@ -155,19 +155,35 @@ fn read_git_branch(dir: &std::path::Path) -> Option<String> {
     None
 }
 
-/// 斜杠命令注册表：(名称, 用法说明)
+/// 斜杠命令注册表：(名称, 用法说明)。字典序——ghost 补全取首个前缀匹配
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("btw", "旁路提问：一次性问答，不写入当前会话历史（规划中）"),
+    ("compact", "手动压缩当前会话上下文（旧结果 stub 化 + 摘要）"),
     (
         "config",
         "打开配置向导：选厂商 → 端点 → API Key → 模型（热生效）",
     ),
-    ("model", "切换模型：/model <名称>，或不带参数打开模型选择器"),
-    ("status", "查看当前 vendor / endpoint / model / session"),
     (
         "fork",
         "分叉会话：/fork 继承全部历史；/fork <n> 回到 n 轮之前重来（原会话保留）",
     ),
     ("help", "显示命令帮助"),
+    ("kill", "停止后台任务：/kill <id>（列表见 /tasks）"),
+    ("model", "切换模型：/model <名称>，或不带参数打开模型选择器"),
+    ("new", "开新会话（当前会话完整保留在磁盘）"),
+    ("plan", "进入/管理 Plan 计划模式（规划中）"),
+    ("quit", "退出 baiji"),
+    ("resume", "恢复其它会话（打开会话选择器）"),
+    ("session", "显示当前会话信息与统计"),
+    ("status", "查看当前 vendor / endpoint / model / session"),
+    (
+        "subagents",
+        "管理子代理：模型 / 思考级别 / 提示词（规划中）",
+    ),
+    ("tasks", "查看后台任务列表"),
+    ("thinking", "设置思考级别：/thinking <level>（规划中）"),
+    ("todos", "显示当前任务清单"),
+    ("usage", "显示用量统计：上下文 / 压缩节省 / 工具调用"),
 ];
 
 /// 输入以 `/` 开头时的命令提示（按前缀过滤）。
@@ -202,11 +218,21 @@ pub fn split_slash(input: &str) -> Option<(&str, &str)> {
     if rest.is_empty() {
         return None;
     }
-    let (cmd, args) = match rest.split_once(' ') {
+    let (cmd, a) = match rest.split_once(' ') {
         Some((c, a)) => (c, a.trim()),
         None => (rest, ""),
     };
-    Some((cmd, args))
+    Some((cmd, a))
+}
+
+/// 输入框灰色补全（fish-style ghost）：命令输入态（`/` 开头、未进参数区）时
+/// 取首个前缀匹配。Tab 键接受补全
+pub fn ghost_completion(input: &str) -> Option<(&'static str, &'static str)> {
+    let rest = input.strip_prefix('/')?;
+    if rest.is_empty() || rest.contains(' ') {
+        return None;
+    }
+    slash_hints(input)?.first().copied()
 }
 
 /// 会话选择器状态
@@ -408,8 +434,6 @@ pub struct App {
     wizard: Option<ConfigWizard>,
     /// 模型发现结果回送通道（事件循环注入）
     models_tx: Option<UnboundedSender<Result<Vec<baiji_ai::ModelInfo>, String>>>,
-    /// 斜杠命令提示的选中项（Tab 补全 / ↑↓ 移动）
-    hint_selected: usize,
     /// 会话选择器打开时为 Some
     picker: Option<SessionPicker>,
     /// 待裁决的 HITL 确认
@@ -424,6 +448,10 @@ pub struct App {
     git_branch: Option<String>,
     /// 渲染帧计数（驱动运行中指示器的旋转动画）
     frame: u64,
+    /// 后台任务注册表（/tasks、/kill；headless 装配为 None）
+    jobs: Option<Arc<baiji_tools::tools::jobs::JobRegistry>>,
+    /// 本次会话累计工具调用次数（/usage；跨 run 累计）
+    tools_total: u64,
 }
 
 impl App {
@@ -436,6 +464,7 @@ impl App {
         settings: RuntimeSettings,
         settings_summary: String,
         auto: AutoContinueConfig,
+        jobs: Option<Arc<baiji_tools::tools::jobs::JobRegistry>>,
     ) -> Self {
         let session_id = harness
             .try_lock()
@@ -463,7 +492,6 @@ impl App {
             run_interrupted: false,
             wizard: None,
             models_tx: None,
-            hint_selected: 0,
             // 空聊天区由欢迎屏兜底（快捷键提示在那里展示）
             lines: Vec::new(),
             input: String::new(),
@@ -471,6 +499,7 @@ impl App {
             agent_running: false,
             current_turn: 0,
             tool_calls: 0,
+            tools_total: 0,
             streaming: String::new(),
             thinking: String::new(),
             session_id,
@@ -485,6 +514,7 @@ impl App {
             workdir,
             git_branch,
             frame: 0,
+            jobs,
         }
     }
 
@@ -660,15 +690,15 @@ impl App {
                 if text.is_empty() {
                     return false;
                 }
-                // 斜杠命令（/model /config /status /help）。
+                // 斜杠命令（/model /config /status /help …）。
                 // 用户 prompt 模板（/name 参数）不在此处理：当作普通消息交给 Harness 展开
                 let is_template = split_slash(&text)
                     .is_some_and(|(cmd, _)| self.templates.iter().any(|(name, _)| name == cmd));
                 if let Some((cmd, args)) = split_slash(&text).filter(|_| !is_template) {
                     self.input.clear();
-                    self.handle_slash(cmd, args, ui_tx).await;
+                    let quit = self.handle_slash(cmd, args, ui_tx).await;
                     self.scroll_to_bottom();
-                    return false;
+                    return quit; // /quit 请求退出
                 }
                 self.input.clear();
                 if self.agent_running {
@@ -685,44 +715,30 @@ impl App {
             }
             KeyCode::Backspace => {
                 self.input.pop();
-                self.hint_selected = 0;
             }
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.open_picker().await;
             }
             KeyCode::Tab => {
-                // 斜杠提示激活时 Tab 补全选中的命令
-                let hints = slash_hints(&self.input).unwrap_or_default();
-                if let Some((name, _)) =
-                    hints.get(self.hint_selected.min(hints.len().saturating_sub(1)))
-                {
+                // Tab 接受输入框里的灰色补全（ghost）——补全为完整命令 + 尾随空格
+                if let Some((name, _)) = self.slash_ghost() {
                     self.input = format!("/{name} ");
                 }
             }
             KeyCode::Up => {
-                // 斜杠提示激活时移动选中项（↑ 也用于滚动，二者按是否在命令输入态区分）
-                if slash_hints(&self.input).is_some_and(|h| !h.is_empty()) {
-                    self.hint_selected = self.hint_selected.saturating_sub(1);
-                } else if self.scroll == usize::MAX {
+                if self.scroll == usize::MAX {
                     self.scroll = 0;
                 } else {
                     self.scroll = self.scroll.saturating_sub(1);
                 }
             }
             KeyCode::Down => {
-                if let Some(hints) = slash_hints(&self.input) {
-                    if self.hint_selected + 1 < hints.len() {
-                        self.hint_selected += 1;
-                        return false;
-                    }
-                }
                 if self.scroll != usize::MAX {
                     self.scroll += 1;
                 }
             }
             KeyCode::Char(c) => {
                 self.input.push(c);
-                self.hint_selected = 0;
             }
             KeyCode::PageUp => {
                 if self.scroll == usize::MAX {
@@ -1014,14 +1030,25 @@ impl App {
 
     // ---- 斜杠命令 ----
 
-    async fn handle_slash(&mut self, cmd: &str, args: &str, ui_tx: &UnboundedSender<UiEvent>) {
+    /// 斜杠命令分发。返回 true = 请求退出（/quit）
+    async fn handle_slash(
+        &mut self,
+        cmd: &str,
+        args: &str,
+        ui_tx: &UnboundedSender<UiEvent>,
+    ) -> bool {
         let _ = ui_tx;
         match cmd {
+            "quit" => return true,
             "help" => {
-                self.lines.push(ChatLine::System(
-                    "命令：/config 打开配置向导（厂商/端点/Key/模型）· /model [名称] 切换模型（不带参数打开选择）· /fork [n] 分叉会话（n = 回退轮数）· /status 查看当前配置 · /help 本帮助"
-                        .to_string(),
-                ));
+                let list: Vec<String> = SLASH_COMMANDS
+                    .iter()
+                    .map(|(name, _)| format!("/{name}"))
+                    .collect();
+                self.lines.push(ChatLine::System(format!(
+                    "命令（输入 / 后输入框灰色提示补全，Tab 接受）：{}",
+                    list.join(" · ")
+                )));
                 if !self.templates.is_empty() {
                     let list: Vec<String> = self
                         .templates
@@ -1073,7 +1100,7 @@ impl App {
                     self.lines.push(ChatLine::System(
                         "运行中不可修改配置，请先等待或 Esc 取消".to_string(),
                     ));
-                    return;
+                    return false;
                 }
                 let s = &self.settings;
                 self.wizard = Some(ConfigWizard::new(&s.vendor, s.endpoint.as_deref()));
@@ -1083,7 +1110,7 @@ impl App {
                     self.lines.push(ChatLine::System(
                         "运行中不可修改配置，请先等待或 Esc 取消".to_string(),
                     ));
-                    return;
+                    return false;
                 }
                 if args.is_empty() {
                     // 直接进入模型选择（沿用当前厂商与 Key）
@@ -1112,12 +1139,207 @@ impl App {
                     self.apply_wizard().await;
                 }
             }
-            other => {
+            "resume" => {
+                if self.agent_running {
+                    self.lines.push(ChatLine::System(
+                        "运行中无法切换会话，先按 Esc 取消".to_string(),
+                    ));
+                } else {
+                    self.open_picker().await;
+                }
+            }
+            "new" => {
+                if self.agent_running {
+                    self.lines.push(ChatLine::System(
+                        "运行中无法开新会话，先按 Esc 取消".to_string(),
+                    ));
+                } else {
+                    let result = self.harness.lock().await.start_new_session();
+                    match result {
+                        Ok(id) => {
+                            self.session_id = id.clone();
+                            self.rebuild_lines(&[]);
+                            // 会话级台账归零
+                            self.context_tokens = 0;
+                            self.bytes_saved = 0;
+                            self.tokens_saved = 0;
+                            self.tools_total = 0;
+                            self.lines.push(ChatLine::System(format!(
+                                "已开新会话 {id}（原会话保留，Ctrl+O 可切回）"
+                            )));
+                        }
+                        Err(e) => {
+                            self.lines
+                                .push(ChatLine::System(format!("✗ 开新会话失败: {e}")));
+                        }
+                    }
+                }
+            }
+            "session" => {
+                let info = self.harness.try_lock().ok().map(|h| {
+                    let meta = &h.session().meta;
+                    (
+                        meta.id.clone(),
+                        meta.parent_id.clone(),
+                        meta.created_at.clone(),
+                        meta.title.clone(),
+                        meta.project.clone(),
+                        h.session().messages.len(),
+                        h.todos_snapshot().len(),
+                    )
+                });
+                match info {
+                    Some((id, parent, created, title, project, msgs, todos)) => {
+                        self.lines.push(ChatLine::System(format!(
+                            "session {id}\n创建: {created}\n标题: {}\n项目: {}\n分叉自: {}\n消息: {msgs} 条 · todo: {todos} 条",
+                            title.as_deref().unwrap_or("（无）"),
+                            project.as_deref().unwrap_or("（无）"),
+                            parent.as_deref().unwrap_or("（根会话）"),
+                        )));
+                    }
+                    None => self
+                        .lines
+                        .push(ChatLine::System("会话忙（运行中），稍后再试".to_string())),
+                }
+            }
+            "compact" => {
+                if self.agent_running {
+                    self.lines.push(ChatLine::System(
+                        "运行中无法压缩，先按 Esc 取消".to_string(),
+                    ));
+                } else {
+                    let mut harness = self.harness.lock().await;
+                    let (stubbed, summary) = harness.compact_now().await;
+                    let messages = harness.session().messages.clone();
+                    drop(harness);
+                    self.rebuild_lines(&messages);
+                    match summary {
+                        Some(s) => self.lines.push(ChatLine::System(format!(
+                            "压缩完成：摘要 {} 字符 · stub 化 {stubbed} 条旧工具结果（可用 expand 取回）",
+                            s.chars().count()
+                        ))),
+                        None if stubbed > 0 => self.lines.push(ChatLine::System(format!(
+                            "压缩完成：stub 化 {stubbed} 条旧工具结果（无需摘要）"
+                        ))),
+                        None => self.lines.push(ChatLine::System(
+                            "历史太短，没有可压缩的内容".to_string(),
+                        )),
+                    }
+                }
+            }
+            "todos" => {
+                let items = self.todo_items();
+                if items.is_empty() {
+                    self.lines.push(ChatLine::System(
+                        "当前没有任务清单（模型可用 todo 工具创建）".to_string(),
+                    ));
+                } else {
+                    let rows: Vec<String> = items
+                        .iter()
+                        .map(|t| format!("{} {}", t.status.marker(), t.content))
+                        .collect();
+                    self.lines
+                        .push(ChatLine::System(format!("任务清单：\n{}", rows.join("\n"))));
+                }
+            }
+            "usage" => {
+                let messages = self
+                    .harness
+                    .try_lock()
+                    .map(|h| h.session().messages.len())
+                    .unwrap_or(0);
+                let saved = if self.bytes_saved > 0 {
+                    format!(
+                        "{}（约 {} tok）",
+                        format_bytes(self.bytes_saved),
+                        self.tokens_saved
+                    )
+                } else {
+                    "0B".to_string()
+                };
                 self.lines.push(ChatLine::System(format!(
-                    "未知命令 /{other}（可用: /config /model /fork /status /help）"
+                    "上下文: {} tokens · 工具调用: {} 次\n压缩节省: {saved} · 自动接力: {}/{}\n历史消息: {messages} 条 · 模型: {}",
+                    if self.context_tokens > 0 {
+                        self.context_tokens.to_string()
+                    } else {
+                        "尚无数据".to_string()
+                    },
+                    self.tools_total,
+                    self.auto_turns,
+                    self.auto.max_turns,
+                    self.settings.model.as_deref().unwrap_or("自动发现"),
+                )));
+            }
+            "tasks" => match self.jobs.as_ref() {
+                None => self.lines.push(ChatLine::System(
+                    "后台任务未启用（未接入 JobRegistry）".to_string(),
+                )),
+                Some(registry) => {
+                    let snapshot = registry.snapshot();
+                    if snapshot.is_empty() {
+                        self.lines
+                            .push(ChatLine::System("没有后台任务".to_string()));
+                    } else {
+                        let rows: Vec<String> = snapshot
+                            .iter()
+                            .map(|(id, command, log, state)| {
+                                format!(" #{id} [{}] {command}（{log}）", state.label())
+                            })
+                            .collect();
+                        self.lines
+                            .push(ChatLine::System(format!("后台任务：\n{}", rows.join("\n"))));
+                    }
+                }
+            },
+            "kill" => {
+                let Some(registry) = self.jobs.as_ref() else {
+                    self.lines.push(ChatLine::System(
+                        "后台任务未启用（未接入 JobRegistry）".to_string(),
+                    ));
+                    return false;
+                };
+                match args.trim().parse::<u32>() {
+                    Ok(id) => {
+                        if registry.stop(id) {
+                            self.lines
+                                .push(ChatLine::System(format!("已停止后台任务 #{id}")));
+                        } else {
+                            self.lines.push(ChatLine::System(format!(
+                                "未找到运行中的任务 #{id}（/tasks 查看列表）"
+                            )));
+                        }
+                    }
+                    Err(_) => self.lines.push(ChatLine::System(
+                        "用法：/kill <id>（id 见 /tasks）".to_string(),
+                    )),
+                }
+            }
+            // 尚未接入的规划中命令：注册表中可见、可补全，执行时明确告知
+            "thinking" => self.lines.push(ChatLine::System(
+                "/thinking <level> 尚未接入 provider 的思考级别配置（规划中）".to_string(),
+            )),
+            "plan" => self.lines.push(ChatLine::System(
+                "Plan 模式尚未实现（规划中：进入只读规划态，计划确认后执行）".to_string(),
+            )),
+            "subagents" => self.lines.push(ChatLine::System(
+                "子代理管理界面尚未实现（规划中：查看/修改子代理的模型、思考级别与提示词）"
+                    .to_string(),
+            )),
+            "btw" => self.lines.push(ChatLine::System(
+                "旁路提问尚未实现（规划中：不写入当前会话历史的一次性问答）".to_string(),
+            )),
+            other => {
+                let list: Vec<String> = SLASH_COMMANDS
+                    .iter()
+                    .map(|(name, _)| format!("/{name}"))
+                    .collect();
+                self.lines.push(ChatLine::System(format!(
+                    "未知命令 /{other}（可用: {} · Tab 可补全）",
+                    list.join(" ")
                 )));
             }
         }
+        false
     }
 
     // ---- 向导列表行（供键处理与渲染共用）----
@@ -1322,6 +1544,7 @@ impl App {
                 ..
             } => {
                 self.tool_calls += 1;
+                self.tools_total += 1; // /usage 台账（跨 run 累计）
                 if let Some(original) = original_bytes {
                     self.bytes_saved = self
                         .bytes_saved
@@ -1587,10 +1810,13 @@ impl App {
         self.wizard.is_some()
     }
 
-    /// 斜杠命令提示（供渲染）：(选中下标, 匹配命令)
-    pub(crate) fn slash_hints_view(&self) -> Option<(usize, Vec<(&'static str, &'static str)>)> {
-        let hints = slash_hints(&self.input)?;
-        Some((self.hint_selected.min(hints.len().saturating_sub(1)), hints))
+    /// 输入框灰色补全（供渲染与 Tab 接受）：(命令名, 用法)。
+    /// 向导输入框不属于命令语义——打开时不出补全
+    pub(crate) fn slash_ghost(&self) -> Option<(&'static str, &'static str)> {
+        if self.wizard.is_some() {
+            return None;
+        }
+        ghost_completion(&self.input)
     }
 
     /// 向导标题（按步骤）
@@ -1754,6 +1980,7 @@ mod tests {
             },
             "max_turns: 24 · compaction: on (auto)".to_string(),
             AutoContinueConfig::default(),
+            None,
         );
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
@@ -1886,8 +2113,50 @@ mod tests {
         app.current_turn = 0;
         app.tool_calls = 0;
 
-        // 斜杠提示条（四段布局）："/" 全量、"/m" 过滤、"/model x" 参数用法
-        for input in ["/", "/m", "/model glm-4.7", "/zzz"] {
+        // /todos 与 /quit 命令分发（Enter 路径）
+        let ui_tx = tokio::sync::mpsc::unbounded_channel().0;
+        todo_store.replace(vec![baiji_harness::TodoItem {
+            id: 1,
+            content: "分析依赖".to_string(),
+            status: baiji_harness::TodoStatus::Done,
+            note: None,
+        }]);
+        app.input = "/todos".to_string();
+        app.handle_key(KeyEvent::new(K::Enter, M::NONE), &ui_tx)
+            .await;
+        assert!(
+            app.lines
+                .iter()
+                .any(|l| matches!(l, ChatLine::System(s) if s.contains("[x] 分析依赖"))),
+            "/todos prints the list"
+        );
+        app.input = "/quit".to_string();
+        assert!(
+            app.handle_key(KeyEvent::new(K::Enter, M::NONE), &ui_tx)
+                .await,
+            "/quit requests exit"
+        );
+
+        // 输入框灰色补全（ghost）：命令输入态在光标后展示余下部分，
+        // 状态栏右侧临时显示用法；Tab 接受补全
+        app.input = "/mo".to_string();
+        terminal.clear().unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let rows = screen(&terminal);
+        assert!(
+            rows.iter().any(|r| r.contains("/mo▏del ")),
+            "ghost completion visible after the cursor"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.replace(' ', "").contains(&"切换模型".to_string())),
+            "status bar shows the ghost command's usage"
+        );
+        let ui_tx = tokio::sync::mpsc::unbounded_channel().0;
+        app.handle_key(KeyEvent::new(K::Tab, M::NONE), &ui_tx).await;
+        assert_eq!(app.input(), "/model ", "Tab accepts the ghost completion");
+        // 参数区不再出补全；未知前缀也没有
+        for input in ["/model glm-4.7", "/zzz", "普通消息"] {
             app.input = input.to_string();
             terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
         }
@@ -1967,6 +2236,19 @@ mod tests {
         // 无匹配 / 非斜杠
         assert!(slash_hints("/xyz").unwrap().is_empty());
         assert!(slash_hints("普通消息").is_none());
+    }
+
+    #[test]
+    fn test_ghost_completion() {
+        // 裸 "/"、非斜杠输入、参数区、无匹配：都不出补全
+        assert!(ghost_completion("/").is_none());
+        assert!(ghost_completion("普通消息").is_none());
+        assert!(ghost_completion("/model glm-4.7").is_none());
+        assert!(ghost_completion("/zzz").is_none());
+        // 首个前缀匹配（大小写不敏感；字典序）
+        assert_eq!(ghost_completion("/mo").unwrap().0, "model");
+        assert_eq!(ghost_completion("/MO").unwrap().0, "model");
+        assert_eq!(ghost_completion("/t").unwrap().0, "tasks");
     }
 
     #[test]
