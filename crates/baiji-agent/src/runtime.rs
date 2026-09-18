@@ -56,6 +56,9 @@ pub struct AgentRuntime {
     /// verbosity steer：向请求内最后一条 user 消息追加恒定"简洁作答"指令
     /// （请求级注入，不改会话历史；参考 lean-ctx，输出 token 实测可省约三分之一）
     verbosity_steer: bool,
+    /// 思考级别（请求级推理强度；RwLock 支持运行中热切换，如 TUI 的 /thinking）。
+    /// None = 不发送思考字段（协议默认行为）
+    thinking: std::sync::RwLock<Option<baiji_ai::ThinkingLevel>>,
     /// spill 能力（可选）：运行中就地精简旧工具结果时，原文写入 ctx store
     /// 返回句柄（可逆）。闭包注入而非依赖 baiji-tools——agent 在依赖图上
     /// 位于 tools 之下，直接依赖会成环
@@ -80,6 +83,7 @@ impl AgentRuntime {
             retry_base_delay: Duration::from_millis(500),
             retry_max_delay: Duration::from_millis(30_000),
             verbosity_steer: false,
+            thinking: std::sync::RwLock::new(None),
             spill: None,
         }
     }
@@ -116,6 +120,22 @@ impl AgentRuntime {
     pub fn with_verbosity_steer(mut self, enabled: bool) -> Self {
         self.verbosity_steer = enabled;
         self
+    }
+
+    /// 设置思考级别（对应配置 `thinking`；None = 不启用）
+    pub fn with_thinking(mut self, thinking: Option<baiji_ai::ThinkingLevel>) -> Self {
+        *self.thinking.write().unwrap() = thinking;
+        self
+    }
+
+    /// 热切换思考级别（TUI /thinking；下一次请求生效）
+    pub fn set_thinking(&self, thinking: Option<baiji_ai::ThinkingLevel>) {
+        *self.thinking.write().unwrap() = thinking;
+    }
+
+    /// 当前思考级别
+    pub fn thinking(&self) -> Option<baiji_ai::ThinkingLevel> {
+        *self.thinking.read().unwrap()
     }
 
     /// 注入 spill 能力：运行中精简旧工具结果时原文可逆（ctx 句柄 + expand 取回）
@@ -265,7 +285,8 @@ impl AgentRuntime {
             }
             let request = ChatRequest::new(request_messages)
                 .with_tools(self.tools.definitions())
-                .with_max_tokens(self.max_tokens);
+                .with_max_tokens(self.max_tokens)
+                .with_thinking(self.thinking());
             let response = match self.stream_with_retry(request, events, cancel).await? {
                 Some(response) => response,
                 None => {
@@ -1276,6 +1297,20 @@ mod tests {
         let mut tools = ToolRegistry::new();
         tools.register(Arc::new(AppendTool));
         AgentRuntime::new(Arc::new(provider)).with_tools(tools)
+    }
+
+    #[test]
+    fn test_thinking_level_builder_and_hot_swap() {
+        use baiji_ai::ThinkingLevel;
+        let runtime = runtime_with(MockProvider::new(Script::AnswerOnly("ok")));
+        assert_eq!(runtime.thinking(), None, "default off");
+        let runtime = runtime.with_thinking(Some(ThinkingLevel::High));
+        assert_eq!(runtime.thinking(), Some(ThinkingLevel::High));
+        // 热切换（TUI /thinking 路径）：&self 即可修改，下一次请求生效
+        runtime.set_thinking(Some(ThinkingLevel::Minimal));
+        assert_eq!(runtime.thinking(), Some(ThinkingLevel::Minimal));
+        runtime.set_thinking(None);
+        assert_eq!(runtime.thinking(), None);
     }
 
     async fn drive(runtime: &AgentRuntime, messages: &mut Vec<Message>) -> Vec<AgentEvent> {

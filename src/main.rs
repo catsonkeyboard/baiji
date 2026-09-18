@@ -296,6 +296,16 @@ async fn main() -> Result<()> {
     if let Some(max_tokens) = app_config.max_tokens {
         runtime_builder = runtime_builder.with_max_tokens(max_tokens);
     }
+    // 思考级别（minimal/low/medium/high；非法值告警并忽略）
+    if let Some(raw) = app_config.thinking.as_deref() {
+        match baiji_ai::ThinkingLevel::parse(raw) {
+            Some(level) => {
+                info!("thinking level: {}", level.effort());
+                runtime_builder = runtime_builder.with_thinking(Some(level));
+            }
+            None => warn!("ignoring invalid thinking level '{raw}' (minimal/low/medium/high)"),
+        }
+    }
     // 不超过模型自身的输出上限（超出会被 API 直接拒绝）
     if let Some(cap) = limits.max_output_tokens.and_then(|c| u32::try_from(c).ok())
         && runtime_builder.max_tokens() > cap
@@ -456,6 +466,10 @@ async fn main() -> Result<()> {
         endpoint: app_config.endpoint.clone(),
         model: Some(model_name.clone()),
         api_key,
+        thinking: app_config
+            .thinking
+            .as_deref()
+            .and_then(baiji_ai::ThinkingLevel::parse),
     };
     let config_path = config::AppConfig::default_path()?;
 

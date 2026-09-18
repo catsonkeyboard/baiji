@@ -3,9 +3,7 @@
 //! 对应 `POST {base_url}/v1/chat/completions`，
 //! 兼容绝大多数 OpenAI 协议兼容服务（DeepSeek / GLM / Moonshot / vLLM 等）。
 
-use crate::types::{
-    ChatRequest, ChatResponse, Message, Role, StreamChunk, TokenUsage, ToolCall,
-};
+use crate::types::{ChatRequest, ChatResponse, Message, Role, StreamChunk, TokenUsage, ToolCall};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -24,6 +22,9 @@ pub struct ChatCompletionsRequest {
     pub max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    /// 推理强度（o 系列 / gpt-5 等）；None 时不发送
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<&'static str>,
     pub stream: bool,
     /// 流式时请求在末尾附带 usage chunk
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -39,9 +40,9 @@ pub struct StreamOptions {
 /// 只匹配裸 id——带厂商前缀的（OpenRouter 的 `openai/gpt-5`）由网关自行归一化。
 pub(crate) fn uses_max_completion_tokens(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
-    let o_series = m.strip_prefix('o').is_some_and(|rest| {
-        rest.chars().next().is_some_and(|c| c.is_ascii_digit())
-    });
+    let o_series = m
+        .strip_prefix('o')
+        .is_some_and(|rest| rest.chars().next().is_some_and(|c| c.is_ascii_digit()));
     o_series || m.starts_with("gpt-5")
 }
 
@@ -109,8 +110,11 @@ pub fn build_request(model: &str, request: &ChatRequest, stream: bool) -> ChatCo
         max_completion_tokens: request.max_tokens.filter(|_| reasoning_model),
         // 这些模型只接受默认 temperature
         temperature: request.temperature.filter(|_| !reasoning_model),
+        reasoning_effort: request.thinking.map(|level| level.effort()),
         stream,
-        stream_options: stream.then_some(StreamOptions { include_usage: true }),
+        stream_options: stream.then_some(StreamOptions {
+            include_usage: true,
+        }),
     }
 }
 
@@ -320,7 +324,8 @@ impl ChatStreamState {
         if let Some(err) = chunk.error {
             self.finished = true;
             return vec![StreamChunk::Error(
-                err.message.unwrap_or_else(|| "Unknown API error".to_string()),
+                err.message
+                    .unwrap_or_else(|| "Unknown API error".to_string()),
             )];
         }
 
@@ -491,36 +496,44 @@ struct ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Message, ToolCall, ToolDefinition, ToolResult};
+    use crate::types::{Message, ThinkingLevel, ToolCall, ToolDefinition, ToolResult};
+
+    #[test]
+    fn test_reasoning_effort_field() {
+        // 启用：reasoning_effort 下发（对推理模型）
+        let request = sample_request().with_thinking(Some(ThinkingLevel::Medium));
+        let body = serde_json::to_value(build_request("o3", &request, true)).unwrap();
+        assert_eq!(body["reasoning_effort"], "medium");
+
+        // 未启用：字段不出现（非推理模型不接受该字段）
+        let body = serde_json::to_value(build_request("gpt-4o", &sample_request(), true)).unwrap();
+        assert!(body.get("reasoning_effort").is_none());
+    }
 
     fn sample_request() -> ChatRequest {
         let mut messages = vec![Message::system("You are helpful")];
         messages.push(Message::user("grep for foo"));
-        messages.push(
-            Message {
-                role: Role::Assistant,
-                content: String::new(),
-                tool_calls: Some(vec![ToolCall {
-                    id: "call_1".to_string(),
-                    name: "builtin__grep".to_string(),
-                    arguments: serde_json::json!({"pattern": "foo"}),
-                }]),
-                tool_results: None,
-                reasoning: None,
-            },
-        );
-        messages.push(
-            Message {
-                role: Role::Tool,
-                content: String::new(),
-                tool_calls: None,
-                tool_results: Some(vec![ToolResult {
-                    tool_call_id: "call_1".to_string(),
-                    content: "src/main.rs:1:foo".to_string(),
-                }]),
-                reasoning: None,
-            },
-        );
+        messages.push(Message {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "builtin__grep".to_string(),
+                arguments: serde_json::json!({"pattern": "foo"}),
+            }]),
+            tool_results: None,
+            reasoning: None,
+        });
+        messages.push(Message {
+            role: Role::Tool,
+            content: String::new(),
+            tool_calls: None,
+            tool_results: Some(vec![ToolResult {
+                tool_call_id: "call_1".to_string(),
+                content: "src/main.rs:1:foo".to_string(),
+            }]),
+            reasoning: None,
+        });
 
         ChatRequest::new(messages)
             .with_tools(vec![ToolDefinition {
@@ -542,8 +555,14 @@ mod tests {
 
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 4);
-        assert_eq!(messages[0], serde_json::json!({"role": "system", "content": "You are helpful"}));
-        assert_eq!(messages[1], serde_json::json!({"role": "user", "content": "grep for foo"}));
+        assert_eq!(
+            messages[0],
+            serde_json::json!({"role": "system", "content": "You are helpful"})
+        );
+        assert_eq!(
+            messages[1],
+            serde_json::json!({"role": "user", "content": "grep for foo"})
+        );
 
         // 纯工具调用轮次：content 省略，tool_calls 展开且 arguments 是 JSON 字符串
         let assistant = &messages[2];
@@ -551,7 +570,10 @@ mod tests {
         assert!(assistant.get("content").is_none());
         assert_eq!(assistant["tool_calls"][0]["id"], "call_1");
         assert_eq!(assistant["tool_calls"][0]["type"], "function");
-        assert_eq!(assistant["tool_calls"][0]["function"]["name"], "builtin__grep");
+        assert_eq!(
+            assistant["tool_calls"][0]["function"]["name"],
+            "builtin__grep"
+        );
         assert_eq!(
             assistant["tool_calls"][0]["function"]["arguments"],
             serde_json::json!(r#"{"pattern":"foo"}"#)
@@ -615,7 +637,10 @@ mod tests {
         let chunks = state.process_data(
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":":\"foo\"}"}}]}}]}"#,
         );
-        assert!(chunks.is_empty(), "buffered tool call must not emit mid-stream");
+        assert!(
+            chunks.is_empty(),
+            "buffered tool call must not emit mid-stream"
+        );
 
         // [DONE] 触发一次性下发，arguments 是完整 JSON 字符串
         let chunks = state.process_data("[DONE]");
@@ -651,8 +676,9 @@ mod tests {
     #[test]
     fn test_stream_error_event() {
         let mut state = ChatStreamState::default();
-        let chunks =
-            state.process_data(r#"{"error":{"message":"Invalid API key","type":"invalid_request_error"}}"#);
+        let chunks = state.process_data(
+            r#"{"error":{"message":"Invalid API key","type":"invalid_request_error"}}"#,
+        );
 
         assert_eq!(
             chunks,
@@ -688,7 +714,13 @@ mod tests {
             assert!(body.get("max_tokens").is_none(), "{model}");
             assert!(body.get("temperature").is_none(), "{model}");
         }
-        for model in ["gpt-4o", "deepseek-chat", "glm-4.6", "openai/gpt-5", "olmo-2"] {
+        for model in [
+            "gpt-4o",
+            "deepseek-chat",
+            "glm-4.6",
+            "openai/gpt-5",
+            "olmo-2",
+        ] {
             let body = serde_json::to_value(build_request(model, &request, true)).unwrap();
             assert_eq!(body["max_tokens"], 2048, "{model}");
             assert!(body.get("max_completion_tokens").is_none(), "{model}");
@@ -712,12 +744,16 @@ mod tests {
             state.process_data(r#"{"choices":[{"delta":{"reasoning":"ok"}}]}"#),
             vec![StreamChunk::Reasoning("ok".to_string())]
         );
-        state.process_data(r#"{"choices":[],"usage":{"prompt_tokens":900,"completion_tokens":30}}"#);
+        state
+            .process_data(r#"{"choices":[],"usage":{"prompt_tokens":900,"completion_tokens":30}}"#);
         let chunks = state.process_data("[DONE]");
         assert_eq!(
             chunks,
             vec![
-                StreamChunk::Usage(TokenUsage { input_tokens: 900, output_tokens: 30 }),
+                StreamChunk::Usage(TokenUsage {
+                    input_tokens: 900,
+                    output_tokens: 30
+                }),
                 StreamChunk::Done
             ]
         );
@@ -738,17 +774,34 @@ mod tests {
         }]);
         let messages = vec![
             Message::user("old"),
-            Message { tool_calls: call.clone(), reasoning: reasoning.clone(), ..Message::assistant("") },
-            Message { reasoning: reasoning.clone(), ..Message::assistant("old answer") },
+            Message {
+                tool_calls: call.clone(),
+                reasoning: reasoning.clone(),
+                ..Message::assistant("")
+            },
+            Message {
+                reasoning: reasoning.clone(),
+                ..Message::assistant("old answer")
+            },
             Message::user("new"),
-            Message { tool_calls: call, reasoning, ..Message::assistant("") },
+            Message {
+                tool_calls: call,
+                reasoning,
+                ..Message::assistant("")
+            },
         ];
-        let body =
-            serde_json::to_value(build_request("deepseek-chat", &ChatRequest::new(messages), true))
-                .unwrap();
+        let body = serde_json::to_value(build_request(
+            "deepseek-chat",
+            &ChatRequest::new(messages),
+            true,
+        ))
+        .unwrap();
         let msgs = body["messages"].as_array().unwrap();
         assert!(msgs[1].get("reasoning_content").is_none(), "old turn");
-        assert!(msgs[2].get("reasoning_content").is_none(), "final answers never replay");
+        assert!(
+            msgs[2].get("reasoning_content").is_none(),
+            "final answers never replay"
+        );
         assert_eq!(msgs[4]["reasoning_content"], "plan");
     }
 }

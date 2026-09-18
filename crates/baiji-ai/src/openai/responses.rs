@@ -25,6 +25,9 @@ pub struct ResponsesRequest {
     pub max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    /// 推理强度（`reasoning: {effort}`）；None 时不发送
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ResponsesReasoning>,
     pub stream: bool,
     /// 推理模型：`["reasoning.encrypted_content"]`，让服务端把思考以密文形式返回
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -33,6 +36,12 @@ pub struct ResponsesRequest {
     /// 不关掉的话服务端会白存一份，且下一次请求拿不到上一轮的思考
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store: Option<bool>,
+}
+
+/// Responses 协议的推理强度
+#[derive(Debug, Serialize)]
+pub struct ResponsesReasoning {
+    pub effort: &'static str,
 }
 
 /// 输入项。消息使用无 type 标签的「简化输入」形式（content 为纯字符串）；
@@ -182,6 +191,9 @@ pub fn build_request(model: &str, request: &ChatRequest, stream: bool) -> Respon
         max_output_tokens: request.max_tokens,
         // 推理模型只接受默认 temperature
         temperature: request.temperature.filter(|_| !reasoning_model),
+        reasoning: request.thinking.map(|level| ResponsesReasoning {
+            effort: level.effort(),
+        }),
         stream,
         include: reasoning_model.then(|| vec!["reasoning.encrypted_content"]),
         store: reasoning_model.then_some(false),
@@ -334,7 +346,9 @@ impl ResponsesStreamState {
                 match event.item {
                     Some(item) if item.item_type == "reasoning" => {
                         match (item.id, item.encrypted_content) {
-                            (Some(id), Some(encrypted_content)) if !encrypted_content.is_empty() => {
+                            (Some(id), Some(encrypted_content))
+                                if !encrypted_content.is_empty() =>
+                            {
                                 let summary = item
                                     .summary
                                     .as_ref()
@@ -398,7 +412,10 @@ impl ResponsesStreamState {
                 let reason = event
                     .response
                     .as_ref()
-                    .and_then(|r| r.pointer("/incomplete_details/reason").and_then(Value::as_str))
+                    .and_then(|r| {
+                        r.pointer("/incomplete_details/reason")
+                            .and_then(Value::as_str)
+                    })
                     .unwrap_or("incomplete");
                 self.incomplete_reason = Some(reason.to_string());
                 self.capture_usage(event.response.as_ref());
@@ -468,7 +485,9 @@ impl ResponsesStreamState {
                 arguments: tool.arguments,
             });
         }
-        let had_tools = out.iter().any(|c| matches!(c, StreamChunk::ToolCallStart { .. }));
+        let had_tools = out
+            .iter()
+            .any(|c| matches!(c, StreamChunk::ToolCallStart { .. }));
         let stop = match self.incomplete_reason.take() {
             Some(reason) => match crate::types::StopReason::parse(&reason) {
                 // "incomplete" 等未知原因一律按截断处理：输出不完整
@@ -514,36 +533,44 @@ struct ResponsesStreamEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Message, ToolCall, ToolDefinition, ToolResult};
+    use crate::types::{Message, ThinkingLevel, ToolCall, ToolDefinition, ToolResult};
+
+    #[test]
+    fn test_reasoning_effort_in_responses() {
+        // 启用：reasoning.effort 下发
+        let request = sample_request().with_thinking(Some(ThinkingLevel::High));
+        let body = serde_json::to_value(build_request("gpt-5", &request, true)).unwrap();
+        assert_eq!(body["reasoning"]["effort"], "high");
+
+        // 未启用：字段不出现
+        let body = serde_json::to_value(build_request("gpt-5", &sample_request(), true)).unwrap();
+        assert!(body.get("reasoning").is_none());
+    }
 
     fn sample_request() -> ChatRequest {
         let mut messages = vec![Message::system("You are helpful")];
         messages.push(Message::user("grep for foo"));
-        messages.push(
-            Message {
-                role: Role::Assistant,
-                content: String::new(),
-                tool_calls: Some(vec![ToolCall {
-                    id: "call_1".to_string(),
-                    name: "builtin__grep".to_string(),
-                    arguments: serde_json::json!({"pattern": "foo"}),
-                }]),
-                tool_results: None,
-                reasoning: None,
-            },
-        );
-        messages.push(
-            Message {
-                role: Role::Tool,
-                content: String::new(),
-                tool_calls: None,
-                tool_results: Some(vec![ToolResult {
-                    tool_call_id: "call_1".to_string(),
-                    content: "src/main.rs:1:foo".to_string(),
-                }]),
-                reasoning: None,
-            },
-        );
+        messages.push(Message {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "builtin__grep".to_string(),
+                arguments: serde_json::json!({"pattern": "foo"}),
+            }]),
+            tool_results: None,
+            reasoning: None,
+        });
+        messages.push(Message {
+            role: Role::Tool,
+            content: String::new(),
+            tool_calls: None,
+            tool_results: Some(vec![ToolResult {
+                tool_call_id: "call_1".to_string(),
+                content: "src/main.rs:1:foo".to_string(),
+            }]),
+            reasoning: None,
+        });
 
         ChatRequest::new(messages)
             .with_tools(vec![ToolDefinition {
@@ -566,12 +593,18 @@ mod tests {
         let input = body["input"].as_array().unwrap();
         assert_eq!(input.len(), 3);
         // 简化输入形式：无 type 标签，content 为纯字符串
-        assert_eq!(input[0], serde_json::json!({"role": "user", "content": "grep for foo"}));
+        assert_eq!(
+            input[0],
+            serde_json::json!({"role": "user", "content": "grep for foo"})
+        );
         // 纯工具调用轮次：assistant 文本消息被省略，仅剩 function_call 项
         assert_eq!(input[1]["type"], "function_call");
         assert_eq!(input[1]["call_id"], "call_1");
         assert_eq!(input[1]["name"], "builtin__grep");
-        assert_eq!(input[1]["arguments"], serde_json::json!(r#"{"pattern":"foo"}"#));
+        assert_eq!(
+            input[1]["arguments"],
+            serde_json::json!(r#"{"pattern":"foo"}"#)
+        );
         assert_eq!(input[2]["type"], "function_call_output");
         assert_eq!(input[2]["call_id"], "call_1");
         assert_eq!(input[2]["output"], "src/main.rs:1:foo");
@@ -614,8 +647,7 @@ mod tests {
         let mut state = ResponsesStreamState::default();
 
         // 文本增量立即下发
-        let chunks =
-            state.process_data(r#"{"type":"response.output_text.delta","delta":"Hello"}"#);
+        let chunks = state.process_data(r#"{"type":"response.output_text.delta","delta":"Hello"}"#);
         assert_eq!(chunks, vec![StreamChunk::Content("Hello".to_string())]);
 
         // function_call 项加入 + 参数增量（按 item_id 定位），均缓冲不下发

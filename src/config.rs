@@ -4,7 +4,7 @@
 //! - 全局：`~/.baiji/config.json`（不存在时自动生成模板）
 //! - 项目：`./.baiji/config.json`（与 skills/prompts 同目录；可选）
 //!
-//! 项目级只能覆盖白名单字段（model/max_tokens/max_turns/llm_compaction/
+//! 项目级只能覆盖白名单字段（model/max_tokens/thinking/max_turns/llm_compaction/
 //! compaction/retry/ui/policy 的非安全字段）。安全敏感项只认全局配置：
 //! api_key/vendor/endpoint/base_url/protocol（防项目重定向把 Key 发到任意
 //! 服务器）与 policy.allowed_paths/require_confirmation_tools（防恶意仓库
@@ -44,6 +44,11 @@ pub struct AppConfig {
     pub protocol: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// 思考级别（"minimal" / "low" / "medium" / "high"；缺省 = 不启用）。
+    /// Anthropic 端点映射 `thinking.budget_tokens`，OpenAI 系映射
+    /// `reasoning_effort` / `reasoning.effort`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
     /// 用 LLM 生成上下文压缩摘要（默认 false = 确定性摘要）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_compaction: Option<bool>,
@@ -241,6 +246,7 @@ fn default_theme() -> String {
 const PROJECT_ALLOWED_TOP: &[&str] = &[
     "model",
     "max_tokens",
+    "thinking",
     "max_turns",
     "llm_compaction",
     "skills",
@@ -465,12 +471,13 @@ impl AppConfig {
             }
         };
         format!(
-            "max_tokens: {} · max_turns: {} · compaction: {compaction} (keep {} turns) · \
+            "max_tokens: {} · thinking: {} · max_turns: {} · compaction: {compaction} (keep {} turns) · \
              retry: {}×{}ms (cap {}ms) · compression: {} · verbosity_steer: {} · \
              auto_continue: {} (cap {}) · skills: {} · hooks: {} · project config: {}",
             self.max_tokens
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "默认".into()),
+            self.thinking.as_deref().unwrap_or("off"),
             self.max_turns,
             self.compaction.keep_recent_turns,
             self.retry.max_retries,
@@ -541,6 +548,7 @@ impl AppConfig {
             "protocol": null,
             "base_url": null,
             "max_tokens": 8192,
+            "thinking": null,
             "llm_compaction": false,
             "max_turns": 24,
             "skills": {
@@ -881,6 +889,22 @@ mod tests {
         assert!(cfg.compaction.enabled);
         assert!(cfg.compaction.max_estimated_tokens.is_none());
         assert_eq!(cfg.retry.max_delay_ms, 30_000);
+        // 模板带 thinking 字段（缺省关闭）
+        assert!(AppConfig::template().contains("\"thinking\": null"));
+    }
+
+    #[test]
+    fn test_thinking_config_parse_and_project_scope() {
+        let cfg: AppConfig =
+            serde_json::from_str(r#"{"vendor":"glm","api_key":"k","thinking":"high"}"#).unwrap();
+        assert_eq!(cfg.thinking.as_deref(), Some("high"));
+
+        // thinking 在项目级白名单内（与 max_tokens 同级，非安全敏感）
+        assert!(PROJECT_ALLOWED_TOP.contains(&"thinking"));
+
+        // runtime_summary 显示思考级别
+        let summary = cfg.runtime_summary();
+        assert!(summary.contains("thinking: high"), "{summary}");
     }
 
     #[test]
@@ -906,6 +930,7 @@ mod tests {
             base_url: None,
             protocol: None,
             max_tokens: None,
+            thinking: None,
             llm_compaction: None,
             max_turns: 24,
             skills: SkillsConfig::default(),
@@ -936,6 +961,7 @@ mod tests {
             base_url: None,
             protocol: None,
             max_tokens: None,
+            thinking: None,
             llm_compaction: None,
             max_turns: 24,
             skills: SkillsConfig::default(),
@@ -956,6 +982,7 @@ mod tests {
             base_url: None,
             protocol: Some("bogus".to_string()),
             max_tokens: None,
+            thinking: None,
             llm_compaction: None,
             max_turns: 24,
             skills: SkillsConfig::default(),
@@ -979,6 +1006,7 @@ mod tests {
             base_url: None,
             protocol: None,
             max_tokens: None,
+            thinking: None,
             llm_compaction: None,
             max_turns: 24,
             skills: SkillsConfig::default(),
@@ -1004,6 +1032,7 @@ mod tests {
             base_url: None,
             protocol: None,
             max_tokens: None,
+            thinking: None,
             llm_compaction: None,
             max_turns: 24,
             skills: SkillsConfig::default(),

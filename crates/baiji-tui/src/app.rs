@@ -181,7 +181,10 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
         "管理子代理：模型 / 思考级别 / 提示词（规划中）",
     ),
     ("tasks", "查看后台任务列表"),
-    ("thinking", "设置思考级别：/thinking <level>（规划中）"),
+    (
+        "thinking",
+        "设置思考级别：/thinking <minimal|low|medium|high|off>，热生效",
+    ),
     ("todos", "显示当前任务清单"),
     ("usage", "显示用量统计：上下文 / 压缩节省 / 工具调用"),
 ];
@@ -936,6 +939,7 @@ impl App {
             endpoint: wizard.endpoint.clone(),
             model: None,
             api_key: self.wizard_key(wizard),
+            thinking: self.settings.thinking,
         };
         let Some(tx) = &self.models_tx else { return };
         let tx = tx.clone();
@@ -990,6 +994,8 @@ impl App {
             endpoint: wizard.endpoint.filter(|e| e != "api"),
             model: wizard.model,
             api_key,
+            // 向导不动思考级别：沿用当前值（save 会一并落盘）
+            thinking: self.settings.thinking,
         };
 
         if let Err(e) = settings::save(&self.config_path, &new_settings, key_update) {
@@ -1087,10 +1093,11 @@ impl App {
             "status" => {
                 let s = &self.settings;
                 self.lines.push(ChatLine::System(format!(
-                    "vendor: {} · endpoint: {} · model: {} · session: {}\n{}",
+                    "vendor: {} · endpoint: {} · model: {} · thinking: {} · session: {}\n{}",
                     s.vendor,
                     s.endpoint.as_deref().unwrap_or("api"),
                     s.model.as_deref().unwrap_or("自动发现"),
+                    s.thinking.map(|l| l.effort()).unwrap_or("off"),
                     self.session_id,
                     self.settings_summary
                 )));
@@ -1314,10 +1321,50 @@ impl App {
                     )),
                 }
             }
-            // 尚未接入的规划中命令：注册表中可见、可补全，执行时明确告知
-            "thinking" => self.lines.push(ChatLine::System(
-                "/thinking <level> 尚未接入 provider 的思考级别配置（规划中）".to_string(),
-            )),
+            // 思考级别：/thinking <minimal|low|medium|high|off>，热生效（下一次请求）
+            // 并落盘；不带参数显示当前级别
+            "thinking" => {
+                let arg = args.trim().to_ascii_lowercase();
+                if arg.is_empty() {
+                    let current = self
+                        .settings
+                        .thinking
+                        .map(|l| l.effort().to_string())
+                        .unwrap_or_else(|| "off".to_string());
+                    self.lines.push(ChatLine::System(format!(
+                        "当前思考级别: {current}\n用法：/thinking <minimal|low|medium|high>，或 /thinking off 关闭\nAnthropic 端点映射 thinking.budget_tokens，OpenAI 系映射 reasoning_effort / reasoning.effort"
+                    )));
+                } else {
+                    let level = if arg == "off" || arg == "none" {
+                        None
+                    } else {
+                        match baiji_ai::ThinkingLevel::parse(&arg) {
+                            Some(level) => Some(level),
+                            None => {
+                                self.lines.push(ChatLine::System(
+                                    "用法：/thinking <minimal|low|medium|high|off>".to_string(),
+                                ));
+                                return false;
+                            }
+                        }
+                    };
+                    self.settings.thinking = level;
+                    if let Err(e) =
+                        settings::save(&self.config_path, &self.settings, settings::KeyUpdate::Keep)
+                    {
+                        self.lines
+                            .push(ChatLine::System(format!("✗ 配置保存失败: {e}")));
+                    } else {
+                        let shown = level
+                            .map(|l| l.effort().to_string())
+                            .unwrap_or_else(|| "off".to_string());
+                        self.harness.lock().await.set_thinking(level);
+                        self.lines.push(ChatLine::System(format!(
+                            "思考级别已设为 {shown}（下一次请求生效，已写入配置）"
+                        )));
+                    }
+                }
+            }
             "plan" => self.lines.push(ChatLine::System(
                 "Plan 模式尚未实现（规划中：进入只读规划态，计划确认后执行）".to_string(),
             )),
@@ -1977,6 +2024,7 @@ mod tests {
                 endpoint: None,
                 model: Some("glm-4.7".to_string()),
                 api_key: "k".to_string(),
+                thinking: None,
             },
             "max_turns: 24 · compaction: on (auto)".to_string(),
             AutoContinueConfig::default(),
@@ -2112,6 +2160,37 @@ mod tests {
         app.agent_running = false;
         app.current_turn = 0;
         app.tool_calls = 0;
+
+        // /thinking <level>：热切换 + 落盘（save 读文件，先写入基线配置）
+        let ui_tx = tokio::sync::mpsc::unbounded_channel().0;
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"vendor":"glm","api_key":"k"}"#,
+        )
+        .unwrap();
+        app.handle_slash("thinking", "high", &ui_tx).await;
+        assert_eq!(app.settings.thinking, Some(baiji_ai::ThinkingLevel::High));
+        assert!(
+            std::fs::read_to_string(dir.path().join("config.json"))
+                .unwrap()
+                .contains("\"thinking\": \"high\""),
+            "persisted to the config file"
+        );
+        assert_eq!(
+            app.harness.try_lock().unwrap().thinking_level(),
+            Some(baiji_ai::ThinkingLevel::High),
+            "runtime hot-swapped"
+        );
+        // off 关闭
+        app.handle_slash("thinking", "off", &ui_tx).await;
+        assert_eq!(app.settings.thinking, None);
+        // 非法值提示用法
+        app.handle_slash("thinking", "bogus", &ui_tx).await;
+        assert!(
+            app.lines
+                .iter()
+                .any(|l| matches!(l, ChatLine::System(s) if s.contains("用法：/thinking")))
+        );
 
         // /todos 与 /quit 命令分发（Enter 路径）
         let ui_tx = tokio::sync::mpsc::unbounded_channel().0;
