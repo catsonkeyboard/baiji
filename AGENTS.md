@@ -7,7 +7,7 @@ A terminal AI coding agent built on a multi-crate Rust workspace: async streamin
 ```bash
 cargo build                # Build the whole workspace
 cargo run                  # Run the TUI app (default)
-cargo test --workspace     # Run all tests (330 total)
+cargo test --workspace     # Run all tests (334 total)
 baiji -e "msg" --yes      # Headless one-shot run (streams to stdout)
 baiji --sessions          # List sessions (no API key needed)
 cargo test -p baiji-agent  # Test a single crate
@@ -29,7 +29,8 @@ crates/
   baiji-harness/     AgentHarness: session tree, JSONL persistence, compaction,
                      skills loading, prompt templates, run loop
   baiji-extensions/  Plugin layer (Plugin/PluginManager) + built-ins: clock, safety
-  baiji-tui/         Ratatui terminal UI (chat / input / status, streaming, steering)
+  baiji-tui/         Ratatui terminal UI (header / chat / input / status, streaming,
+                     steering, floating todo panel)
 src/                 Root bin crate `baiji`: config resolution + composition
 ```
 
@@ -181,12 +182,13 @@ MCP: `mcp` module ports the mcporter CLI bridge — `register_mcp_tools(&mut Too
 
 ### TUI (`baiji-tui`)
 
-Chat / input / status layout. Streaming text renders into a partial line and lands as a full line on `RunCompleted`. Typing during a run pushes steering; Esc cancels via `CancellationToken`; PageUp/PageDown scroll with a `usize::MAX` stick-to-bottom sentinel clamped each frame.
+Claude Code / OpenCode / Grok-style layout: one-line header (brand + git branch + `~`-abbreviated workdir left, vendor·model or running spinner right) → borderless chat area (2-col side padding, blank line between message groups) → optional slash-hint bar → rounded input box → one-line status bar (run state left, ctx/saved/session right). Message styling: user `❯ ` bold + full-row highlight strip (`theme.highlight`), assistant plain gray, tool activity `● Name(args)` (colored dot, bold name) with `⎿` result lines indented dim (`⎿ ✗` in error color), system lines dim italic. Streaming text renders into a partial line and lands as a full line on `RunCompleted`; thinking shows a dim `✻` tail. Empty sessions render a centered welcome screen (logo + key hints). Typing during a run pushes steering; Esc cancels via `CancellationToken`; PageUp/PageDown scroll with a `usize::MAX` stick-to-bottom sentinel clamped each frame.
 
+- **Floating todo panel**: when the session has a todo list, it floats in the chat area's top-right corner (rounded border, `○`/`◉`/`✓` markers, in-progress accented, done crossed out; capped at half the chat height, `… 还有 N 项` overflow; hidden when empty or terminal < 50 cols). Data via `AgentHarness::todos_snapshot()`.
 - **Session picker** (`Ctrl+O`): centered overlay listing sessions (newest first, current marked `▸`, branch origin shown as `⎇parent`); `Enter` switches (chat rebuilt from replayed history), `b` branches the current session, `Esc` closes. Disabled while a run is active.
 - **In-TUI configuration** (hot provider swap, no restart): `/config` opens a wizard overlay — vendor list → endpoint list (Coding Plan variants with notes) → API key input (typed into the input box; empty keeps existing/$ENV) → model picker (async discovery via the vendor's models API, with a manual-input fallback) → applied. `/model [name]` switches model directly (no arg opens the picker); `/status` shows the active settings plus a runtime summary (max_tokens/max_turns, compaction, retry, compression & verbosity switches, whether a project config is in effect). Apply = save config file (serde_json roundtrip preserving unknown fields) + rebuild provider (`settings::build_provider`, endpoint→protocol routing) + `AgentHarness::swap_provider` (RwLock-backed hot swap in `AgentRuntime`) + status-bar hint update. Blocked while a run is active.
 - **HITL dialogs**: `InteractiveApprover` forwards confirmation requests to the UI loop; the dialog replaces the input box (`y` allow / `a` allow-all-this-run / `n` or Esc deny). A superseded unanswered request is auto-denied; app exit and run cancel always resolve pending requests.
-- **Themes**: `Theme::dark()` (default) / `light()` palettes from `ui.theme`.
+- **Themes**: `Theme::dark()` (default, three-gray Grok palette: White user / Gray assistant / DarkGray meta + `highlight` strip bg `#262626`) / `light()` from `ui.theme`.
 - **Paste**: bracketed paste is enabled for the TUI lifetime (`EnableBracketedPaste` on init, disabled on exit); `Event::Paste` is forwarded as `UiEvent::Paste` and folded into the input box single-line (`sanitize_paste`: newlines → spaces).
 
 ## Key Data Paths
