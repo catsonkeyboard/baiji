@@ -12,7 +12,7 @@ pub mod signatures;
 pub mod tools;
 pub mod walk;
 
-pub use env::{spill_to_store, ExecutionEnv};
+pub use env::{ExecutionEnv, spill_to_store};
 
 use baiji_agent::AgentTool;
 use std::sync::Arc;
@@ -20,11 +20,18 @@ use std::sync::Arc;
 /// 注册全部内置工具（共享同一个执行环境）
 pub fn builtin_tools(env: ExecutionEnv) -> Vec<Arc<dyn AgentTool>> {
     let env = Arc::new(env);
+    // 后台任务注册表：bash(生产) 与 jobs(消费) 共享；
+    // Drop 时击杀全部仍在运行的任务（进程退出不留孤儿）
+    let job_registry = Arc::new(tools::jobs::JobRegistry::new());
     vec![
         Arc::new(tools::ReadTool::new(env.clone())),
         Arc::new(tools::WriteTool::new(env.clone())),
         Arc::new(tools::EditTool::new(env.clone())),
-        Arc::new(tools::BashTool::new(env.clone())),
+        Arc::new(tools::BashTool::with_jobs(
+            env.clone(),
+            job_registry.clone(),
+        )),
+        Arc::new(tools::JobsTool::new(env.clone(), job_registry)),
         Arc::new(tools::GrepTool::new(env.clone())),
         Arc::new(tools::FindTool::new(env.clone())),
         Arc::new(tools::LsTool::new(env.clone())),

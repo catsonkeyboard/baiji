@@ -211,7 +211,7 @@ agent → tools 新依赖边（与 harness → tools 同理，须在 AGENTS.md �
 
 ---
 
-## T7 · 后台任务（bash 后台 + jobs 工具）【P2】
+## T7 · 后台任务（bash 后台 + jobs 工具）【P2 · ✅ 已完成 2026-09-18】
 
 ### 动机
 bash 默认 30s、硬上限 300s，无后台进程管理——`npm run dev` 起了管不了，
