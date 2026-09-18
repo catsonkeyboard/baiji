@@ -7,7 +7,7 @@ A terminal AI coding agent built on a multi-crate Rust workspace: async streamin
 ```bash
 cargo build                # Build the whole workspace
 cargo run                  # Run the TUI app (default)
-cargo test --workspace     # Run all tests (172 total)
+cargo test --workspace     # Run all tests (285 total)
 baiji -e "msg" --yes      # Headless one-shot run (streams to stdout)
 baiji --sessions          # List sessions (no API key needed)
 cargo test -p baiji-agent  # Test a single crate
@@ -33,11 +33,11 @@ crates/
 src/                 Root bin crate `baiji`: config resolution + composition
 ```
 
-Dependency direction: telemetry ← ai ← agent ← {tools, harness} ← {tui, bin}; extensions ← agent.
+Dependency direction: telemetry ← ai ← agent ← tools ← harness ← {tui, bin}; extensions ← agent. (harness depends on tools only for the shared CCR `spill_to_store` primitive — handle format must stay single-sourced so `expand` round-trips.)
 
-## Configuration
+## Configuration (two-scope, pi-style layered settings)
 
-**Path**: `~/.baiji/config.json` (auto-generated template on first run)
+**Global**: `~/.baiji/config.json` (auto-generated template on first run). **Project** (optional): `./.baiji/config.json` — deep-merged over global (objects merge recursively, arrays/scalars replace, project wins), then env-var overrides apply. Project scope is whitelist-limited for security: only `model` / `max_tokens` / `max_turns` / `llm_compaction` / `compaction` / `retry` / `ui` / `policy.{max_tool_output_bytes, bash_timeout_secs, compression_enabled, verbosity_steer}` are honored; `api_key` / `vendor` / `endpoint` / `base_url` / `protocol` (a hostile repo could redirect the global key to an arbitrary server) and `policy.{allowed_paths, require_confirmation_tools}` (a hostile repo could open the sandbox / drop HITL) are global-only — violations are dropped with a warning. Unknown fields warn and are ignored.
 
 ```json
 {
@@ -48,11 +48,24 @@ Dependency direction: telemetry ← ai ← agent ← {tools, harness} ← {tui, 
   "base_url": null,
   "max_tokens": 4096,
   "llm_compaction": false,
+  "max_turns": 24,
+  "compaction": {
+    "enabled": true,
+    "max_estimated_tokens": null,
+    "keep_recent_turns": 6
+  },
+  "retry": {
+    "max_retries": 2,
+    "base_delay_ms": 500,
+    "max_delay_ms": 30000
+  },
   "policy": {
     "allowed_paths": [],
     "require_confirmation_tools": ["bash", "write", "edit"],
     "max_tool_output_bytes": 32768,
-    "bash_timeout_secs": 30
+    "bash_timeout_secs": 30,
+    "compression_enabled": true,
+    "verbosity_steer": false
   },
   "ui": { "theme": "dark" }
 }
@@ -65,6 +78,9 @@ Dependency direction: telemetry ← ai ← agent ← {tools, harness} ← {tui, 
 - `policy.allowed_paths` extends the path whitelist (default: current directory only).
 - `policy.require_confirmation_tools` (HITL): listed tools prompt a y/a/n confirmation dialog before executing; `a` (AllowAll) suppresses re-prompts for that tool for the rest of the run. Empty list = auto-approve everything.
 - `llm_compaction: true` switches context compaction to provider-generated summaries (falls back to the deterministic summary on API error).
+- `max_turns` caps LLM turns per run (default 24).
+- `compaction`: `enabled: false` disables both context-reduction tiers (tool-result stubbing + summary; the in-run anti-overflow trim stays); `max_estimated_tokens` overrides the window-derived budget (70% of the context window minus the output reserve, floor 16k); `keep_recent_turns` (default 6) is the intact-turn window.
+- `retry`: transient-error retries with exponential backoff (`base_delay_ms × 2^attempt`, capped at `max_delay_ms`; server `Retry-After` honored but also capped). Defaults 2 / 500ms / 30s.
 - `ui.theme`: `"dark"` (default) or `"light"` palettes.
 - MCP: place a `mcporter.json` in the project root; tools are discovered via `npx -y mcporter` at startup (requires Node). Tool names use `server.tool`.
 
@@ -123,8 +139,8 @@ run()
 
 ### Harness (`baiji-harness`)
 
-- `AgentHarness::run`: persist user message → compact (if over budget) → `AgentRuntime::run` → persist new messages. Checkpoint is taken **after** compaction (compaction shrinks the list).
-- Compaction: token estimate (ASCII ~0.25/char, CJK ~0.5/char, +4/message); keeps the last 6 turns intact, older turns folded into a summary. Default budget 48k tokens. `compact_with_llm` (opt-in via `llm_compaction: true`) asks the provider to summarize and falls back to the deterministic summary on error/empty.
+- `AgentHarness::run`: persist user message → **stub old tool results** (if over budget) → compact (if still over budget) → `AgentRuntime::run` → persist new messages. Checkpoint is taken **after** compaction (compaction shrinks the list).
+- Two-tier context reduction over one budget (`max_estimated_tokens`): **tier 1, reversible tool-result stubbing** (`stub.rs`, runs first when the ctx store is configured via `set_ctx_store`): tool results ≥512B outside the `keep_recent_turns` window are replaced oldest-turn-first with a `[ctx stub: … ctx:<handle>]` marker (original spilled via `baiji_tools::spill_to_store`, recoverable with `expand`); stops as soon as the estimate fits, in-memory view only — the JSONL keeps raw originals and each run re-derives (content-addressed spill is idempotent); `branch` forks inherit the current in-memory (possibly stubbed) view. **tier 2, summary compaction**: token estimate (ASCII ~0.25/char, CJK ~0.5/char, +4/message); keeps the last 6 turns intact, older turns folded into a summary. Default budget 48k tokens. `compact_with_llm` (opt-in via `llm_compaction: true`) asks the provider to summarize and falls back to the deterministic summary on error/empty.
 - Sessions: `~/.baiji/sessions/<id>.jsonl`, append-only records `Started/Message/Summary`; `load`/`switch_session` replays (Summary → injected as `[Conversation Summary]` System message; history stays raw and self-heals via the next compaction). `branch()` forks a session (parent link, history copied). `list_sessions()` returns all metas for the UI picker.
 - Skills: `load_skills([dirs])` scans `*/SKILL.md` with `name:`/`description:` frontmatter; project `./.baiji/skills` overrides user `~/.baiji/skills`; rendered into the system prompt.
 - Templates: `render("... {{var}} ...", &vars)`.
@@ -132,15 +148,19 @@ run()
 
 ### Tools (`baiji-tools`)
 
-`read` (multi-mode JIT disclosure: `signatures` = symbol outline with line anchors → read exact ranges via offset/limit, `map` = compact directory tree, `full` = numbered lines with optional `density` (0.05-1.0) entropy-based line selection; over-budget full reads auto-degrade to `[auto-density …]` instead of hard truncation — disable via `ExecutionEnv::without_density_fallback`), `write` (creates parents), `edit` (exact-match replace; unique or `replace_all`), `bash` (`sh -c` in workdir, timeout + kill, exit/stdout/stderr, output compression: noise-line filtering + consecutive-duplicate folding `⟨… repeated N×⟩`), `grep` (regex, depth ≤10, skips `.git`/`target`/`node_modules`/hidden, glob filter, ≤200 matches), `find` (name substring + kind filter), `ls` (dirs first), `expand` (retrieve truncated output by `ctx:` handle).
+`read` (multi-mode JIT disclosure: `signatures` = symbol outline with line anchors → read exact ranges via offset/limit, `map` = compact directory tree, `full` = numbered lines with optional `density` (0.05-1.0) entropy-based line selection; over-budget full reads auto-degrade to `[auto-density …]` instead of hard truncation — disable via `ExecutionEnv::without_density_fallback`; **cached re-read**: in-process `(path, args)` cache keyed on `(mtime, size)` — an identical re-read of an unmodified file whose previous output was ≥2KB returns a short `[unchanged: … ctx:<handle>]` stub instead of resending the content, recoverable via `expand`; no ctx store / small outputs / `map` mode (dir mtime unreliable) never stub), `write` (creates parents), `edit` (exact-match replace; unique or `replace_all`), `bash` (`sh -c` in workdir, timeout + kill, exit/stdout/stderr, three-stage output compression: ANSI strip → generic rules (noise-line filtering + consecutive-duplicate folding `⟨… repeated N×⟩`) → content-aware domain compressors), `grep` (regex, depth ≤10, skips `.git`/`target`/`node_modules`/hidden, glob filter, ≤200 matches; consecutive same-file matches are grouped under a `File: path` header with `line: text` rows when shorter), `find` (name substring + kind filter), `ls` (dirs first), `expand` (retrieve truncated/compressed output by `ctx:` handle).
+
+**Domain compressors** (`compressors/`, inspired by lean-ctx / ANOLISA tokenless): after the generic shell rules and before byte truncation, output is classified and routed to a domain compressor — `json` (lossless: compact re-serialization + drop blacklisted diagnostic fields (debug/trace/stack/…) + drop null/empty values; lossy: arrays capped at 32 head + 8 tail, strings >4096 chars truncated, depth ≤8), `tabular` (CSV/TSV row reduction: >32 data rows → keep header + first/last 4 + diagnostic rows + even sampling to a 32-row budget; markdown pipe tables and ragged rows rejected), `build_log` (cargo/pytest/npm/go-style logs: only contiguous runs ≥9 of progress lines are reduced to first/last 2 with a counted elision marker — diagnostics, summaries, stack frames and rustc error blocks survive verbatim; >8 elision ranges aborts), plus `search_results` path sharing for grep. Three disciplines throughout: (1) lossless transforms need ≥15% savings to be adopted; (2) failed commands (exit≠0) get lossless cleanup only — diagnostic context is never lossy-compressed; (3) every lossy transform spills the full original to the ctx store first and carries `ctx:<handle>` in its marker — spill unavailable ⇒ no lossy compression (fail-open).
 
 **tree-sitter index** (`signatures.rs` / `index.rs`): AST symbol extraction for Rust/Python/JS/TS/Go (`Symbol { name, kind, line_start, line_end, signature }`, ≤500/file; regex fallback for other languages or parse failures). `CodeIndex` scans on demand (≤2000 files, same skip rules as grep) building a symbol table + import edges per file. Tools built on it: `search` (BM25 over symbol+filename docs — identifiers split on camelCase/snake_case/abbreviations; results are `path:L start-end` anchors feeding read offset/limit) and `imports` (outgoing edges of a file / incoming importers = change impact).
 
 `ExecutionEnv`: workdir, `allowed_roots` path whitelist with lexical `..` normalization (no fs canonicalization — works for not-yet-existing paths), byte-boundary-safe output truncation, `max_file_size` 1MB, bash timeout 30s default.
 
-**CCR (reversible truncation)**: when output exceeds `max_output_bytes` and the ctx store is enabled (default: `~/.baiji/ctx-store/`), the full content is spilled to a SHA-256 content-addressed file and the marker carries `ctx:<handle16>`; the `expand` tool retrieves it (with offset/limit paging). Truncation is never information loss.
+**CCR (reversible truncation)**: when output exceeds `max_output_bytes` or a lossy domain compression applies, and the ctx store is enabled (default: `~/.baiji/ctx-store/`), the full content is spilled to a SHA-256 content-addressed file and the marker carries `ctx:<handle16>`; the `expand` tool retrieves it (with offset/limit paging). Truncation is never information loss. Store lifecycle: handle files older than the TTL (default 7 days, `with_ctx_store_ttl`) are pruned on store init (once per process); only 16-hex handle-named files are ever removed.
 
-**Context ledger**: tools that compress/truncate report `original_bytes` on `ToolOutput`; the runtime annotates `agent.tool` spans (`bytes_original`/`bytes_delivered`/`bytes_saved`) and `AgentEvent::ToolFinished`; the harness taps the event stream and appends a `Ledger { tool_calls, original_bytes, delivered_bytes }` record per run to the session JSONL (ignored on replay). The TUI status bar shows cumulative bytes saved.
+**Context ledger**: tools that compress/truncate report `original_bytes` **and** `original_tokens` (heuristic: ASCII ~4 chars/token, CJK ~2 — canonical `baiji_agent::estimate_text_tokens`, shared with compaction) on `ToolOutput`; the runtime annotates `agent.tool` spans (`bytes_*` + `tokens_original`/`tokens_delivered`/`tokens_saved`) and `AgentEvent::ToolFinished`; the harness taps the event stream and appends a `Ledger { tool_calls, original_bytes, delivered_bytes, original_tokens, delivered_tokens }` record per run to the session JSONL (ignored on replay; token fields serde-default so old records parse). The TUI status bar shows cumulative bytes saved plus the token estimate. `policy.compression_enabled: false` (or env `BAIJI_COMPRESSION=off`) disables domain compression only — the A/B control arm keeps generic shell rules and truncation.
+
+**Verbosity steer** (`policy.verbosity_steer`, env `BAIJI_VERBOSITY_STEER=on|off`): when enabled, the runtime appends a byte-constant conciseness note to the last user message of every request (lean-ctx measures ~1/3 output-token savings). Request-copy-only — session history and the JSONL never contain the injected text; byte-constancy keeps provider-side prefix caching intact.
 
 ### Extensions (`baiji-extensions`)
 
@@ -158,7 +178,7 @@ MCP: `mcp` module ports the mcporter CLI bridge — `register_mcp_tools(&mut Too
 Chat / input / status layout. Streaming text renders into a partial line and lands as a full line on `RunCompleted`. Typing during a run pushes steering; Esc cancels via `CancellationToken`; PageUp/PageDown scroll with a `usize::MAX` stick-to-bottom sentinel clamped each frame.
 
 - **Session picker** (`Ctrl+O`): centered overlay listing sessions (newest first, current marked `▸`, branch origin shown as `⎇parent`); `Enter` switches (chat rebuilt from replayed history), `b` branches the current session, `Esc` closes. Disabled while a run is active.
-- **In-TUI configuration** (hot provider swap, no restart): `/config` opens a wizard overlay — vendor list → endpoint list (Coding Plan variants with notes) → API key input (typed into the input box; empty keeps existing/$ENV) → model picker (async discovery via the vendor's models API, with a manual-input fallback) → applied. `/model [name]` switches model directly (no arg opens the picker); `/status` shows the active settings. Apply = save config file (serde_json roundtrip preserving unknown fields) + rebuild provider (`settings::build_provider`, endpoint→protocol routing) + `AgentHarness::swap_provider` (RwLock-backed hot swap in `AgentRuntime`) + status-bar hint update. Blocked while a run is active.
+- **In-TUI configuration** (hot provider swap, no restart): `/config` opens a wizard overlay — vendor list → endpoint list (Coding Plan variants with notes) → API key input (typed into the input box; empty keeps existing/$ENV) → model picker (async discovery via the vendor's models API, with a manual-input fallback) → applied. `/model [name]` switches model directly (no arg opens the picker); `/status` shows the active settings plus a runtime summary (max_tokens/max_turns, compaction, retry, compression & verbosity switches, whether a project config is in effect). Apply = save config file (serde_json roundtrip preserving unknown fields) + rebuild provider (`settings::build_provider`, endpoint→protocol routing) + `AgentHarness::swap_provider` (RwLock-backed hot swap in `AgentRuntime`) + status-bar hint update. Blocked while a run is active.
 - **HITL dialogs**: `InteractiveApprover` forwards confirmation requests to the UI loop; the dialog replaces the input box (`y` allow / `a` allow-all-this-run / `n` or Esc deny). A superseded unanswered request is auto-denied; app exit and run cancel always resolve pending requests.
 - **Themes**: `Theme::dark()` (default) / `light()` palettes from `ui.theme`.
 - **Paste**: bracketed paste is enabled for the TUI lifetime (`EnableBracketedPaste` on init, disabled on exit); `Event::Paste` is forwarded as `UiEvent::Paste` and folded into the input box single-line (`sanitize_paste`: newlines → spaces).
