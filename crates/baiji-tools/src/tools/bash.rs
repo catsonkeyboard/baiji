@@ -191,11 +191,21 @@ fn is_noise_line(line: &str) -> bool {
 
 pub struct BashTool {
     env: Arc<ExecutionEnv>,
+    /// 后台任务注册表（run_in_background 产生；jobs 工具消费）
+    jobs: Arc<crate::tools::jobs::JobRegistry>,
 }
 
 impl BashTool {
     pub fn new(env: Arc<ExecutionEnv>) -> Self {
-        Self { env }
+        Self {
+            env,
+            jobs: Arc::new(crate::tools::jobs::JobRegistry::new()),
+        }
+    }
+
+    /// 与 jobs 工具共享注册表（builtin_tools 装配用；new() 为隔离注册表）
+    pub fn with_jobs(env: Arc<ExecutionEnv>, jobs: Arc<crate::tools::jobs::JobRegistry>) -> Self {
+        Self { env, jobs }
     }
 }
 
@@ -207,7 +217,9 @@ impl AgentTool for BashTool {
 
     fn description(&self) -> &str {
         "Execute a shell command in the working directory. Returns exit code, stdout and stderr. \
-         Commands are killed after a timeout (default 30s)."
+         Commands are killed after a timeout (default 30s). Set run_in_background=true for \
+         long-running commands (dev servers, watchers): returns a job id immediately; manage it \
+         with the jobs tool (list/output/stop)."
     }
 
     fn parameters(&self) -> Value {
@@ -215,7 +227,8 @@ impl AgentTool for BashTool {
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "Shell command to execute"},
-                "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds (default 30000, max 300000)"}
+                "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds (default 30000, max 300000)"},
+                "run_in_background": {"type": "boolean", "description": "Detach: return a job id immediately (no timeout); manage via the jobs tool"}
             },
             "required": ["command"]
         })
@@ -227,6 +240,47 @@ impl AgentTool for BashTool {
                 "[Error] missing required argument 'command'",
             ));
         };
+        // 后台模式：登记任务、重定向输出到文件、spawn 后立即返回
+        // （watchdog 收尸；无超时——stop 由 jobs 工具触发）
+        if args["run_in_background"].as_bool().unwrap_or(false) {
+            let (job_id, output_file) = self.jobs.create(command);
+            let stdout_file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&output_file);
+            let stderr_file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&output_file);
+            let (Ok(stdout_file), Ok(stderr_file)) = (stdout_file, stderr_file) else {
+                return Ok(ToolOutput::err(format!(
+                    "[Error] opening background output file {}: io error",
+                    output_file.display()
+                )));
+            };
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c")
+                .arg(command)
+                .current_dir(&self.env.workdir)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::from(stdout_file))
+                .stderr(std::process::Stdio::from(stderr_file));
+            #[cfg(unix)]
+            cmd.process_group(0);
+            cmd.kill_on_drop(true);
+            return match cmd.spawn() {
+                Ok(child) => {
+                    self.jobs.attach(job_id, child.id().unwrap_or(0));
+                    crate::tools::jobs::spawn_watchdog(self.jobs.clone(), job_id, child);
+                    Ok(ToolOutput::ok(format!(
+                        "[Background] job #{job_id} started: {command} \
+                         — use jobs list / jobs output {job_id} / jobs stop {job_id} to manage"
+                    )))
+                }
+                Err(e) => Ok(ToolOutput::err(format!("[Error] spawning command: {e}"))),
+            };
+        }
+
         let timeout_ms = args["timeout_ms"]
             .as_u64()
             .unwrap_or(self.env.command_timeout.as_millis() as u64)
