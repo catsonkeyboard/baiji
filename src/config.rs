@@ -53,6 +53,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub policy: PolicyConfig,
     #[serde(default)]
+    pub skills: SkillsConfig,
+    #[serde(default)]
     pub compaction: CompactionConfig,
     #[serde(default)]
     pub retry: RetryConfig,
@@ -61,6 +63,27 @@ pub struct AppConfig {
     /// 项目级配置是否生效（加载时判定；不入 JSON）
     #[serde(skip)]
     pub project_config_applied: bool,
+}
+
+/// Skills 加载设置
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SkillsConfig {
+    /// 总开关：false 时不加载任何 skill（工具与系统提示段都不出现）。
+    /// 环境变量 `BAIJI_SKILLS=off` 可免改配置临时关闭
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 按名禁用的技能清单（frontmatter name）
+    #[serde(default)]
+    pub disabled: Vec<String>,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            disabled: Vec::new(),
+        }
+    }
 }
 
 /// 上下文压缩设置（参考 pi 的 CompactionSettings）
@@ -218,6 +241,7 @@ const PROJECT_ALLOWED_TOP: &[&str] = &[
     "max_tokens",
     "max_turns",
     "llm_compaction",
+    "skills",
     "policy",
     "compaction",
     "retry",
@@ -294,6 +318,7 @@ const KNOWN_TOP_FIELDS: &[&str] = &[
     "max_tokens",
     "llm_compaction",
     "max_turns",
+    "skills",
     "policy",
     "compaction",
     "retry",
@@ -439,7 +464,7 @@ impl AppConfig {
         format!(
             "max_tokens: {} · max_turns: {} · compaction: {compaction} (keep {} turns) · \
              retry: {}×{}ms (cap {}ms) · compression: {} · verbosity_steer: {} · \
-             auto_continue: {} (cap {}) · project config: {}",
+             auto_continue: {} (cap {}) · skills: {} · project config: {}",
             self.max_tokens
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "默认".into()),
@@ -452,6 +477,13 @@ impl AppConfig {
             on_off(self.policy.verbosity_steer),
             on_off(self.policy.auto_continue),
             self.policy.auto_continue_max_turns,
+            if !self.skills.enabled {
+                "off".to_string()
+            } else if self.skills.disabled.is_empty() {
+                "on".to_string()
+            } else {
+                format!("on ({} disabled)", self.skills.disabled.len())
+            },
             if self.project_config_applied {
                 "生效"
             } else {
@@ -461,7 +493,8 @@ impl AppConfig {
     }
 
     /// 环境变量覆盖（A/B 对照免改配置）：`BAIJI_COMPRESSION=off|0|false|no` 关闭域压缩；
-    /// `BAIJI_VERBOSITY_STEER=on|1|true|yes` 开启（其余值关闭）
+    /// `BAIJI_VERBOSITY_STEER=on|1|true|yes` 开启（其余值关闭）；
+    /// `BAIJI_SKILLS=off|0|false|no` 关闭 skills 加载
     fn with_env_overrides(mut self) -> Self {
         if let Ok(v) = std::env::var("BAIJI_COMPRESSION") {
             let off = matches!(v.to_lowercase().as_str(), "off" | "0" | "false" | "no");
@@ -470,6 +503,10 @@ impl AppConfig {
         if let Ok(v) = std::env::var("BAIJI_VERBOSITY_STEER") {
             let on = matches!(v.to_lowercase().as_str(), "on" | "1" | "true" | "yes");
             self.policy.verbosity_steer = on;
+        }
+        if let Ok(v) = std::env::var("BAIJI_SKILLS") {
+            let off = matches!(v.to_lowercase().as_str(), "off" | "0" | "false" | "no");
+            self.skills.enabled = !off;
         }
         self
     }
@@ -493,6 +530,10 @@ impl AppConfig {
             "max_tokens": 8192,
             "llm_compaction": false,
             "max_turns": 24,
+            "skills": {
+                "enabled": true,
+                "disabled": []
+            },
             "compaction": {
                 "enabled": true,
                 "max_estimated_tokens": null,
@@ -617,6 +658,40 @@ mod tests {
             expand_env_vars(r#"{"model": "glm-4.7", "n": 1.5}"#).unwrap(),
             r#"{"model": "glm-4.7", "n": 1.5}"#
         );
+    }
+
+    #[test]
+    fn test_skills_config_defaults_and_env_override() {
+        // 旧配置缺失 skills 字段 → 默认全开
+        let cfg: AppConfig =
+            serde_json::from_value(serde_json::json!({"vendor":"glm","api_key":"k"})).unwrap();
+        assert!(cfg.skills.enabled);
+        assert!(cfg.skills.disabled.is_empty());
+
+        // 环境变量关闭
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"vendor":"glm","api_key":"k"}"#).unwrap();
+        unsafe { std::env::set_var("BAIJI_SKILLS", "off") };
+        let cfg = AppConfig::load_from(&path).unwrap();
+        unsafe { std::env::remove_var("BAIJI_SKILLS") };
+        assert!(!cfg.skills.enabled);
+        let cfg = AppConfig::load_from(&path).unwrap();
+        assert!(cfg.skills.enabled);
+
+        // 项目级白名单内可覆盖(按名禁用)
+        let project = dir.path().join(".baiji").join("config.json");
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        std::fs::write(&project, r#"{"skills":{"disabled":["deploy"]}}"#).unwrap();
+        let cfg = AppConfig::load_with_project(&path, &project).unwrap();
+        assert!(cfg.skills.enabled);
+        assert_eq!(cfg.skills.disabled, vec!["deploy".to_string()]);
+
+        // 摘要反映状态
+        let summary = AppConfig::load_with_project(&path, &project)
+            .unwrap()
+            .runtime_summary();
+        assert!(summary.contains("skills: on (1 disabled)"), "{summary}");
     }
 
     #[test]
@@ -776,6 +851,7 @@ mod tests {
             max_tokens: None,
             llm_compaction: None,
             max_turns: 24,
+            skills: SkillsConfig::default(),
             policy: PolicyConfig::default(),
             compaction: CompactionConfig::default(),
             retry: RetryConfig::default(),
@@ -804,6 +880,7 @@ mod tests {
             max_tokens: None,
             llm_compaction: None,
             max_turns: 24,
+            skills: SkillsConfig::default(),
             policy: PolicyConfig::default(),
             compaction: CompactionConfig::default(),
             retry: RetryConfig::default(),
@@ -822,6 +899,7 @@ mod tests {
             max_tokens: None,
             llm_compaction: None,
             max_turns: 24,
+            skills: SkillsConfig::default(),
             policy: PolicyConfig::default(),
             compaction: CompactionConfig::default(),
             retry: RetryConfig::default(),
@@ -843,6 +921,7 @@ mod tests {
             max_tokens: None,
             llm_compaction: None,
             max_turns: 24,
+            skills: SkillsConfig::default(),
             policy: PolicyConfig::default(),
             compaction: CompactionConfig::default(),
             retry: RetryConfig::default(),
@@ -866,6 +945,7 @@ mod tests {
             max_tokens: None,
             llm_compaction: None,
             max_turns: 24,
+            skills: SkillsConfig::default(),
             policy: PolicyConfig::default(),
             compaction: CompactionConfig::default(),
             retry: RetryConfig::default(),
