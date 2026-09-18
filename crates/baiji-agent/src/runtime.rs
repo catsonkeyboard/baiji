@@ -394,11 +394,18 @@ impl AgentRuntime {
                         warn!("{}", msg);
                         return Err(anyhow::anyhow!("{}", msg));
                     }
+                    let mut answer = response.content.clone();
                     if response.stop == Some(StopReason::MaxTokens) {
                         warn!("final answer truncated at max_tokens={}", self.max_tokens);
+                        // 标记进入答案与历史：用户看到截断提示，
+                        // 模型下一轮也能看到并从中断处续写
+                        answer.push_str(&format!(
+                            "\n\n[答案因 max_tokens={} 被截断 — 可发送\u{201c}继续\u{201d}获取剩余部分]",
+                            self.max_tokens
+                        ));
                     }
-                    *final_answer = response.content.clone();
-                    commit(convo, events, Message::assistant(&response.content));
+                    *final_answer = answer.clone();
+                    commit(convo, events, Message::assistant(answer));
                     events.send(AgentEvent::TurnFinished { turn }).ok();
                     turn_span.end();
                     break;
@@ -1084,6 +1091,8 @@ mod tests {
         AlwaysTool,
         /// 第一轮：工具参数在 max_tokens 处被截断；之后直接回答
         TruncatedToolThenAnswer,
+        /// 最终答案在 max_tokens 处被截断（无工具调用）
+        TruncatedAnswer(&'static str),
     }
 
     fn tool_call_chunks(id: &str) -> Vec<Result<StreamChunk>> {
@@ -1154,6 +1163,11 @@ mod tests {
                 }
                 Script::AnswerOnly(text) => vec![
                     Ok(StreamChunk::Content(text.to_string())),
+                    Ok(StreamChunk::Done),
+                ],
+                Script::TruncatedAnswer(text) => vec![
+                    Ok(StreamChunk::Content(text.to_string())),
+                    Ok(StreamChunk::Stop(StopReason::MaxTokens)),
                     Ok(StreamChunk::Done),
                 ],
                 Script::ThreeToolsThenAnswer => {
@@ -1868,5 +1882,49 @@ mod tests {
         assert_eq!(ids, vec!["t0", "t1", "t2", "t3", "t4", "small"]);
         // 幂等
         assert_eq!(elide_old_tool_results(&mut convo), 0);
+    }
+
+    #[tokio::test]
+    async fn test_truncated_final_answer_carries_marker() {
+        let provider = Arc::new(MockProvider::new(Script::TruncatedAnswer(
+            "这是一段被截断的回答",
+        )));
+        let runtime = AgentRuntime::new(provider).with_max_tokens(100);
+        let mut history = vec![Message::user("问个长问题")];
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let answer = runtime
+            .run(
+                "sys",
+                &mut history,
+                &tx,
+                &CancellationToken::new(),
+                &SteeringQueue::new(),
+            )
+            .await
+            .unwrap();
+        // 答案带明示标记（用户可见，模型下轮可续写）
+        assert!(answer.contains("这是一段被截断的回答"), "{answer}");
+        assert!(answer.contains("被截断"), "{answer}");
+        assert!(answer.contains("max_tokens=100"), "{answer}");
+        // 历史中的 assistant 消息同样携带标记
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].content, answer);
+
+        // 正常完成的答案不带标记
+        let provider = Arc::new(MockProvider::new(Script::AnswerOnly("正常回答")));
+        let runtime = AgentRuntime::new(provider);
+        let mut history = vec![Message::user("q")];
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let answer = runtime
+            .run(
+                "sys",
+                &mut history,
+                &tx,
+                &CancellationToken::new(),
+                &SteeringQueue::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer, "正常回答");
     }
 }
