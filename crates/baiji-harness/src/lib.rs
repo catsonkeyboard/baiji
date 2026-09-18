@@ -314,6 +314,11 @@ impl AgentHarness {
         self.todos.as_ref().is_some_and(|t| t.has_open())
     }
 
+    /// 当前任务清单快照（UI 悬浮面板渲染用；未配置时为空）
+    pub fn todos_snapshot(&self) -> Vec<TodoItem> {
+        self.todos.as_ref().map(|t| t.items()).unwrap_or_default()
+    }
+
     /// 版本与消息数均吻合的有效锚点（否则 None = 用全量字符估算）
     fn valid_usage_anchor(&self) -> Option<UsageAnchor> {
         self.usage_anchor.filter(|a| {

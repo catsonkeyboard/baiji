@@ -56,9 +56,9 @@ mod tests {
     #[test]
     fn app_chat_line_shape() {
         let line = app::ChatLine::assistant("hello".to_string());
-        assert_eq!(line.label(), "baiji");
+        assert!(matches!(line, app::ChatLine::Assistant(s) if s == "hello"));
         let user = app::ChatLine::user("hi".to_string());
-        assert_eq!(user.label(), "you");
+        assert!(matches!(user, app::ChatLine::User(s) if s == "hi"));
     }
 
     #[test]

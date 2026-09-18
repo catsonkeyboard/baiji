@@ -32,21 +32,6 @@ impl ChatLine {
     pub fn assistant(content: impl Into<String>) -> Self {
         Self::Assistant(content.into())
     }
-
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::User(_) => "you",
-            Self::Assistant(_) => "baiji",
-            Self::Tool(_) => "tool",
-            Self::System(_) => "sys",
-        }
-    }
-
-    pub fn content(&self) -> &str {
-        match self {
-            Self::User(s) | Self::Assistant(s) | Self::Tool(s) | Self::System(s) => s,
-        }
-    }
 }
 
 /// 字节数人性化展示
@@ -143,6 +128,31 @@ pub fn sanitize_paste(text: &str) -> String {
         .collect::<String>()
         .trim()
         .to_string()
+}
+
+/// 从 `dir`（含父目录，≤8 层）读取 git 分支名。
+/// worktree 的 `.git` 是文件，`join(".git/HEAD")` 读取失败按"此层无仓库"继续向上。
+fn read_git_branch(dir: &std::path::Path) -> Option<String> {
+    let mut current = Some(dir);
+    for _ in 0..8 {
+        let dir = current?;
+        current = dir.parent();
+        let Ok(head) = std::fs::read_to_string(dir.join(".git/HEAD")) else {
+            continue;
+        };
+        let head = head.trim();
+        if let Some(branch) = head.strip_prefix("ref: refs/heads/") {
+            return Some(branch.to_string());
+        }
+        if head.starts_with("gitdir:") {
+            return None; // worktree：不追 gitdir 文件
+        }
+        return head
+            .split_whitespace()
+            .next()
+            .map(|sha| sha.chars().take(7).collect::<String>()); // detached HEAD
+    }
+    None
 }
 
 /// 斜杠命令注册表：(名称, 用法说明)
@@ -282,7 +292,8 @@ impl SessionPicker {
         self.rebuild();
     }
 
-    /// 是否处于项目过滤态（标题栏提示用）
+    /// 是否处于项目过滤态（选择器测试断言用）
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn filtering_by_project(&self) -> bool {
         self.filter.is_some()
     }
@@ -405,6 +416,14 @@ pub struct App {
     pending: Option<PendingConfirm>,
     /// 确认请求到达通道（来自 InteractiveApprover）
     confirm_rx: Option<UnboundedReceiver<ConfirmDialog>>,
+    /// 当前项目名（项目分组；头部展示）
+    project: Option<String>,
+    /// 启动时的工作目录（头部展示，~ 缩写）
+    workdir: std::path::PathBuf,
+    /// 启动时的 git 分支（向上查找 .git/HEAD）
+    git_branch: Option<String>,
+    /// 渲染帧计数（驱动运行中指示器的旋转动画）
+    frame: u64,
 }
 
 impl App {
@@ -422,6 +441,9 @@ impl App {
             .try_lock()
             .map(|h| h.session().meta.id.clone())
             .unwrap_or_default();
+        let project = harness.try_lock().ok().and_then(|h| h.current_project());
+        let workdir = std::env::current_dir().unwrap_or_default();
+        let git_branch = read_git_branch(&workdir);
         let status_hint = settings::status_hint(&settings);
         let templates = harness
             .try_lock()
@@ -442,10 +464,8 @@ impl App {
             wizard: None,
             models_tx: None,
             hint_selected: 0,
-            lines: vec![ChatLine::System(
-                "Enter 发送 · 运行中输入为 steering · Esc 取消 · Ctrl+O 会话 · Ctrl+C 退出"
-                    .to_string(),
-            )],
+            // 空聊天区由欢迎屏兜底（快捷键提示在那里展示）
+            lines: Vec::new(),
             input: String::new(),
             scroll: usize::MAX,
             agent_running: false,
@@ -461,6 +481,10 @@ impl App {
             picker: None,
             pending: None,
             confirm_rx,
+            project,
+            workdir,
+            git_branch,
+            frame: 0,
         }
     }
 
@@ -1237,12 +1261,12 @@ impl App {
                         .map(|cs| cs.iter().map(|c| c.name.as_str()).collect())
                         .unwrap_or_default();
                     self.lines
-                        .push(ChatLine::Tool(format!("▶ 调用工具: {}", names.join(", "))));
+                        .push(ChatLine::Tool(format!("● {}", names.join(", "))));
                 }
                 Role::Tool => {
                     for result in msg.tool_results.iter().flatten() {
                         let brief: String = result.content.chars().take(120).collect();
-                        self.lines.push(ChatLine::Tool(format!("✓ {brief}")));
+                        self.lines.push(ChatLine::Tool(format!("⎿ {brief}")));
                     }
                 }
                 Role::System => {
@@ -1286,11 +1310,11 @@ impl App {
             AgentEvent::ToolStarted { name, args, .. } => {
                 self.thinking.clear();
                 let brief: String = args.to_string().chars().take(80).collect();
-                self.lines.push(ChatLine::Tool(format!("▶ {name} {brief}")));
+                self.lines
+                    .push(ChatLine::Tool(format!("● {name}({brief})")));
                 self.scroll_to_bottom();
             }
             AgentEvent::ToolFinished {
-                name,
                 output,
                 is_error,
                 original_bytes,
@@ -1310,9 +1334,9 @@ impl App {
                         .saturating_add(original.saturating_sub(delivered));
                 }
                 let brief: String = output.chars().take(120).collect();
-                let mark = if is_error { "✗" } else { "✓" };
-                self.lines
-                    .push(ChatLine::Tool(format!("{mark} {name}: {brief}")));
+                // 工具名已在 ● 行出现过；⎿ 行只给结果摘要，出错时带 ✗ 前缀
+                let mark = if is_error { "✗ " } else { "" };
+                self.lines.push(ChatLine::Tool(format!("⎿ {mark}{brief}")));
                 self.scroll_to_bottom();
             }
             AgentEvent::TurnFinished { .. } => self.thinking.clear(),
@@ -1417,35 +1441,33 @@ impl App {
         });
     }
 
-    pub(crate) fn status_line(&self) -> String {
-        let state = if self.agent_running {
-            format!("⏳ Turn {} | {} tools", self.current_turn, self.tool_calls)
+    /// 状态栏左半：运行状态（旋转指示器由 ui 按帧计数拼上）
+    pub(crate) fn status_left(&self) -> String {
+        if self.agent_running {
+            format!("Turn {} · {} tools", self.current_turn, self.tool_calls)
         } else {
             "就绪".to_string()
-        };
-        let auto = if self.auto.enabled && self.auto_turns > 0 {
-            format!(" · 自动 {}/{}", self.auto_turns, self.auto.max_turns)
-        } else {
-            String::new()
-        };
-        let saved = if self.bytes_saved > 0 {
-            format!(
-                " · 省 {} (~{} tok)",
+        }
+    }
+
+    /// 状态栏右半：会话与运行台账（各项在无数据时省略）
+    pub(crate) fn status_right(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.context_tokens > 0 {
+            parts.push(format!("ctx {:.1}k", self.context_tokens as f64 / 1000.0));
+        }
+        if self.bytes_saved > 0 {
+            parts.push(format!(
+                "省 {} (~{} tok)",
                 format_bytes(self.bytes_saved),
                 self.tokens_saved
-            )
-        } else {
-            String::new()
-        };
-        let context = if self.context_tokens > 0 {
-            format!(" · ctx {:.1}k", self.context_tokens as f64 / 1000.0)
-        } else {
-            String::new()
-        };
-        format!(
-            "{} · session {} · {}{}{}{}",
-            self.status_hint, self.session_id, state, context, auto, saved
-        )
+            ));
+        }
+        if self.auto.enabled && self.auto_turns > 0 {
+            parts.push(format!("自动 {}/{}", self.auto_turns, self.auto.max_turns));
+        }
+        parts.push(format!("session {}", self.session_id));
+        parts.join(" · ")
     }
 
     // 访问器供 ui 模块渲染
@@ -1493,6 +1515,53 @@ impl App {
 
     pub(crate) fn theme(&self) -> Theme {
         self.theme
+    }
+
+    /// 头部/输入框右下角的设置提示（"智谱 GLM · glm-4.7"）
+    pub(crate) fn hint(&self) -> &str {
+        &self.status_hint
+    }
+
+    /// 当前项目名（项目分组；无项目时 None）
+    pub(crate) fn project(&self) -> Option<&str> {
+        self.project.as_deref()
+    }
+
+    /// 启动时的工作目录（~ 缩写后的展示串）
+    pub(crate) fn workdir_display(&self) -> String {
+        let path = self.workdir.display().to_string();
+        std::env::var("HOME")
+            .ok()
+            .filter(|home| !home.is_empty() && path.starts_with(home.as_str()))
+            .map(|home| format!("~{}", &path[home.len()..]))
+            .unwrap_or(path)
+    }
+
+    /// 启动时的 git 分支（非仓库时 None）
+    pub(crate) fn git_branch(&self) -> Option<&str> {
+        self.git_branch.as_deref()
+    }
+
+    /// 渲染帧计数 +1（旋转指示器动画）
+    pub(crate) fn bump_frame(&mut self) {
+        self.frame = self.frame.wrapping_add(1);
+    }
+
+    pub(crate) fn frame(&self) -> u64 {
+        self.frame
+    }
+
+    /// 当前任务清单快照（右上角悬浮面板；锁忙时跳过本帧）
+    pub(crate) fn todo_items(&self) -> Vec<baiji_harness::TodoItem> {
+        self.harness
+            .try_lock()
+            .map(|h| h.todos_snapshot())
+            .unwrap_or_default()
+    }
+
+    /// 会话是否尚无内容（欢迎屏兜底展示）
+    pub(crate) fn is_fresh(&self) -> bool {
+        self.lines.is_empty() && self.streaming.is_empty()
     }
 
     pub(crate) fn picker(&self) -> Option<&SessionPicker> {
@@ -1669,7 +1738,9 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let runtime = Arc::new(AgentRuntime::new(Arc::new(Echo)).with_tools(ToolRegistry::new()));
-        let harness = AgentHarness::new(runtime, dir.path().join("sessions")).unwrap();
+        let mut harness = AgentHarness::new(runtime, dir.path().join("sessions")).unwrap();
+        let todo_store = Arc::new(baiji_harness::TodoStore::new());
+        harness.set_todos(todo_store.clone());
         let mut app = App::new(
             Arc::new(tokio::sync::Mutex::new(harness)),
             Theme::dark(),
@@ -1686,9 +1757,28 @@ mod tests {
         );
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let screen = |t: &ratatui::Terminal<ratatui::backend::TestBackend>| -> Vec<String> {
+            let buffer = t.backend().buffer();
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect()
+        };
 
-        // 普通三段布局
+        // 普通三段布局（空会话：欢迎屏兜底）
         terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let rows = screen(&terminal);
+        assert!(
+            rows.iter().any(|r| r.contains("██████╗")),
+            "welcome screen shows the logo"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("/help")),
+            "welcome screen shows key hints"
+        );
 
         // 多行回答保留换行（回归：曾被压成一行）；长中文回复贴底时末行可见
         // （回归：按字符数而非显示宽度估行，滚不到底）
@@ -1700,16 +1790,6 @@ mod tests {
         )));
         app.scroll_to_bottom();
         terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
-        let screen = |t: &ratatui::Terminal<ratatui::backend::TestBackend>| -> Vec<String> {
-            let buffer = t.backend().buffer();
-            (0..buffer.area.height)
-                .map(|y| {
-                    (0..buffer.area.width)
-                        .map(|x| buffer[(x, y)].symbol().to_string())
-                        .collect::<String>()
-                })
-                .collect()
-        };
         let rows = screen(&terminal);
         // 宽字符后跟一个空占位格，去掉空格再比对
         assert!(
@@ -1726,6 +1806,85 @@ mod tests {
         );
         assert!(rows[code_row + 2].contains('}'));
         app.lines.clear();
+
+        // 用户消息（❯ 前缀 + 底色条）与工具活动行：● Name(args) / ⎿ 结果（错误带 ✗）
+        app.lines.push(ChatLine::user("帮我看看这个项目"));
+        app.lines
+            .push(ChatLine::Tool(r#"● read({"path":"lib.rs"})"#.to_string()));
+        app.lines.push(ChatLine::Tool("⎿ 200 行已读取".to_string()));
+        app.lines
+            .push(ChatLine::Tool("⎿ ✗ bash: exit 1".to_string()));
+        app.scroll_to_bottom();
+        // TestBackend 的增量刷新对宽字符覆盖有残留：断言前强制全量重绘
+        terminal.clear().unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let rows = screen(&terminal);
+        assert!(rows.iter().any(|r| r.contains("❯")), "user prompt mark");
+        assert!(
+            rows.iter()
+                .any(|r| r.replace(' ', "").contains("帮我看看这个项目"))
+        );
+        assert!(rows.iter().any(|r| r.contains("● read")));
+        assert!(
+            rows.iter()
+                .any(|r| r.replace(' ', "").contains("⎿200行已读取"))
+        );
+
+        // 右上角悬浮 todo 面板：有清单才出现
+        todo_store.replace(vec![
+            baiji_harness::TodoItem {
+                id: 1,
+                content: "分析依赖".to_string(),
+                status: baiji_harness::TodoStatus::Done,
+                note: None,
+            },
+            baiji_harness::TodoItem {
+                id: 2,
+                content: "实现悬浮面板".to_string(),
+                status: baiji_harness::TodoStatus::InProgress,
+                note: None,
+            },
+            baiji_harness::TodoItem {
+                id: 3,
+                content: "补测试".to_string(),
+                status: baiji_harness::TodoStatus::Pending,
+                note: None,
+            },
+        ]);
+        terminal.clear().unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let rows = screen(&terminal);
+        // 宽字符的跳过格在 TestBackend 里呈现为空格：比对前去掉
+        let plain = |s: &str| s.replace(' ', "");
+        assert!(rows.iter().any(|r| r.contains("Todo")), "todo panel title");
+        assert!(
+            rows.iter()
+                .any(|r| plain(r).contains(&plain("实现悬浮面板")))
+        );
+        // 清空后面板消失
+        todo_store.replace(Vec::new());
+        terminal.clear().unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert!(
+            !screen(&terminal).iter().any(|r| r.contains("Todo")),
+            "panel hidden when list empty"
+        );
+
+        // 运行态：顶栏/状态栏运行指示 + 输入框顶边 steering 提示
+        app.agent_running = true;
+        app.current_turn = 2;
+        app.tool_calls = 3;
+        terminal.clear().unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let rows = screen(&terminal);
+        assert!(rows.iter().any(|r| r.contains("Turn 2 · 3 tools")));
+        assert!(rows.iter().any(|r| {
+            r.replace(' ', "")
+                .contains(&"Esc 取消 · 输入即 steering".replace(' ', ""))
+        }));
+        app.agent_running = false;
+        app.current_turn = 0;
+        app.tool_calls = 0;
 
         // 斜杠提示条（四段布局）："/" 全量、"/m" 过滤、"/model x" 参数用法
         for input in ["/", "/m", "/model glm-4.7", "/zzz"] {
