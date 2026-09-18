@@ -8,6 +8,7 @@
 //! - [`SafetyPlugin`]：注册 hook，拦截 `rm -rf /` 等危险 bash 命令
 //! - [`mcp`]：mcporter CLI 桥（MCP 工具发现与调用）
 
+pub mod command_hook;
 pub mod mcp;
 
 use anyhow::Result;
@@ -16,7 +17,8 @@ use baiji_agent::{AgentTool, Hook, HookDecision, HookRegistry, ToolOutput, ToolR
 use serde_json::Value;
 use std::sync::Arc;
 
-pub use mcp::{register_mcp_tools, McpTool, McporterBridge};
+pub use command_hook::{CommandHookSpec, CommandHooks, HooksConfig};
+pub use mcp::{McpTool, McporterBridge, register_mcp_tools};
 
 /// 插件注册上下文：插件把工具/hooks 塞进来
 #[derive(Default)]
@@ -189,7 +191,11 @@ fn rm_targets_root(command: &str) -> bool {
     // 去引号与反斜杠（`"/"`、`\rm`）
     let tokens: Vec<String> = spaced
         .split_whitespace()
-        .map(|t| t.chars().filter(|c| !matches!(c, '"' | '\'' | '\\')).collect())
+        .map(|t| {
+            t.chars()
+                .filter(|c| !matches!(c, '"' | '\'' | '\\'))
+                .collect()
+        })
         .collect();
 
     let home = std::env::var("HOME").ok();
@@ -291,7 +297,12 @@ mod tests {
         assert_eq!(hooks.len(), 1);
 
         // now 工具可用
-        let out = tools.get("now").unwrap().execute(Value::Null).await.unwrap();
+        let out = tools
+            .get("now")
+            .unwrap()
+            .execute(Value::Null)
+            .await
+            .unwrap();
         assert!(!out.is_error);
         assert!(out.content.contains('T')); // RFC3339
     }

@@ -7,7 +7,7 @@ A terminal AI coding agent built on a multi-crate Rust workspace: async streamin
 ```bash
 cargo build                # Build the whole workspace
 cargo run                  # Run the TUI app (default)
-cargo test --workspace     # Run all tests (318 total)
+cargo test --workspace     # Run all tests (325 total)
 baiji -e "msg" --yes      # Headless one-shot run (streams to stdout)
 baiji --sessions          # List sessions (no API key needed)
 cargo test -p baiji-agent  # Test a single crate
@@ -83,6 +83,7 @@ Dependency direction: telemetry ← ai ← agent ← tools ← harness ← {tui,
 - `auto_continue: true` enables auto-continue (T4): when a run finishes normally with open todos and the turn budget is not exhausted, the next run starts automatically with the fixed `baiji_harness::AUTO_CONTINUE_PROMPT` input (visible in history). The budget (`auto_continue_max_turns`, default 96) counts per user-initiated chain (reset on manual submit); Esc interrupts the chain. headless opt-in: `baiji -e "..." --continue-until-done`.
 - `retry`: transient-error retries with exponential backoff (`base_delay_ms × 2^attempt`, capped at `max_delay_ms`; server `Retry-After` honored but also capped). Defaults 2 / 500ms / 30s.
 - `ui.theme`: `"dark"` (default) or `"light"` palettes.
+- `hooks` (global-only): user command hooks fired on lifecycle events — `run_start` / `turn_start` / `tool_call` / `tool_result` / `run_end`, each a list of `{ "command": "...", "timeout_secs": 10 }` (`command_hook.rs` in baiji-extensions). Context is JSON on the hook's stdin (`{"event", ...}` with tool/args/input/turn/output-preview) plus the `BAIJI_HOOK_EVENT` env var. Convention: **exit code 2 on `tool_call` blocks the call** (stderr becomes the deny reason the LLM sees); any other failure or timeout is logged and fails open. `tool_result` is observe-only. Security: hooks run arbitrary shell — the section is NOT project-whitelisted (project-level `hooks` is dropped with a warning) and `BAIJI_HOOKS=off` is the global kill switch; the /status summary shows the count.
 - MCP: place a `mcporter.json` in the project root; tools are discovered via `npx -y mcporter` at startup (requires Node). Tool names use `server.tool`.
 
 ### Vendor presets (`baiji-ai::vendors`)
