@@ -4,12 +4,14 @@
 //! - `Started`：会话元信息（首条）
 //! - `Message`：对话消息（含工具调用/结果）
 //! - `Summary`：上下文压缩标记
+//! - `Todo`：任务清单快照（每次变更后追加，重放取最后一条）
 //!
 //! 重放语义：`Message` 按序回放；`Summary` 把此前的消息折叠为
 //! `[摘要 System 消息] + 最近 kept_messages 条`，与压缩发生时内存中的状态一致
 //! （文件仍保留全部原文供审计；恢复会话不会把已压缩的历史重新加载回来）。
 
 use crate::session::{Session, SessionMeta};
+use crate::todo::TodoItem;
 use anyhow::{Context, Result};
 use baiji_ai::Message;
 use serde::{Deserialize, Serialize};
@@ -36,6 +38,10 @@ pub enum Record {
         /// 重放时据此丢弃更早的消息；旧文件无此字段（None）= 旧语义，原文全部保留
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kept_messages: Option<usize>,
+    },
+    /// 任务清单快照（todo 工具每次变更后由 harness 追加；重放取最后一条）
+    Todo {
+        items: Vec<TodoItem>,
     },
     /// 一次运行结束时的上下文节省台账（Context IR 摘要）。
     /// token 字段带 serde default：旧记录缺失时按 0 解析（回放时本就被忽略）
@@ -128,6 +134,7 @@ impl JsonlStore {
                         session = Some(Session {
                             meta,
                             messages: Vec::new(),
+                            todos: Vec::new(),
                         });
                     }
                 }
@@ -150,6 +157,12 @@ impl JsonlStore {
                         }
                         // 旧文件：无法得知保留了多少，维持旧行为
                         None => messages.push(summary),
+                    }
+                }
+                // 任务清单：快照语义，最后一条生效
+                Record::Todo { items } => {
+                    if let Some(session) = session.as_mut() {
+                        session.todos = items;
                     }
                 }
                 // 台账只作审计，不进入对话历史
@@ -482,6 +495,49 @@ mod tests {
             store.load(&titled.meta.id).unwrap().meta.title.as_deref(),
             Some("Saved title")
         );
+    }
+
+    #[test]
+    fn test_todo_record_last_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlStore::new(dir.path());
+        let session = Session::new(None);
+        let id = &session.meta.id;
+        store
+            .append(
+                id,
+                &Record::Started {
+                    meta: session.meta.clone(),
+                },
+            )
+            .unwrap();
+        let item = |n: usize| crate::todo::TodoItem {
+            id: n,
+            content: format!("task {n}"),
+            status: crate::todo::TodoStatus::Pending,
+            note: None,
+        };
+        // 两条快照：重放取最后一条
+        store
+            .append(
+                id,
+                &Record::Todo {
+                    items: vec![item(1), item(2)],
+                },
+            )
+            .unwrap();
+        store
+            .append(
+                id,
+                &Record::Todo {
+                    items: vec![item(3)],
+                },
+            )
+            .unwrap();
+
+        let loaded = store.load(id).unwrap();
+        assert_eq!(loaded.todos.len(), 1);
+        assert_eq!(loaded.todos[0].content, "task 3");
     }
 
     #[test]

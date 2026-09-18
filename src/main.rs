@@ -156,6 +156,10 @@ async fn main() -> Result<()> {
     )));
     info!("project memory enabled for '{memory_project}'");
 
+    // ---- 会话任务清单（todo 工具 + 系统提示注入，长程任务状态外置）----
+    let todo_store = Arc::new(baiji_harness::TodoStore::new());
+    tools.register(Arc::new(baiji_harness::TodoTool::new(todo_store.clone())));
+
     // skills：同名时项目级 ./.baiji/skills 覆盖用户级 ~/.baiji/skills
     // （load_skills 后者覆盖前者，故用户级在前）。系统提示只列清单，正文经 skill 工具按需加载
     let skills = baiji_harness::load_skills(&[
@@ -301,6 +305,9 @@ async fn main() -> Result<()> {
 
     // 历史 tool result stub 化与 expand 工具共用同一 ctx store
     harness.set_ctx_store(baiji_dir.join("ctx-store"));
+
+    // 任务清单（与已注册的 TodoTool 共享存储）
+    harness.set_todos(todo_store);
 
     // LLM 压缩摘要（可选）
     if app_config.llm_compaction.unwrap_or(false) {

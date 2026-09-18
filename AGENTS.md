@@ -7,7 +7,7 @@ A terminal AI coding agent built on a multi-crate Rust workspace: async streamin
 ```bash
 cargo build                # Build the whole workspace
 cargo run                  # Run the TUI app (default)
-cargo test --workspace     # Run all tests (285 total)
+cargo test --workspace     # Run all tests (291 total)
 baiji -e "msg" --yes      # Headless one-shot run (streams to stdout)
 baiji --sessions          # List sessions (no API key needed)
 cargo test -p baiji-agent  # Test a single crate
@@ -145,6 +145,7 @@ run()
 - Skills: `load_skills([dirs])` scans `*/SKILL.md` with `name:`/`description:` frontmatter; project `./.baiji/skills` overrides user `~/.baiji/skills`; rendered into the system prompt.
 - Templates: `render("... {{var}} ...", &vars)`.
 - Project memory (cross-session, `memory.rs`): per-project JSONL at `~/.baiji/memory/<name-hash>.jsonl` (project key = dir name + path hash). Entries carry a kind (fact/decision/preference/gotcha), `learned_at`, optional `valid_until` TTL — expired entries are lazily evicted and never injected. Active entries (≤20, 200 chars each) render into the system prompt as `## Project memory`. The `memory` tool (add/list/forget) lets the LLM write entries; same-fact re-add refreshes instead of duplicating.
+- Session todo list (`todo.rs`, long-horizon state externalization): the `todo` tool (add/update/list/clear) maintains `TodoItem { id, content, status, note }` in a `TodoStore` shared between the harness and the tool (Arc). The current list renders into the system prompt as `## Task list` — the system prompt never participates in compaction, so the plan survives context reduction and session resume. Persistence: a `Record::Todo { items }` snapshot is appended to the session JSONL at the end of any run that mutated the list (replay = last record wins; `branch` inherits, `switch_session` restores). `has_open_todos()` feeds the future auto-continue (T4).
 
 ### Tools (`baiji-tools`)
 

@@ -14,6 +14,7 @@ pub mod session;
 pub mod skills;
 pub mod stub;
 pub mod templates;
+pub mod todo;
 
 pub use compaction::{CompactionPolicy, compact, compact_with_llm, estimate_tokens};
 pub use memory::{MemoryEntry, MemoryKind, MemoryStore, MemoryTool, memory_section, project_key};
@@ -23,6 +24,7 @@ pub use stub::stub_tool_results;
 pub use skills::{Skill, SkillTool, load_skills};
 pub use templates::render;
 pub use templates::{PromptTemplate, load_templates};
+pub use todo::{TodoItem, TodoStatus, TodoStore, TodoTool, todo_section};
 
 use anyhow::Result;
 use baiji_agent::{AgentEvent, AgentRuntime, SteeringQueue};
@@ -46,6 +48,7 @@ Avoid mode=full on large files. If output was truncated, use the expand tool wit
 imports (direction=incoming) to see who depends on a file before changing it; grep for exact patterns.
 - Prefer precise edits (edit tool) over rewriting whole files.
 - Persist durable project knowledge (build commands, conventions, decisions, pitfalls) with the memory tool; it survives across sessions.
+- For multi-step work, break it down with the todo tool first (one in_progress item at a time, mark done as you go). The list lives outside the conversation and is never lost to compaction.
 - Verify changes by reading back or running quick commands when practical.
 - Keep answers concise; show the final result and any commands the user should run.
 - If a request is ambiguous, state your assumption and proceed.
@@ -74,6 +77,8 @@ pub struct AgentHarness {
     memory: Option<(Arc<MemoryStore>, String)>,
     /// ctx store 目录（None = 禁用历史 tool result 的 stub 化）
     ctx_store: Option<PathBuf>,
+    /// 会话级任务清单（与 TodoTool 共享；None = 未启用 todo 工具）
+    todos: Option<Arc<TodoStore>>,
     telemetry: Arc<dyn baiji_telemetry::Telemetry>,
 }
 
@@ -100,6 +105,7 @@ impl AgentHarness {
             llm_compaction: false,
             memory: None,
             ctx_store: None,
+            todos: None,
             telemetry: Arc::new(NoopTelemetry),
         })
     }
@@ -124,6 +130,7 @@ impl AgentHarness {
             llm_compaction: false,
             memory: None,
             ctx_store: None,
+            todos: None,
             telemetry: Arc::new(NoopTelemetry),
         })
     }
@@ -161,6 +168,8 @@ impl AgentHarness {
 
         let mut child = Session::new(Some(self.session.meta.id.clone()));
         child.messages = messages[..keep].to_vec();
+        // 任务清单随分叉继承（父会话不受影响）
+        child.todos = self.session.todos.clone();
         // 标题随 Started 一起写入（分叉时历史已知）
         child.meta.title = self.session.meta.title.clone();
         child.derive_title();
@@ -236,6 +245,18 @@ impl AgentHarness {
         self.ctx_store = Some(dir.into());
     }
 
+    /// 启用任务清单（与 TodoTool 共享同一存储）。
+    /// 存储内容以会话当前状态为准：resume 会话后清单经此恢复进共享存储
+    pub fn set_todos(&mut self, store: Arc<TodoStore>) {
+        store.replace(self.session.todos.clone());
+        self.todos = Some(store);
+    }
+
+    /// 是否有未完成任务（自动接力的判定条件）
+    pub fn has_open_todos(&self) -> bool {
+        self.todos.as_ref().is_some_and(|t| t.has_open())
+    }
+
     /// 列出存储中的全部会话（供 UI 选择器）
     pub fn list_sessions(&self) -> Result<Vec<SessionMeta>> {
         self.store.list()
@@ -244,6 +265,10 @@ impl AgentHarness {
     /// 切换到已有会话（历史从 JSONL 重放）
     pub fn switch_session(&mut self, session_id: &str) -> Result<()> {
         self.session = self.store.load(session_id)?;
+        // 任务清单跟随切换（TodoTool 共享同一存储，随即看到新状态）
+        if let Some(todos) = &self.todos {
+            todos.replace(self.session.todos.clone());
+        }
         info!("switched to session {session_id}");
         Ok(())
     }
@@ -291,6 +316,13 @@ impl AgentHarness {
                 prompt.push_str("\n\n");
                 prompt.push_str(&section);
             }
+        }
+        // 任务清单：系统提示永不参与压缩——这是状态外置的关键性质
+        if let Some(todos) = &self.todos
+            && let Some(section) = todo_section(&todos.items())
+        {
+            prompt.push_str("\n\n");
+            prompt.push_str(&section);
         }
         prompt
     }
@@ -476,6 +508,17 @@ impl AgentHarness {
                 &self.session.meta.id,
                 &Record::Message {
                     message: message.clone(),
+                },
+            )?;
+        }
+        // 任务清单有变更则落盘快照（run 结束时机：会话 id 稳定，无并发问题）
+        if let Some(todos) = &self.todos
+            && todos.take_dirty()
+        {
+            self.store.append(
+                &self.session.meta.id,
+                &Record::Todo {
+                    items: todos.items(),
                 },
             )?;
         }
@@ -959,6 +1002,102 @@ mod tests {
         let file = store_dir.join(format!("{}.jsonl", harness.session().meta.id));
         let jsonl = std::fs::read_to_string(&file).unwrap();
         assert!(!jsonl.contains("\"summary\""), "{jsonl}");
+    }
+
+    // ===== 任务清单（todo）=====
+
+    #[tokio::test]
+    async fn test_todo_mutations_persisted_and_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("sessions");
+        let todos = Arc::new(TodoStore::new());
+
+        let runtime = Arc::new(AgentRuntime::new(Arc::new(EchoProvider)));
+        let mut harness = AgentHarness::new(runtime, store_dir.clone()).unwrap();
+        // set_todos 以会话状态为准（新会话为空）——工具在接线之后变更
+        harness.set_todos(todos.clone());
+        assert!(!harness.has_open_todos());
+
+        todos.add("step one".into());
+        todos.update(1, Some(TodoStatus::InProgress), None, Some(Some("wip".into()))).unwrap();
+        todos.add("step two".into());
+        assert!(harness.has_open_todos());
+
+        // run 结束时变更落盘
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        harness
+            .run("go", &tx, &CancellationToken::new(), &SteeringQueue::new())
+            .await
+            .unwrap();
+        let file = store_dir.join(format!("{}.jsonl", harness.session().meta.id));
+        let jsonl = std::fs::read_to_string(&file).unwrap();
+        assert!(jsonl.contains("\"todo\""), "{jsonl}");
+
+        // resume：新 harness + 新存储，清单从重放恢复
+        let runtime2 = Arc::new(AgentRuntime::new(Arc::new(EchoProvider)));
+        let mut restored = AgentHarness::load(runtime2, store_dir, &harness.session().meta.id).unwrap();
+        let fresh = Arc::new(TodoStore::new());
+        restored.set_todos(fresh.clone());
+        let items = fresh.items();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].status, TodoStatus::InProgress);
+        assert_eq!(items[0].note.as_deref(), Some("wip"));
+
+        // 系统提示包含清单（注入可见）
+        let prompt = restored.system_prompt();
+        assert!(prompt.contains("## Task list"), "{prompt}");
+        assert!(prompt.contains("[~] 1. step one — wip"), "{prompt}");
+        assert!(prompt.contains("[ ] 2. step two"), "{prompt}");
+        assert!(restored.has_open_todos());
+    }
+
+    #[tokio::test]
+    async fn test_todo_survives_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("sessions");
+        let todos = Arc::new(TodoStore::new());
+
+        let runtime = Arc::new(AgentRuntime::new(Arc::new(EchoProvider)));
+        let mut harness = AgentHarness::new(runtime, store_dir.clone()).unwrap();
+        harness.set_todos(todos.clone());
+        harness.set_compaction_policy(CompactionPolicy {
+            max_estimated_tokens: 10,
+            keep_recent_turns: 1,
+        });
+
+        // 11 项任务 + 足以触发压缩的历史
+        todos.add("the long task".into());
+        for i in 1..=10 {
+            todos.add(format!("step {i}"));
+        }
+        for i in 0..10 {
+            harness.session.messages.push(Message::user(format!("question {i}")));
+            harness
+                .session
+                .messages
+                .push(Message::assistant(format!("answer {i} with padding to grow context")));
+        }
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        harness
+            .run("go", &tx, &CancellationToken::new(), &SteeringQueue::new())
+            .await
+            .unwrap();
+
+        // 压缩确实发生了（历史折叠为摘要）
+        assert!(
+            harness
+                .session
+                .messages
+                .iter()
+                .any(|m| m.content.contains("[Conversation Summary]")),
+            "compaction should have fired"
+        );
+        // 但系统提示仍含全部任务项——清单外置于压缩不可及之处
+        let prompt = harness.system_prompt();
+        assert!(prompt.contains("the long task"), "{prompt}");
+        assert!(prompt.contains("[ ] 11. step 10"), "{prompt}");
+        assert!(prompt.matches("step ").count() >= 11, "{prompt}");
     }
 
     // ===== 上下文节省台账（Context IR）=====
