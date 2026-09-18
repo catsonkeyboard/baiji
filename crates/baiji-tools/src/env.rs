@@ -98,19 +98,9 @@ impl ExecutionEnv {
     /// 把完整内容 spill 到存储，返回短句柄（sha256 前 16 位十六进制）。
     /// 同内容只写一次（内容寻址天然去重）。
     pub fn spill(&self, content: &str) -> Option<String> {
-        let store = self.ctx_store.as_ref()?;
-        let digest = Sha256::digest(content.as_bytes());
-        let handle = digest
-            .iter()
-            .take(8)
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
-        let file = store.join(&handle);
-        // 已存在则跳过写入（去重）
-        if !file.exists() {
-            std::fs::write(&file, content).ok()?;
-        }
-        Some(handle)
+        self.ctx_store
+            .as_deref()
+            .and_then(|dir| spill_to_store(dir, content))
     }
 
     /// 按句柄取回 spill 的内容
@@ -298,6 +288,24 @@ pub fn prune_ctx_store(dir: &Path, ttl: Duration) -> usize {
     removed
 }
 
+/// 把内容 spill 到内容寻址存储目录：句柄 = sha256 前 16 位十六进制，
+/// 同内容只写一次。`ExecutionEnv::spill` 与 harness 的历史 stub 化共用
+/// （句柄格式必须全局唯一实现——expand 凭它取回）。
+pub fn spill_to_store(dir: &Path, content: &str) -> Option<String> {
+    let digest = Sha256::digest(content.as_bytes());
+    let handle = digest
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let file = dir.join(&handle);
+    // 已存在则跳过写入（去重）；目录可能尚未创建（如 harness 单独配置时）
+    if !file.exists() {
+        std::fs::create_dir_all(dir).ok()?;
+        std::fs::write(&file, content).ok()?;
+    }
+    Some(handle)
+}
 
 /// 词法归一化：消除 `.` 与 `..`，不触碰文件系统
 /// （`..` 越过根时按根截断，行为等价于 canonicalize 的路径部分）
