@@ -18,6 +18,8 @@ pub struct RuntimeSettings {
     pub model: Option<String>,
     /// 已展开的明文 Key（向导输入或环境变量展开而来）
     pub api_key: String,
+    /// 思考级别（None = 不启用）
+    pub thinking: Option<baiji_ai::ThinkingLevel>,
 }
 
 /// 自动接力配置（T4）：run 结束且 todo 未完成时自动继续
@@ -63,6 +65,9 @@ pub fn load(config_path: &Path) -> Result<RuntimeSettings> {
         endpoint: value["endpoint"].as_str().map(String::from),
         model: value["model"].as_str().map(String::from),
         api_key,
+        thinking: value["thinking"]
+            .as_str()
+            .and_then(baiji_ai::ThinkingLevel::parse),
     })
 }
 
@@ -111,6 +116,14 @@ pub fn save(config_path: &Path, settings: &RuntimeSettings, key: KeyUpdate<'_>) 
         }
         None => {
             map.remove("model");
+        }
+    }
+    match settings.thinking {
+        Some(level) => {
+            map.insert("thinking".into(), serde_json::json!(level.effort()));
+        }
+        None => {
+            map.remove("thinking");
         }
     }
     match key {
@@ -227,6 +240,7 @@ mod tests {
             endpoint: Some("coding".to_string()),
             model: Some("glm-4.7".to_string()),
             api_key: "sk-live".to_string(),
+            thinking: None,
         };
         save(&path, &updated, KeyUpdate::Keep).unwrap();
 
@@ -277,6 +291,7 @@ mod tests {
             endpoint: Some("coding".to_string()),
             model: Some("glm-4.7".to_string()),
             api_key: "sk-test".to_string(),
+            thinking: None,
         };
         let provider = build_provider(&settings).unwrap();
         assert_eq!(provider.protocol(), baiji_ai::Protocol::OpenAIChat);
@@ -285,6 +300,7 @@ mod tests {
         // 缺 Key / 缺 model 的报错
         let bad = RuntimeSettings {
             api_key: String::new(),
+            thinking: None,
             ..settings.clone()
         };
         assert!(build_provider(&bad).is_err());
@@ -302,6 +318,7 @@ mod tests {
             endpoint: None,
             model: Some("glm-4.7".to_string()),
             api_key: String::new(),
+            thinking: None,
         };
         assert_eq!(status_hint(&settings), "智谱 GLM · glm-4.7");
         let settings = RuntimeSettings {

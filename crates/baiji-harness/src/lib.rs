@@ -417,6 +417,16 @@ impl AgentHarness {
         self.telemetry = telemetry;
     }
 
+    /// 热切换思考级别（TUI /thinking；下一次请求生效）
+    pub fn set_thinking(&self, thinking: Option<baiji_ai::ThinkingLevel>) {
+        self.runtime.set_thinking(thinking);
+    }
+
+    /// 当前思考级别
+    pub fn thinking_level(&self) -> Option<baiji_ai::ThinkingLevel> {
+        self.runtime.thinking()
+    }
+
     pub fn set_templates(&mut self, templates: Vec<templates::PromptTemplate>) {
         self.templates = templates;
     }

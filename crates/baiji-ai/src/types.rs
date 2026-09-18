@@ -127,6 +127,53 @@ pub struct ToolDefinition {
     pub parameters: Value, // JSON Schema
 }
 
+/// 思考级别（provider 推理强度）。
+/// 请求级开关：`None` = 不发送任何思考相关字段（协议各自的默认行为）；
+/// 各协议映射 — Anthropic `thinking.budget_tokens`、
+/// OpenAI Chat `reasoning_effort`、OpenAI Responses `reasoning.effort`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingLevel {
+    Minimal,
+    Low,
+    Medium,
+    High,
+}
+
+impl ThinkingLevel {
+    /// 配置/命令字符串解析（大小写不敏感；off/none 由调用方在 Option 层处理）
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            _ => None,
+        }
+    }
+
+    /// Anthropic `thinking.budget_tokens`（API 要求 ≥1024 且 < max_tokens，
+    /// 请求侧会在 max_tokens 不足时补足）
+    pub fn budget_tokens(self) -> u32 {
+        match self {
+            Self::Minimal => 1024,
+            Self::Low => 4096,
+            Self::Medium => 8192,
+            Self::High => 16384,
+        }
+    }
+
+    /// OpenAI 系 effort 字符串（Chat `reasoning_effort` / Responses `reasoning.effort`）
+    pub fn effort(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
 /// 聊天请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatRequest {
@@ -134,6 +181,9 @@ pub struct ChatRequest {
     pub tools: Option<Vec<ToolDefinition>>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    /// 思考级别（None = 不启用，序列化时省略——serde 默认兼容旧配置/记录）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingLevel>,
 }
 
 impl ChatRequest {
@@ -143,6 +193,7 @@ impl ChatRequest {
             tools: None,
             max_tokens: None,
             temperature: None,
+            thinking: None,
         }
     }
 
@@ -153,6 +204,12 @@ impl ChatRequest {
 
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = Some(max_tokens);
+        self
+    }
+
+    /// 设置思考级别（请求级；None 表示不启用）
+    pub fn with_thinking(mut self, thinking: Option<ThinkingLevel>) -> Self {
+        self.thinking = thinking;
         self
     }
 
@@ -238,6 +295,34 @@ pub enum StreamChunk {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_thinking_level_parse_and_mapping() {
+        assert_eq!(ThinkingLevel::parse("high"), Some(ThinkingLevel::High));
+        assert_eq!(ThinkingLevel::parse("LOW"), Some(ThinkingLevel::Low));
+        assert_eq!(
+            ThinkingLevel::parse(" minimal "),
+            Some(ThinkingLevel::Minimal)
+        );
+        // off/none 与未知值：由配置层在 Option 层处理（parse 返回 None）
+        assert_eq!(ThinkingLevel::parse("off"), None);
+        assert_eq!(ThinkingLevel::parse("bogus"), None);
+
+        assert_eq!(ThinkingLevel::Minimal.budget_tokens(), 1024);
+        assert_eq!(ThinkingLevel::High.budget_tokens(), 16384);
+        assert_eq!(ThinkingLevel::Medium.effort(), "medium");
+
+        // serde 小写；ChatRequest 缺省无 thinking（旧记录/旧配置兼容）
+        assert_eq!(
+            serde_json::to_string(&ThinkingLevel::Low).unwrap(),
+            "\"low\""
+        );
+        let req: ChatRequest = serde_json::from_str(r#"{"messages":[]}"#).unwrap();
+        assert_eq!(req.thinking, None);
+        let req: ChatRequest =
+            serde_json::from_str(r#"{"messages":[],"thinking":"high"}"#).unwrap();
+        assert_eq!(req.thinking, Some(ThinkingLevel::High));
+    }
 
     #[test]
     fn test_message_creation() {

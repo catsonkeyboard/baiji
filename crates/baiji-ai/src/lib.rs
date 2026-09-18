@@ -19,8 +19,8 @@ pub use models::{
     discover_models, list_models, model_limits, pick_default_model, ModelInfo, ModelLimits,
 };
 pub use provider::{build_provider, Protocol, Provider, ProviderConfig};
-pub use types::{current_turn_start, ReasoningBlock, StopReason, 
-    ChatRequest, ChatResponse, Message, Role, StreamChunk, TokenUsage, ToolCall, ToolDefinition,
+pub use types::{current_turn_start, ReasoningBlock, StopReason,
+    ChatRequest, ChatResponse, Message, Role, StreamChunk, ThinkingLevel, TokenUsage, ToolCall, ToolDefinition,
     ToolResult,
 };
 pub use vendors::{all_vendors, auto_endpoint, expand_env_vars, find_vendor, resolve_vendor, EndpointVariant, VendorPreset};

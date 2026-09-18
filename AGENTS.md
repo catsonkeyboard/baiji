@@ -7,7 +7,7 @@ A terminal AI coding agent built on a multi-crate Rust workspace: async streamin
 ```bash
 cargo build                # Build the whole workspace
 cargo run                  # Run the TUI app (default)
-cargo test --workspace     # Run all tests (337 total)
+cargo test --workspace     # Run all tests (343 total)
 baiji -e "msg" --yes      # Headless one-shot run (streams to stdout)
 baiji --sessions          # List sessions (no API key needed)
 cargo test -p baiji-agent  # Test a single crate
@@ -48,6 +48,7 @@ Dependency direction: telemetry ← ai ← agent ← tools ← harness ← {tui,
   "protocol": null,
   "base_url": null,
   "max_tokens": 4096,
+  "thinking": null,
   "llm_compaction": false,
   "max_turns": 24,
   "compaction": {
@@ -73,6 +74,7 @@ Dependency direction: telemetry ← ai ← agent ← tools ← harness ← {tui,
 ```
 
 - Only `vendor` + API key are required; `model` is auto-discovered from the vendor's models API when omitted (first entry is used; set it explicitly to pin).
+- `thinking` sets the reasoning level: `"minimal"` / `"low"` / `"medium"` / `"high"` (null/absent = off). Request-level field mapped per protocol — Anthropic `thinking: {type: enabled, budget_tokens}` (1024/4096/8192/16384, max_tokens auto-raised to budget+1024 when needed), OpenAI Chat `reasoning_effort`, OpenAI Responses `reasoning.effort`. Hot-swappable in the TUI via `/thinking <level|off>` (persisted to the config, next request生效); project-scope-allowed like `max_tokens`.
 - `api_key` supports `$ENV_VAR` / `${ENV_VAR}`; if omitted, the vendor's recommended env var is read (see below). Undefined vars are kept literally.
 - `endpoint` selects a vendor endpoint variant (default `"api"` = pay-per-use). Coding Plan subscriptions must use their dedicated endpoints — GLM: `"anthropic"` (`/api/anthropic`, Anthropic protocol) / `"coding"` (`/api/coding/paas/v4`, OpenAI Chat) / `"responses"` (`/api/v1`, OpenAI Responses); deepseek/kimi/minimax/mimo/bailian: `"anthropic"` (verified Anthropic-compatible endpoints). Unknown endpoint names fail fast with the available list.
 - `protocol` override: `"anthropic"` / `"chat"` / `"responses"`; `base_url` override accepts root, `/v1`-suffixed, versioned (`/v4`), or full endpoint paths. Explicit `base_url`/`protocol` take precedence over the selected endpoint variant.
@@ -184,7 +186,7 @@ MCP: `mcp` module ports the mcporter CLI bridge — `register_mcp_tools(&mut Too
 
 Claude Code / OpenCode / Grok-style layout: one-line header (brand + git branch + `~`-abbreviated workdir left, vendor·model or running spinner right) → borderless chat area (2-col side padding, blank line between message groups) → rounded input box → one-line status bar (run state left, ctx/saved/session right). Message styling: user `❯ ` bold + full-row highlight strip (`theme.highlight`), assistant plain gray, tool activity `● Name(args)` (colored dot, bold name) with `⎿` result lines indented dim (`⎿ ✗` in error color), system lines dim italic. Streaming text renders into a partial line and lands as a full line on `RunCompleted`; thinking shows a dim `✻` tail. Empty sessions render a centered welcome screen (logo + key hints). Typing during a run pushes steering; Esc cancels via `CancellationToken`; PageUp/PageDown scroll with a `usize::MAX` stick-to-bottom sentinel clamped each frame.
 
-- **Slash commands + ghost completion**: `SLASH_COMMANDS` (18 entries, dictionary order): btw / compact / config / fork / help / kill / model / new / plan / quit / resume / session / status / subagents / tasks / thinking / todos / usage. While typing `/prefix`, the input box shows a dim fish-style ghost of the first prefix match after the cursor (`> /mo▏del `) and Tab accepts it (completes to `/model `); the status bar's right half temporarily shows that command's usage. Implemented for real: quit (exit), new (`AgentHarness::start_new_session` — same project, shared todo store cleared), resume (session picker), session (meta + message/todo counts), compact (`AgentHarness::compact_now` — forced stub+summary, persists `Record::Summary`), todos, usage (ctx/compression-saved/tools ledger), tasks (`JobRegistry::snapshot`), kill (`JobRegistry::stop`; both wired via `baiji_tools::builtin_tools_with_jobs` → `baiji_tui::run(jobs)`). thinking / plan / subagents / btw are registered with explicit "planned" responses. User prompt templates (`/name args`) bypass command dispatch and go to the harness.
+- **Slash commands + ghost completion**: `SLASH_COMMANDS` (18 entries, dictionary order): btw / compact / config / fork / help / kill / model / new / plan / quit / resume / session / status / subagents / tasks / thinking / todos / usage. While typing `/prefix`, the input box shows a dim fish-style ghost of the first prefix match after the cursor (`> /mo▏del `) and Tab accepts it (completes to `/model `); the status bar's right half temporarily shows that command's usage. Implemented for real: quit (exit), new (`AgentHarness::start_new_session` — same project, shared todo store cleared), resume (session picker), session (meta + message/todo counts), compact (`AgentHarness::compact_now` — forced stub+summary, persists `Record::Summary`), todos, usage (ctx/compression-saved/tools ledger), tasks (`JobRegistry::snapshot`), kill (`JobRegistry::stop`; both wired via `baiji_tools::builtin_tools_with_jobs` → `baiji_tui::run(jobs)`), thinking (`/thinking <minimal|low|medium|high|off>` — hot-swaps `AgentRuntime`'s request-level thinking, persists to config). plan / subagents / btw are registered with explicit "planned" responses. User prompt templates (`/name args`) bypass command dispatch and go to the harness.
 
 - **Floating todo panel**: when the session has a todo list, it floats in the chat area's top-right corner (rounded border, `○`/`◉`/`✓` markers, in-progress accented, done crossed out; capped at half the chat height, `… 还有 N 项` overflow; hidden when empty or terminal < 50 cols). Data via `AgentHarness::todos_snapshot()`.
 - **Session picker** (`Ctrl+O`): centered overlay listing sessions (newest first, current marked `▸`, branch origin shown as `⎇parent`); `Enter` switches (chat rebuilt from replayed history), `b` branches the current session, `Esc` closes. Disabled while a run is active.

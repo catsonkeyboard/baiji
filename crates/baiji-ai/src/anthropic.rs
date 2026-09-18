@@ -119,9 +119,22 @@ impl AnthropicProvider {
     fn build_request_body(request: &ChatRequest, model: &str, stream: bool) -> AnthropicRequest {
         let (system, messages) = Self::convert_messages(&request.messages);
 
+        // 思考级别：budget_tokens 必须严格小于 max_tokens——不足时补足 max_tokens
+        let thinking = request.thinking.map(|level| AnthropicThinking {
+            r#type: "enabled",
+            budget_tokens: level.budget_tokens(),
+        });
+        let max_tokens = match &thinking {
+            Some(t) => request
+                .max_tokens
+                .unwrap_or(4096)
+                .max(t.budget_tokens + 1024),
+            None => request.max_tokens.unwrap_or(4096),
+        };
+
         AnthropicRequest {
             model: model.to_string(),
-            max_tokens: request.max_tokens.unwrap_or(4096),
+            max_tokens,
             temperature: request.temperature,
             system,
             messages,
@@ -135,6 +148,7 @@ impl AnthropicProvider {
                     })
                     .collect()
             }),
+            thinking,
             stream,
         }
     }
@@ -309,8 +323,7 @@ impl AnthropicStreamState {
                     }
                     if block.block_type == "tool_use" {
                         if let (Some(id), Some(name)) = (block.id.clone(), block.name.clone()) {
-                            let index =
-                                event.index.unwrap_or(self.block_ids.len() as u32) as usize;
+                            let index = event.index.unwrap_or(self.block_ids.len() as u32) as usize;
                             while self.block_ids.len() <= index {
                                 self.block_ids.push(None);
                             }
@@ -346,7 +359,10 @@ impl AnthropicStreamState {
                                     .cloned()
                                     .flatten()
                                     .unwrap_or_default();
-                                vec![StreamChunk::ToolCallArguments { id, arguments: json }]
+                                vec![StreamChunk::ToolCallArguments {
+                                    id,
+                                    arguments: json,
+                                }]
                             }
                             _ => Vec::new(),
                         },
@@ -420,7 +436,17 @@ struct AnthropicRequest {
     messages: Vec<AnthropicMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<AnthropicTool>>,
+    /// 扩展思考（`thinking: {type: enabled, budget_tokens}`）；None 时不发送
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<AnthropicThinking>,
     stream: bool,
+}
+
+/// Anthropic 扩展思考配置（type 恒为 enabled）
+#[derive(Debug, Serialize)]
+struct AnthropicThinking {
+    r#type: &'static str,
+    budget_tokens: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -644,31 +670,27 @@ mod tests {
     fn test_build_request_body_shapes() {
         let mut messages = vec![Message::system("Be helpful")];
         messages.push(Message::user("hi"));
-        messages.push(
-            Message {
-                role: Role::Assistant,
-                content: String::new(),
-                tool_calls: Some(vec![ToolCall {
-                    id: "tu_1".to_string(),
-                    name: "grep".to_string(),
-                    arguments: serde_json::json!({"pattern": "foo"}),
-                }]),
-                tool_results: None,
-                reasoning: None,
-            },
-        );
-        messages.push(
-            Message {
-                role: Role::Tool,
-                content: String::new(),
-                tool_calls: None,
-                tool_results: Some(vec![ToolResult {
-                    tool_call_id: "tu_1".to_string(),
-                    content: "a.rs:1:foo".to_string(),
-                }]),
-                reasoning: None,
-            },
-        );
+        messages.push(Message {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: Some(vec![ToolCall {
+                id: "tu_1".to_string(),
+                name: "grep".to_string(),
+                arguments: serde_json::json!({"pattern": "foo"}),
+            }]),
+            tool_results: None,
+            reasoning: None,
+        });
+        messages.push(Message {
+            role: Role::Tool,
+            content: String::new(),
+            tool_calls: None,
+            tool_results: Some(vec![ToolResult {
+                tool_call_id: "tu_1".to_string(),
+                content: "a.rs:1:foo".to_string(),
+            }]),
+            reasoning: None,
+        });
 
         let request = ChatRequest::new(messages).with_max_tokens(1024);
         let body = serde_json::to_value(AnthropicProvider::build_request_body(
@@ -690,6 +712,41 @@ mod tests {
         assert_eq!(last["role"], "user");
         assert_eq!(last["content"][0]["type"], "tool_result");
         assert_eq!(last["content"][0]["tool_use_id"], "tu_1");
+    }
+
+    #[test]
+    fn test_thinking_in_request_body() {
+        use crate::types::ThinkingLevel;
+        let messages = vec![Message::user("hi")];
+
+        // 启用：budget_tokens 下发，max_tokens 补足到 budget + 1024（API 要求 budget < max_tokens）
+        let request = ChatRequest::new(messages.clone()).with_thinking(Some(ThinkingLevel::High));
+        let body = serde_json::to_value(AnthropicProvider::build_request_body(
+            &request, "claude-x", false,
+        ))
+        .unwrap();
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 16384);
+        assert_eq!(body["max_tokens"], 16384 + 1024);
+
+        // 已有更大的 max_tokens 时保持不变
+        let request = ChatRequest::new(messages.clone())
+            .with_max_tokens(32768)
+            .with_thinking(Some(ThinkingLevel::Medium));
+        let body = serde_json::to_value(AnthropicProvider::build_request_body(
+            &request, "claude-x", false,
+        ))
+        .unwrap();
+        assert_eq!(body["max_tokens"], 32768);
+        assert_eq!(body["thinking"]["budget_tokens"], 8192);
+
+        // 未启用：字段整个不出现
+        let request = ChatRequest::new(messages);
+        let body = serde_json::to_value(AnthropicProvider::build_request_body(
+            &request, "claude-x", false,
+        ))
+        .unwrap();
+        assert!(body.get("thinking").is_none());
     }
 
     #[test]
@@ -747,8 +804,9 @@ mod tests {
             }]
         );
 
-        let chunks =
-            state.process_data(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}"#);
+        let chunks = state.process_data(
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}"#,
+        );
         assert_eq!(chunks, vec![StreamChunk::Content("ok".to_string())]);
 
         let chunks = state.process_data(r#"{"type":"message_stop"}"#);
@@ -777,7 +835,10 @@ mod tests {
         assert_eq!(
             state.process_data(r#"{"type":"message_stop"}"#),
             vec![
-                StreamChunk::Usage(TokenUsage { input_tokens: 0, output_tokens: 4096 }),
+                StreamChunk::Usage(TokenUsage {
+                    input_tokens: 0,
+                    output_tokens: 4096
+                }),
                 StreamChunk::Stop(crate::types::StopReason::MaxTokens),
                 StreamChunk::Done
             ]
@@ -804,7 +865,10 @@ mod tests {
         assert_eq!(
             state.process_data(r#"{"type":"message_stop"}"#),
             vec![
-                StreamChunk::Usage(TokenUsage { input_tokens: 120, output_tokens: 45 }),
+                StreamChunk::Usage(TokenUsage {
+                    input_tokens: 120,
+                    output_tokens: 45
+                }),
                 StreamChunk::Stop(crate::types::StopReason::ToolUse),
                 StreamChunk::Done
             ]
@@ -836,11 +900,19 @@ mod tests {
         };
         let messages = vec![
             Message::user("old turn"),
-            Message { tool_calls: call("t1"), reasoning: thinking.clone(), ..Message::assistant("") },
+            Message {
+                tool_calls: call("t1"),
+                reasoning: thinking.clone(),
+                ..Message::assistant("")
+            },
             result("t1"),
             Message::assistant("old answer"),
             Message::user("new turn"),
-            Message { tool_calls: call("t2"), reasoning: thinking, ..Message::assistant("") },
+            Message {
+                tool_calls: call("t2"),
+                reasoning: thinking,
+                ..Message::assistant("")
+            },
             result("t2"),
         ];
         let body = serde_json::to_value(AnthropicProvider::build_request_body(
