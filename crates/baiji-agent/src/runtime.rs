@@ -284,6 +284,7 @@ impl AgentRuntime {
                                     is_error: true,
                                     duration_ms: 0,
                                     original_bytes: None,
+                                    original_tokens: None,
                                 })
                                 .ok();
                             tool_results.push(ToolResult {
@@ -456,9 +457,17 @@ impl AgentRuntime {
         tool_span.set_attribute("duration_ms", AttrValue::Uint(duration_ms));
         tool_span.set_attribute("is_error", AttrValue::Bool(output.is_error));
         tool_span.set_attribute("bytes_delivered", AttrValue::Uint(output.content.len() as u64));
+        tool_span.set_attribute(
+            "tokens_delivered",
+            AttrValue::Uint(crate::estimate_text_tokens(&output.content) as u64),
+        );
         if let Some(original) = output.original_bytes {
             tool_span.set_attribute("bytes_original", AttrValue::Uint(original));
             tool_span.set_attribute("bytes_saved", AttrValue::Uint(output.bytes_saved()));
+        }
+        if let Some(tokens) = output.original_tokens {
+            tool_span.set_attribute("tokens_original", AttrValue::Uint(tokens));
+            tool_span.set_attribute("tokens_saved", AttrValue::Uint(output.tokens_saved()));
         }
         tool_span.end();
 
@@ -479,6 +488,7 @@ impl AgentRuntime {
                 is_error: output.is_error,
                 duration_ms,
                 original_bytes: output.original_bytes,
+                original_tokens: output.original_tokens,
             })
             .ok();
 

@@ -55,7 +55,9 @@ impl AgentTool for ExpandTool {
 
     async fn execute(&self, args: Value) -> Result<ToolOutput> {
         let Some(raw) = args["handle"].as_str() else {
-            return Ok(ToolOutput::err("[Error] missing required argument 'handle'"));
+            return Ok(ToolOutput::err(
+                "[Error] missing required argument 'handle'",
+            ));
         };
         let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
         let limit = args["limit"].as_u64().map(|l| l as usize);
@@ -67,7 +69,9 @@ impl AgentTool for ExpandTool {
 
         let lines: Vec<&str> = content.lines().collect();
         let start = (offset - 1).min(lines.len());
-        let end = limit.map(|l| start.saturating_add(l).min(lines.len())).unwrap_or(lines.len());
+        let end = limit
+            .map(|l| start.saturating_add(l).min(lines.len()))
+            .unwrap_or(lines.len());
         let numbered = lines[start..end]
             .iter()
             .enumerate()
@@ -75,10 +79,13 @@ impl AgentTool for ExpandTool {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let (delivered, original) = self.env.truncate_with_meta(&numbered);
+        let (delivered, original, original_tokens) = self.env.truncate_with_meta(&numbered);
         let mut output = ToolOutput::ok(delivered);
         if let Some(bytes) = original {
             output = output.with_original_bytes(bytes);
+        }
+        if let Some(tokens) = original_tokens {
+            output = output.with_original_tokens(tokens);
         }
         Ok(output)
     }
@@ -92,9 +99,7 @@ mod tests {
     async fn test_expand_roundtrip_with_paging() {
         let dir = tempfile::tempdir().unwrap();
         let env = Arc::new(ExecutionEnv::new(".").with_ctx_store(dir.path()));
-        let content = (1..=20)
-            .map(|i| format!("line-{i}\n"))
-            .collect::<String>();
+        let content = (1..=20).map(|i| format!("line-{i}\n")).collect::<String>();
         let handle = env.spill(&content).unwrap();
 
         let tool = ExpandTool::new(env);
@@ -134,10 +139,7 @@ mod tests {
         assert!(out.is_error);
         assert!(out.content.contains("no stored content"));
 
-        let out = tool
-            .execute(serde_json::json!({}))
-            .await
-            .unwrap();
+        let out = tool.execute(serde_json::json!({})).await.unwrap();
         assert!(out.is_error);
     }
 

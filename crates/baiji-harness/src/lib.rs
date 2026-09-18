@@ -14,13 +14,13 @@ pub mod session;
 pub mod skills;
 pub mod templates;
 
-pub use compaction::{compact, compact_with_llm, estimate_tokens, CompactionPolicy};
-pub use memory::{memory_section, project_key, MemoryEntry, MemoryKind, MemoryStore, MemoryTool};
+pub use compaction::{CompactionPolicy, compact, compact_with_llm, estimate_tokens};
+pub use memory::{MemoryEntry, MemoryKind, MemoryStore, MemoryTool, memory_section, project_key};
 pub use persist::{JsonlStore, Record};
-pub use session::{new_session_id, Session, SessionMeta, SessionTree};
-pub use skills::{load_skills, Skill, SkillTool};
-pub use templates::{load_templates, PromptTemplate};
+pub use session::{Session, SessionMeta, SessionTree, new_session_id};
+pub use skills::{Skill, SkillTool, load_skills};
 pub use templates::render;
+pub use templates::{PromptTemplate, load_templates};
 
 use anyhow::Result;
 use baiji_agent::{AgentEvent, AgentRuntime, SteeringQueue};
@@ -78,7 +78,12 @@ impl AgentHarness {
     pub fn new(runtime: Arc<AgentRuntime>, store_dir: impl Into<PathBuf>) -> Result<Self> {
         let store = JsonlStore::new(store_dir);
         let session = Session::new(None);
-        store.append(&session.meta.id, &Record::Started { meta: session.meta.clone() })?;
+        store.append(
+            &session.meta.id,
+            &Record::Started {
+                meta: session.meta.clone(),
+            },
+        )?;
         Ok(Self {
             runtime,
             store,
@@ -153,11 +158,19 @@ impl AgentHarness {
         // 标题随 Started 一起写入（分叉时历史已知）
         child.meta.title = self.session.meta.title.clone();
         child.derive_title();
-        self.store
-            .append(&child.meta.id, &Record::Started { meta: child.meta.clone() })?;
+        self.store.append(
+            &child.meta.id,
+            &Record::Started {
+                meta: child.meta.clone(),
+            },
+        )?;
         for message in &child.messages {
-            self.store
-                .append(&child.meta.id, &Record::Message { message: message.clone() })?;
+            self.store.append(
+                &child.meta.id,
+                &Record::Message {
+                    message: message.clone(),
+                },
+            )?;
         }
         self.session = child;
         self.last_context_tokens = None; // 历史变短了，旧读数作废
@@ -347,12 +360,14 @@ impl AgentHarness {
 
         // 3. runtime 循环（新增消息直接追加进 session.messages）。
         //    事件经 tap 转发：统计工具输出的压缩台账（Context IR 摘要）
-        let (tap_tx, mut tap_rx) = tokio::sync::mpsc::unbounded_channel::<baiji_agent::AgentEvent>();
+        let (tap_tx, mut tap_rx) =
+            tokio::sync::mpsc::unbounded_channel::<baiji_agent::AgentEvent>();
         let events_out = events.clone();
         let store = self.store.clone();
         let session_id = self.session.meta.id.clone();
         let forward = tokio::spawn(async move {
             let (mut calls, mut original, mut delivered) = (0u32, 0u64, 0u64);
+            let (mut original_tokens, mut delivered_tokens) = (0u64, 0u64);
             // 已增量落盘的消息数；一旦写失败就停止，剩余的留给运行结束后补写（保持顺序）
             let mut persisted = 0usize;
             let mut persist_ok = true;
@@ -380,19 +395,31 @@ impl AgentHarness {
                 if let baiji_agent::AgentEvent::ToolFinished {
                     output,
                     original_bytes,
+                    original_tokens: orig_tokens,
                     ..
                 } = &event
                 {
                     calls += 1;
                     let delivered_bytes = output.len() as u64;
+                    let d_tokens = baiji_agent::estimate_text_tokens(output) as u64;
                     delivered += delivered_bytes;
                     original += original_bytes.unwrap_or(delivered_bytes);
+                    delivered_tokens += d_tokens;
+                    original_tokens += orig_tokens.unwrap_or(d_tokens);
                 }
                 if events_out.send(event).is_err() {
                     break;
                 }
             }
-            (calls, original, delivered, persisted, context_tokens)
+            (
+                calls,
+                original,
+                delivered,
+                persisted,
+                context_tokens,
+                original_tokens,
+                delivered_tokens,
+            )
         });
 
         let answer = self
@@ -406,8 +433,15 @@ impl AgentHarness {
             )
             .await;
         drop(tap_tx);
-        let (tool_calls, original_bytes, delivered_bytes, persisted, context_tokens) =
-            forward.await.unwrap_or((0, 0, 0, 0, None));
+        let (
+            tool_calls,
+            original_bytes,
+            delivered_bytes,
+            persisted,
+            context_tokens,
+            original_tokens,
+            delivered_tokens,
+        ) = forward.await.unwrap_or((0, 0, 0, 0, None, 0, 0));
         if context_tokens.is_some() {
             self.last_context_tokens = context_tokens;
         }
@@ -415,8 +449,12 @@ impl AgentHarness {
         // 4. 补写尚未增量落盘的新增消息（无论成败都保留进度）
         let unpersisted = (checkpoint + persisted).min(self.session.messages.len());
         for message in &self.session.messages[unpersisted..] {
-            self.store
-                .append(&self.session.meta.id, &Record::Message { message: message.clone() })?;
+            self.store.append(
+                &self.session.meta.id,
+                &Record::Message {
+                    message: message.clone(),
+                },
+            )?;
         }
         // 台账（有工具调用才记录）
         if tool_calls > 0 {
@@ -426,17 +464,29 @@ impl AgentHarness {
                     tool_calls,
                     original_bytes,
                     delivered_bytes,
+                    original_tokens,
+                    delivered_tokens,
                 },
             )?;
             info!(
-                "context ledger: {tool_calls} tool calls, {} -> {} bytes ({:.1}% saved)",
+                "context ledger: {tool_calls} tool calls, {} -> {} bytes ({:.1}% saved), \
+                 ~{} -> ~{} tokens ({:.1}% saved)",
                 original_bytes,
                 delivered_bytes,
                 if original_bytes > 0 {
-                    original_bytes.saturating_sub(delivered_bytes) as f64 / original_bytes as f64 * 100.0
+                    original_bytes.saturating_sub(delivered_bytes) as f64 / original_bytes as f64
+                        * 100.0
                 } else {
                     0.0
-                }
+                },
+                original_tokens,
+                delivered_tokens,
+                if original_tokens > 0 {
+                    original_tokens.saturating_sub(delivered_tokens) as f64 / original_tokens as f64
+                        * 100.0
+                } else {
+                    0.0
+                },
             );
         }
         run_span.end();
@@ -452,8 +502,8 @@ mod tests {
     use async_trait::async_trait;
     use baiji_agent::ToolRegistry;
     use baiji_ai::{ChatRequest, ChatResponse, Protocol, Provider, StreamChunk};
-    use futures::stream::BoxStream;
     use futures::StreamExt as _;
+    use futures::stream::BoxStream;
 
     /// 固定回答的 Mock Provider
     struct EchoProvider;
@@ -532,7 +582,12 @@ mod tests {
 
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             let answer = harness
-                .run("你好", &tx, &CancellationToken::new(), &SteeringQueue::new())
+                .run(
+                    "你好",
+                    &tx,
+                    &CancellationToken::new(),
+                    &SteeringQueue::new(),
+                )
                 .await
                 .expect("run");
             assert_eq!(answer, "收到：");
@@ -554,12 +609,18 @@ mod tests {
     #[tokio::test]
     async fn test_branch_inherits_history() {
         let dir = tempfile::tempdir().unwrap();
-        let runtime = Arc::new(AgentRuntime::new(Arc::new(EchoProvider)).with_tools(ToolRegistry::new()));
+        let runtime =
+            Arc::new(AgentRuntime::new(Arc::new(EchoProvider)).with_tools(ToolRegistry::new()));
         let mut harness = AgentHarness::new(runtime, dir.path().join("sessions")).unwrap();
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         harness
-            .run("first question", &tx, &CancellationToken::new(), &SteeringQueue::new())
+            .run(
+                "first question",
+                &tx,
+                &CancellationToken::new(),
+                &SteeringQueue::new(),
+            )
             .await
             .unwrap();
 
@@ -567,13 +628,21 @@ mod tests {
         let history_len = harness.session().messages.len();
 
         harness.branch().unwrap();
-        assert_eq!(harness.session().meta.parent_id.as_deref(), Some(parent_id.as_str()));
+        assert_eq!(
+            harness.session().meta.parent_id.as_deref(),
+            Some(parent_id.as_str())
+        );
         assert_eq!(harness.session().messages.len(), history_len);
 
         // 分叉后继续对话，互不影响（各自 JSONL 独立）
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         harness
-            .run("branched question", &tx, &CancellationToken::new(), &SteeringQueue::new())
+            .run(
+                "branched question",
+                &tx,
+                &CancellationToken::new(),
+                &SteeringQueue::new(),
+            )
             .await
             .unwrap();
         assert_eq!(harness.session().messages.len(), history_len + 2);
@@ -590,7 +659,12 @@ mod tests {
         for question in ["q1 about alpha", "q2", "q3"] {
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             harness
-                .run(question, &tx, &CancellationToken::new(), &SteeringQueue::new())
+                .run(
+                    question,
+                    &tx,
+                    &CancellationToken::new(),
+                    &SteeringQueue::new(),
+                )
                 .await
                 .unwrap();
         }
@@ -601,15 +675,25 @@ mod tests {
         let dropped = harness.branch_rewind(2).unwrap();
         assert_eq!(dropped.as_deref(), Some("q2"));
         assert_eq!(harness.session().messages.len(), 2);
-        assert_eq!(harness.session().meta.parent_id.as_deref(), Some(parent_id.as_str()));
-        assert!(harness.branch_rewind(5).is_err(), "cannot rewind past the start");
+        assert_eq!(
+            harness.session().meta.parent_id.as_deref(),
+            Some(parent_id.as_str())
+        );
+        assert!(
+            harness.branch_rewind(5).is_err(),
+            "cannot rewind past the start"
+        );
 
         // 原会话完好；两个会话的标题都已落盘，列表不再是"(无标题)"
         let store = JsonlStore::new(&sessions);
         assert_eq!(store.load(&parent_id).unwrap().messages.len(), 6);
         let metas = store.list().unwrap();
         assert_eq!(metas.len(), 2);
-        assert!(metas.iter().all(|m| m.title.as_deref() == Some("q1 about alpha")));
+        assert!(
+            metas
+                .iter()
+                .all(|m| m.title.as_deref() == Some("q1 about alpha"))
+        );
     }
 
     #[tokio::test]
@@ -654,7 +738,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(MemoryStore::open(dir.path().join("mem")));
         store
-            .add("proj", "构建前必须 cargo fmt", MemoryKind::Gotcha, None, "agent")
+            .add(
+                "proj",
+                "构建前必须 cargo fmt",
+                MemoryKind::Gotcha,
+                None,
+                "agent",
+            )
             .unwrap();
 
         let runtime = Arc::new(AgentRuntime::new(captured.clone()).with_tools(ToolRegistry::new()));
@@ -678,13 +768,19 @@ mod tests {
     async fn test_list_and_switch_sessions() {
         let dir = tempfile::tempdir().unwrap();
         let store_dir = dir.path().join("sessions");
-        let runtime = Arc::new(AgentRuntime::new(Arc::new(EchoProvider)).with_tools(ToolRegistry::new()));
+        let runtime =
+            Arc::new(AgentRuntime::new(Arc::new(EchoProvider)).with_tools(ToolRegistry::new()));
 
         // 会话 A：一轮对话
         let mut harness_a = AgentHarness::new(Arc::clone(&runtime), store_dir.clone()).unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         harness_a
-            .run("question in A", &tx, &CancellationToken::new(), &SteeringQueue::new())
+            .run(
+                "question in A",
+                &tx,
+                &CancellationToken::new(),
+                &SteeringQueue::new(),
+            )
             .await
             .unwrap();
         let id_a = harness_a.session().meta.id.clone();
@@ -694,7 +790,12 @@ mod tests {
         let mut harness_b = AgentHarness::new(Arc::clone(&runtime), store_dir.clone()).unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         harness_b
-            .run("question in B", &tx, &CancellationToken::new(), &SteeringQueue::new())
+            .run(
+                "question in B",
+                &tx,
+                &CancellationToken::new(),
+                &SteeringQueue::new(),
+            )
             .await
             .unwrap();
         let _id_b = harness_b.session().meta.id.clone();
@@ -733,7 +834,10 @@ mod tests {
         let summary = compact_with_llm(
             &provider,
             &mut messages,
-            &CompactionPolicy { max_estimated_tokens: 100, keep_recent_turns: 2 },
+            &CompactionPolicy {
+                max_estimated_tokens: 100,
+                keep_recent_turns: 2,
+            },
         )
         .await
         .expect("should compact");
@@ -759,7 +863,10 @@ mod tests {
         let summary = compact_with_llm(
             &provider,
             &mut messages,
-            &CompactionPolicy { max_estimated_tokens: 50, keep_recent_turns: 2 },
+            &CompactionPolicy {
+                max_estimated_tokens: 50,
+                keep_recent_turns: 2,
+            },
         )
         .await
         .expect("should still compact");
@@ -829,12 +936,11 @@ mod tests {
         fn parameters(&self) -> serde_json::Value {
             serde_json::json!({"type": "object"})
         }
-        async fn execute(
-            &self,
-            _args: serde_json::Value,
-        ) -> Result<baiji_agent::ToolOutput> {
-            // 模拟：原始 10KB 压缩到 100B
-            Ok(baiji_agent::ToolOutput::ok("x".repeat(100)).with_original_bytes(10_000))
+        async fn execute(&self, _args: serde_json::Value) -> Result<baiji_agent::ToolOutput> {
+            // 模拟：原始 10KB/~2600 token 压缩到 100B/~26 token
+            Ok(baiji_agent::ToolOutput::ok("x".repeat(100))
+                .with_original_bytes(10_000)
+                .with_original_tokens(2_600))
         }
     }
 
@@ -853,30 +959,40 @@ mod tests {
             let mut saved = 0u64;
             while let Some(event) = rx.recv().await {
                 if let baiji_agent::AgentEvent::ToolFinished {
-                    output, original_bytes, ..
+                    output,
+                    original_bytes,
+                    ..
                 } = event
                 {
-                    saved += original_bytes.unwrap_or(0).saturating_sub(output.len() as u64);
+                    saved += original_bytes
+                        .unwrap_or(0)
+                        .saturating_sub(output.len() as u64);
                 }
             }
             saved
         });
 
         harness
-            .run("run the tool", &tx, &CancellationToken::new(), &SteeringQueue::new())
+            .run(
+                "run the tool",
+                &tx,
+                &CancellationToken::new(),
+                &SteeringQueue::new(),
+            )
             .await
             .unwrap();
         drop(tx);
         // 转发出的事件保留了原始字节数（UI 可统计）
         assert_eq!(collector.await.unwrap(), 10_000 - 100);
 
-        // JSONL 末尾有台账记录
-        let file = store_dir
-            .join(format!("{}.jsonl", harness.session().meta.id));
+        // JSONL 末尾有台账记录（字节 + token 双口径）
+        let file = store_dir.join(format!("{}.jsonl", harness.session().meta.id));
         let content = std::fs::read_to_string(&file).unwrap();
         let last = content.lines().last().unwrap();
         assert!(last.contains("\"ledger\""), "last line: {last}");
         assert!(last.contains("\"tool_calls\":1"));
+        assert!(last.contains("\"original_tokens\":2600"));
+        assert!(last.contains("\"delivered_tokens\":26"));
 
         // 加载时台账不进入对话历史
         let runtime2 = Arc::new(AgentRuntime::new(Arc::new(EchoProvider)));

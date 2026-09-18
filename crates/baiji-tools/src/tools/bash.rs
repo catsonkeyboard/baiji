@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use baiji_agent::{AgentTool, ToolOutput};
+use baiji_agent::{AgentTool, ToolOutput, estimate_text_tokens};
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
@@ -280,6 +280,8 @@ impl AgentTool for BashTool {
         let (stdout, stdout_total) = finish_capture(out_buf, out_task, PIPE_DRAIN_GRACE).await;
         let (stderr, stderr_total) = finish_capture(err_buf, err_task, PIPE_DRAIN_GRACE).await;
         let raw_bytes = stdout_total + stderr_total;
+        // 反事实基准：不做任何压缩时会发送多少 token（对原始管道文本估算）
+        let raw_tokens = (estimate_text_tokens(&stdout) + estimate_text_tokens(&stderr)) as u64;
         let success = status.success();
 
         // 输出压缩，三级管道：
@@ -306,12 +308,15 @@ impl AgentTool for BashTool {
             combined.push_str(&format!("\n[stderr]\n{stderr}"));
         }
 
-        let (delivered, truncated_at) = self.env.truncate_with_meta(&combined);
-        // 台账口径：原始管道字节是"不压缩会发送多少"的反事实基准；
+        let (delivered, truncated_at, truncated_tokens) = self.env.truncate_with_meta(&combined);
+        // 台账口径：原始管道字节/token 是"不压缩会发送多少"的反事实基准；
         // 截断时的预截断长度取两者较大值
         let original = truncated_at.unwrap_or(0).max(raw_bytes as u64);
+        let original_tokens = truncated_tokens.unwrap_or(0).max(raw_tokens);
         let mut result = if (delivered.len() as u64) < original {
-            ToolOutput::ok(delivered).with_original_bytes(original)
+            ToolOutput::ok(delivered)
+                .with_original_bytes(original)
+                .with_original_tokens(original_tokens)
         } else {
             ToolOutput::ok(delivered)
         };

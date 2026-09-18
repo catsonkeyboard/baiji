@@ -16,6 +16,17 @@ pub struct ToolOutput {
     /// 压缩前的原始字节数（None = 未压缩）。
     /// 工具在截断/压缩输出时填写，用于上下文节省台账。
     pub original_bytes: Option<u64>,
+    /// 压缩前的原始 token 估算（启发式：ASCII ~4 字符/token，CJK ~2 字符/token）。
+    /// 与 `original_bytes` 同源同条件填写，供台账以 token 口径统计。
+    pub original_tokens: Option<u64>,
+}
+
+/// 文本 token 估算（启发式，与 harness compaction 同一口径）：
+/// ASCII ~0.25/字符，非 ASCII（CJK 等）~0.5/字符，+1 常数。
+pub fn estimate_text_tokens(s: &str) -> usize {
+    let ascii = s.chars().filter(|c| c.is_ascii()).count();
+    let non_ascii = s.chars().filter(|c| !c.is_ascii()).count();
+    ascii / 4 + non_ascii / 2 + 1
 }
 
 impl ToolOutput {
@@ -24,6 +35,7 @@ impl ToolOutput {
             content: content.into(),
             is_error: false,
             original_bytes: None,
+            original_tokens: None,
         }
     }
 
@@ -32,6 +44,7 @@ impl ToolOutput {
             content: content.into(),
             is_error: true,
             original_bytes: None,
+            original_tokens: None,
         }
     }
 
@@ -41,11 +54,24 @@ impl ToolOutput {
         self
     }
 
+    /// 标注压缩信息（原始 token 估算）
+    pub fn with_original_tokens(mut self, tokens: u64) -> Self {
+        self.original_tokens = Some(tokens);
+        self
+    }
+
     /// 本条结果节省的字节数（未压缩或原始更小时为 0）
     pub fn bytes_saved(&self) -> u64 {
         self.original_bytes
             .unwrap_or(self.content.len() as u64)
             .saturating_sub(self.content.len() as u64)
+    }
+
+    /// 本条结果节省的 token 估算（未压缩时为 0）
+    pub fn tokens_saved(&self) -> u64 {
+        self.original_tokens
+            .unwrap_or(estimate_text_tokens(&self.content) as u64)
+            .saturating_sub(estimate_text_tokens(&self.content) as u64)
     }
 }
 
@@ -163,6 +189,32 @@ mod tests {
         assert_eq!(out.content, "echo!");
         assert!(!out.is_error);
         assert_eq!(out.bytes_saved(), 0);
+    }
+
+    #[test]
+    fn test_estimate_text_tokens_mixed() {
+        // ASCII ~4 字符/token，非 ASCII ~2 字符/token，+1 常数
+        assert_eq!(estimate_text_tokens("abcd"), 2);
+        assert_eq!(estimate_text_tokens("你好"), 2);
+        assert_eq!(estimate_text_tokens("abcd你好"), 3);
+        assert_eq!(estimate_text_tokens(""), 1);
+    }
+
+    #[test]
+    fn test_tokens_saved_accounting() {
+        // ASCII 400 字符 ≈ 101 token；压缩后 40 字符 ≈ 11 token
+        let out = ToolOutput::ok("x".repeat(40)).with_original_tokens(101);
+        assert_eq!(out.original_tokens, Some(101));
+        assert_eq!(out.tokens_saved(), 90);
+
+        // 未标注 = 未压缩 → 0
+        let out = ToolOutput::ok("hello");
+        assert_eq!(out.original_tokens, None);
+        assert_eq!(out.tokens_saved(), 0);
+
+        // 原始更小（异常数据）不产生负数
+        let out = ToolOutput::ok("x".repeat(400)).with_original_tokens(5);
+        assert_eq!(out.tokens_saved(), 0);
     }
 
     #[test]

@@ -59,6 +59,11 @@ pub struct PolicyConfig {
     /// bash 默认超时（秒）
     #[serde(default = "default_bash_timeout")]
     pub bash_timeout_secs: u64,
+    /// 内容感知域压缩开关（JSON/表格/构建日志）。
+    /// 关闭即 A/B 对照臂：只保留通用 shell 规则与截断。
+    /// 环境变量 `BAIJI_COMPRESSION=off` 可免改配置临时关闭
+    #[serde(default = "default_compression_enabled")]
+    pub compression_enabled: bool,
 }
 
 fn default_max_output_bytes() -> usize {
@@ -69,6 +74,10 @@ fn default_bash_timeout() -> u64 {
     30
 }
 
+fn default_compression_enabled() -> bool {
+    true
+}
+
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
@@ -76,6 +85,7 @@ impl Default for PolicyConfig {
             require_confirmation_tools: Vec::new(),
             max_tool_output_bytes: default_max_output_bytes(),
             bash_timeout_secs: default_bash_timeout(),
+            compression_enabled: default_compression_enabled(),
         }
     }
 }
@@ -134,7 +144,8 @@ impl AppConfig {
                     .collect::<Vec<_>>()
                     .join(", ")
             );
-            return serde_json::from_str(&template).context("解析默认配置模板");
+            let config: AppConfig = serde_json::from_str(&template).context("解析默认配置模板")?;
+            return Ok(config.with_env_overrides());
         }
         Self::load_from(&path)
     }
@@ -143,8 +154,18 @@ impl AppConfig {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("读取配置 {}", path.display()))?;
         let expanded = expand_env_vars(&raw)?;
-        serde_json::from_str(&expanded)
-            .with_context(|| format!("解析配置失败，请检查 JSON 格式: {}", path.display()))
+        let config: AppConfig = serde_json::from_str(&expanded)
+            .with_context(|| format!("解析配置失败，请检查 JSON 格式: {}", path.display()))?;
+        Ok(config.with_env_overrides())
+    }
+
+    /// 环境变量覆盖（A/B 对照免改配置）：`BAIJI_COMPRESSION=off|0|false|no` 关闭域压缩
+    fn with_env_overrides(mut self) -> Self {
+        if let Ok(v) = std::env::var("BAIJI_COMPRESSION") {
+            let off = matches!(v.to_lowercase().as_str(), "off" | "0" | "false" | "no");
+            self.policy.compression_enabled = !off;
+        }
+        self
     }
 
     pub fn default_path() -> Result<PathBuf> {
@@ -169,7 +190,8 @@ impl AppConfig {
                 "allowed_paths": [],
                 "require_confirmation_tools": ["bash", "write", "edit"],
                 "max_tool_output_bytes": 32768,
-                "bash_timeout_secs": 30
+                "bash_timeout_secs": 30,
+                "compression_enabled": true
             },
             "ui": { "theme": "dark" }
         }))

@@ -51,7 +51,7 @@ impl AgentTool for LsTool {
                 return Ok(ToolOutput::err(format!(
                     "[Error] reading dir '{}': {e}",
                     dir.display()
-                )))
+                )));
             }
         };
 
@@ -75,13 +75,19 @@ impl AgentTool for LsTool {
         lines.extend(files);
 
         if lines.is_empty() {
-            return Ok(ToolOutput::ok(format!("(empty directory '{}')", dir.display())));
+            return Ok(ToolOutput::ok(format!(
+                "(empty directory '{}')",
+                dir.display()
+            )));
         }
         let joined = lines.join("\n");
-        let (delivered, original) = self.env.truncate_with_meta(&joined);
+        let (delivered, original, original_tokens) = self.env.truncate_with_meta(&joined);
         let mut out = ToolOutput::ok(delivered);
         if let Some(bytes) = original {
             out = out.with_original_bytes(bytes);
+        }
+        if let Some(tokens) = original_tokens {
+            out = out.with_original_tokens(tokens);
         }
         Ok(out)
     }

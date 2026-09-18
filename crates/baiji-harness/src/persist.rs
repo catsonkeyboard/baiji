@@ -20,10 +20,16 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "record", rename_all = "snake_case")]
 pub enum Record {
-    Started { meta: SessionMeta },
+    Started {
+        meta: SessionMeta,
+    },
     /// 会话标题（首条用户消息确定后追加；文件只追加，无法回填 Started）
-    Title { title: String },
-    Message { message: Message },
+    Title {
+        title: String,
+    },
+    Message {
+        message: Message,
+    },
     Summary {
         content: String,
         /// 压缩后保留的最近消息条数（都已写在本记录之前）。
@@ -31,11 +37,16 @@ pub enum Record {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kept_messages: Option<usize>,
     },
-    /// 一次运行结束时的上下文节省台账（Context IR 摘要）
+    /// 一次运行结束时的上下文节省台账（Context IR 摘要）。
+    /// token 字段带 serde default：旧记录缺失时按 0 解析（回放时本就被忽略）
     Ledger {
         tool_calls: u32,
         original_bytes: u64,
         delivered_bytes: u64,
+        #[serde(default)]
+        original_tokens: u64,
+        #[serde(default)]
+        delivered_tokens: u64,
     },
 }
 
@@ -234,11 +245,21 @@ mod tests {
         session.messages.push(Message::assistant("hi there"));
 
         store
-            .append(&session.meta.id, &Record::Started { meta: session.meta.clone() })
+            .append(
+                &session.meta.id,
+                &Record::Started {
+                    meta: session.meta.clone(),
+                },
+            )
             .unwrap();
         for message in &session.messages {
             store
-                .append(&session.meta.id, &Record::Message { message: message.clone() })
+                .append(
+                    &session.meta.id,
+                    &Record::Message {
+                        message: message.clone(),
+                    },
+                )
                 .unwrap();
         }
 
@@ -256,7 +277,12 @@ mod tests {
         let session = Session::new(None);
 
         store
-            .append(&session.meta.id, &Record::Started { meta: session.meta.clone() })
+            .append(
+                &session.meta.id,
+                &Record::Started {
+                    meta: session.meta.clone(),
+                },
+            )
             .unwrap();
         store
             .append(
@@ -279,7 +305,11 @@ mod tests {
         let loaded = store.load(&session.meta.id).unwrap();
         assert_eq!(loaded.messages.len(), 2);
         assert_eq!(loaded.messages[1].role, Role::System);
-        assert!(loaded.messages[1].content.contains("[Conversation Summary]"));
+        assert!(
+            loaded.messages[1]
+                .content
+                .contains("[Conversation Summary]")
+        );
     }
 
     #[test]
@@ -290,11 +320,21 @@ mod tests {
         let id = &session.meta.id;
 
         store
-            .append(id, &Record::Started { meta: session.meta.clone() })
+            .append(
+                id,
+                &Record::Started {
+                    meta: session.meta.clone(),
+                },
+            )
             .unwrap();
         for text in ["q1", "a1", "q2", "a2", "q3"] {
             store
-                .append(id, &Record::Message { message: Message::user(text) })
+                .append(
+                    id,
+                    &Record::Message {
+                        message: Message::user(text),
+                    },
+                )
                 .unwrap();
         }
         store
@@ -307,7 +347,12 @@ mod tests {
             )
             .unwrap();
         store
-            .append(id, &Record::Message { message: Message::assistant("a3") })
+            .append(
+                id,
+                &Record::Message {
+                    message: Message::assistant("a3"),
+                },
+            )
             .unwrap();
 
         let loaded = store.load(id).unwrap();
@@ -327,14 +372,25 @@ mod tests {
         let id = &session.meta.id;
 
         store
-            .append(id, &Record::Started { meta: session.meta.clone() })
+            .append(
+                id,
+                &Record::Started {
+                    meta: session.meta.clone(),
+                },
+            )
             .unwrap();
         store
-            .append(id, &Record::Message { message: Message::user("你好") })
+            .append(
+                id,
+                &Record::Message {
+                    message: Message::user("你好"),
+                },
+            )
             .unwrap();
 
         // 模拟崩溃：半行 JSON，且截断在多字节字符中间，无换行
-        let mut partial = br#"{"record":"message","message":{"role":"assistant","content":""#.to_vec();
+        let mut partial =
+            br#"{"record":"message","message":{"role":"assistant","content":""#.to_vec();
         partial.extend_from_slice(&"好".as_bytes()[..2]);
         let mut file = std::fs::OpenOptions::new()
             .append(true)
@@ -348,7 +404,12 @@ mod tests {
 
         // 之后的追加不会粘在坏行上
         store
-            .append(id, &Record::Message { message: Message::assistant("hi") })
+            .append(
+                id,
+                &Record::Message {
+                    message: Message::assistant("hi"),
+                },
+            )
             .unwrap();
         let loaded = store.load(id).unwrap();
         assert_eq!(loaded.messages.len(), 2);
@@ -362,31 +423,65 @@ mod tests {
 
         let titled = Session::new(None);
         store
-            .append(&titled.meta.id, &Record::Started { meta: titled.meta.clone() })
+            .append(
+                &titled.meta.id,
+                &Record::Started {
+                    meta: titled.meta.clone(),
+                },
+            )
             .unwrap();
         store
-            .append(&titled.meta.id, &Record::Message { message: Message::user("hello") })
+            .append(
+                &titled.meta.id,
+                &Record::Message {
+                    message: Message::user("hello"),
+                },
+            )
             .unwrap();
         store
-            .append(&titled.meta.id, &Record::Title { title: "Saved title".into() })
+            .append(
+                &titled.meta.id,
+                &Record::Title {
+                    title: "Saved title".into(),
+                },
+            )
             .unwrap();
 
         // 旧文件：没有 Title 记录
         let legacy = Session::new(None);
         store
-            .append(&legacy.meta.id, &Record::Started { meta: legacy.meta.clone() })
+            .append(
+                &legacy.meta.id,
+                &Record::Started {
+                    meta: legacy.meta.clone(),
+                },
+            )
             .unwrap();
         store
-            .append(&legacy.meta.id, &Record::Message { message: Message::user("旧会话的问题") })
+            .append(
+                &legacy.meta.id,
+                &Record::Message {
+                    message: Message::user("旧会话的问题"),
+                },
+            )
             .unwrap();
 
         let metas = store.list().unwrap();
         let title_of = |id: &str| {
-            metas.iter().find(|m| m.id == id).unwrap().title.clone().unwrap()
+            metas
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap()
+                .title
+                .clone()
+                .unwrap()
         };
         assert_eq!(title_of(&titled.meta.id), "Saved title");
         assert_eq!(title_of(&legacy.meta.id), "旧会话的问题");
-        assert_eq!(store.load(&titled.meta.id).unwrap().meta.title.as_deref(), Some("Saved title"));
+        assert_eq!(
+            store.load(&titled.meta.id).unwrap().meta.title.as_deref(),
+            Some("Saved title")
+        );
     }
 
     #[test]
@@ -397,7 +492,12 @@ mod tests {
         for _ in 0..3 {
             let session = Session::new(None);
             store
-                .append(&session.meta.id, &Record::Started { meta: session.meta.clone() })
+                .append(
+                    &session.meta.id,
+                    &Record::Started {
+                        meta: session.meta.clone(),
+                    },
+                )
                 .unwrap();
         }
         assert_eq!(store.list().unwrap().len(), 3);

@@ -60,7 +60,11 @@ pub fn estimate_tokens(messages: &[Message]) -> usize {
             let results = m
                 .tool_results
                 .as_ref()
-                .map(|rs| rs.iter().map(|r| estimate_string_tokens(&r.content)).sum::<usize>())
+                .map(|rs| {
+                    rs.iter()
+                        .map(|r| estimate_string_tokens(&r.content))
+                        .sum::<usize>()
+                })
                 .unwrap_or(0);
             content + tools + results + 4
         })
@@ -237,9 +241,8 @@ fn truncate_chars(s: &str, max: usize) -> String {
 }
 
 fn estimate_string_tokens(s: &str) -> usize {
-    let ascii = s.chars().filter(|c| c.is_ascii()).count();
-    let non_ascii = s.chars().filter(|c| !c.is_ascii()).count();
-    ascii / 4 + non_ascii / 2 + 1
+    // 与工具层台账共用同一估算器（baiji-agent 提供），保证口径一致
+    baiji_agent::estimate_text_tokens(s)
 }
 
 #[cfg(test)]
@@ -386,7 +389,10 @@ mod tests {
         assert!(second.contains("second question"), "{second}");
         assert!(!second.contains("user asked \"\""), "{second}");
         // 只保留一条摘要消息
-        let summaries = msgs.iter().filter(|m| previous_summary(m).is_some()).count();
+        let summaries = msgs
+            .iter()
+            .filter(|m| previous_summary(m).is_some())
+            .count();
         assert_eq!(summaries, 1);
     }
 }

@@ -134,6 +134,9 @@ async fn main() -> Result<()> {
     for extra in &app_config.policy.allowed_paths {
         env = env.with_allowed_root(extra);
     }
+    if !app_config.policy.compression_enabled {
+        env = env.without_compression();
+    }
 
     let mut tools = ToolRegistry::new();
     for tool in baiji_tools::builtin_tools(env) {

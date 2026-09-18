@@ -121,7 +121,7 @@ impl AgentTool for GrepTool {
             }
             return Ok(ToolOutput::ok(message));
         }
-        let (mut delivered, original) = self
+        let (mut delivered, original, original_tokens) = self
             .env
             .truncate_with_meta(&search_results::render(&matches));
         // 提示放在截断之后追加，保证一定可见
@@ -132,6 +132,9 @@ impl AgentTool for GrepTool {
         let mut out = ToolOutput::ok(delivered);
         if let Some(bytes) = original {
             out = out.with_original_bytes(bytes);
+        }
+        if let Some(tokens) = original_tokens {
+            out = out.with_original_tokens(tokens);
         }
         Ok(out)
     }

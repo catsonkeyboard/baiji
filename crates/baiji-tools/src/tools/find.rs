@@ -46,7 +46,9 @@ impl AgentTool for FindTool {
 
     async fn execute(&self, args: Value) -> Result<ToolOutput> {
         let Some(pattern) = args["pattern"].as_str() else {
-            return Ok(ToolOutput::err("[Error] missing required argument 'pattern'"));
+            return Ok(ToolOutput::err(
+                "[Error] missing required argument 'pattern'",
+            ));
         };
         let path = args["path"].as_str().unwrap_or(".");
         let kind = args["kind"].as_str();
@@ -61,11 +63,10 @@ impl AgentTool for FindTool {
         let search_root = root.clone();
         let kind = kind.map(str::to_string);
         // 阻塞式目录遍历放到 blocking 线程池
-        let (results, capped) = tokio::task::spawn_blocking(move || {
-            walk(&search_root, &needle, kind.as_deref(), &env)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("find task failed: {e}"))?;
+        let (results, capped) =
+            tokio::task::spawn_blocking(move || walk(&search_root, &needle, kind.as_deref(), &env))
+                .await
+                .map_err(|e| anyhow::anyhow!("find task failed: {e}"))?;
 
         if results.is_empty() {
             return Ok(ToolOutput::ok(format!(
@@ -74,7 +75,7 @@ impl AgentTool for FindTool {
             )));
         }
         let joined = results.join("\n");
-        let (mut delivered, original) = self.env.truncate_with_meta(&joined);
+        let (mut delivered, original, original_tokens) = self.env.truncate_with_meta(&joined);
         if capped {
             delivered.push_str(&format!(
                 "\n[Results capped at {MAX_RESULTS} — there are more. Use a more specific pattern or path.]"
@@ -83,6 +84,9 @@ impl AgentTool for FindTool {
         let mut out = ToolOutput::ok(delivered);
         if let Some(bytes) = original {
             out = out.with_original_bytes(bytes);
+        }
+        if let Some(tokens) = original_tokens {
+            out = out.with_original_tokens(tokens);
         }
         Ok(out)
     }
