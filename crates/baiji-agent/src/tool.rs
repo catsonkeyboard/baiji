@@ -131,6 +131,11 @@ impl ToolRegistry {
         self.tools.iter().map(|t| t.name()).collect()
     }
 
+    /// 全部已注册工具（装配子集用，如子代理的只读工具集）
+    pub fn tools(&self) -> &[Arc<dyn AgentTool>] {
+        &self.tools
+    }
+
     pub fn len(&self) -> usize {
         self.tools.len()
     }

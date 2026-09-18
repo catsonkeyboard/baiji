@@ -188,6 +188,19 @@ async fn main() -> Result<()> {
         Err(e) => warn!("MCP discovery failed: {e}"),
     }
 
+    // ---- 子代理 task 工具（T8）：只读工具子集 + 独立上下文 ----
+    // 中间输出不进主对话；Provider 在此快照（热切换不传播，重启生效）
+    let sub_tools: Vec<Arc<dyn baiji_agent::AgentTool>> = tools
+        .tools()
+        .iter()
+        .filter(|t| baiji_agent::SUBAGENT_ALLOWED_TOOLS.contains(&t.name()))
+        .cloned()
+        .collect();
+    tools.register(Arc::new(
+        baiji_agent::SubagentTool::new(provider.clone(), sub_tools).with_max_turns(12),
+    ));
+    info!("subagent task tool registered (read-only tools, max 12 turns)");
+
     // ---- 插件 ----
     let mut hooks = HookRegistry::new();
     let applied = baiji_extensions::PluginManager::new()

@@ -1,0 +1,469 @@
+//! 子代理 task 工具（T8）——探索型子任务的上下文隔离
+//!
+//! 子任务（"找出所有调用点并总结"）的中间输出会污染主上下文；
+//! `task` 工具 spawn 一个嵌套 [`AgentRuntime`]（独立对话、独立轮次预算、
+//! 默认只读工具集）干脏活，只回传最终答案——中间输出全部丢弃。
+//! 对主上下文的保护与 P3 的可逆 stub 是同一哲学的放大。
+//!
+//! - 递归深度上限 1：子工具集构造时剔除 `task` 自身
+//! - 取消传播：父 runtime 在 `select!` 中 await 工具 future，Esc 取消时
+//!   future 被 drop，子代理的内部流随之中止（无额外机制）
+//! - 子代理失败（超轮次/LLM 错误）以 `is_error` 工具结果返回，不炸父 run
+//! - v1 简化：子代理事件不向父流转发（上下文隔离的代价；遥测只有父侧
+//!   的 `agent.tool` span）；Provider 在构造时快照，热切换不传播
+
+use crate::AgentRuntime;
+use crate::event::AgentEvent;
+use crate::queue::SteeringQueue;
+use crate::tool::{AgentTool, ToolOutput, ToolRegistry};
+use baiji_ai::{Message, Provider};
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
+
+/// 子代理默认可用的工具（只读集；写入类工具由装配方显式追加）
+pub const SUBAGENT_ALLOWED_TOOLS: &[&str] =
+    &["read", "grep", "find", "ls", "search", "imports", "expand"];
+
+/// 子代理系统提示
+const SUB_SYSTEM_PROMPT: &str = "\
+You are a focused subagent executing a single research task inside a parent agent's session. \
+Complete the task with the tools available, then return a concise, self-contained result — \
+the parent ONLY sees your final answer, all intermediate output is discarded. \
+Locate with search/grep first, read only the ranges you need, and cite file:line in the result.";
+
+/// 子代理单次运行的轮次上限（防失控；父级可在构造时覆盖）
+const DEFAULT_MAX_TURNS: u32 = 12;
+/// 回传答案的字符上限——超长说明任务应拆小，截断并提示
+const MAX_ANSWER_CHARS: usize = 16 * 1024;
+
+/// `task` 工具：独立上下文跑子任务，回传最终答案
+pub struct SubagentTool {
+    provider: Arc<dyn Provider>,
+    tools: Vec<Arc<dyn AgentTool>>,
+    max_turns: u32,
+}
+
+impl SubagentTool {
+    pub fn new(provider: Arc<dyn Provider>, tools: Vec<Arc<dyn AgentTool>>) -> Self {
+        Self {
+            provider,
+            // 递归防护：深度上限 1——子工具集里绝不含 task 自身
+            tools: tools
+                .into_iter()
+                .filter(|t| t.name() != Self::name_static())
+                .collect(),
+            max_turns: DEFAULT_MAX_TURNS,
+        }
+    }
+
+    pub fn with_max_turns(mut self, max_turns: u32) -> Self {
+        self.max_turns = max_turns.max(1);
+        self
+    }
+
+    fn name_static() -> &'static str {
+        "task"
+    }
+
+    /// 子代理实际可用的工具名（测试/诊断用）
+    pub fn sub_tool_names(&self) -> Vec<&str> {
+        self.tools.iter().map(|t| t.name()).collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentTool for SubagentTool {
+    fn name(&self) -> &str {
+        Self::name_static()
+    }
+
+    fn description(&self) -> &str {
+        "Run a subagent with its OWN context on a research subtask (e.g. 'find all callers \
+         of X and summarize'). The subagent has read-only tools, its own turn budget, and \
+         returns only its final answer — intermediate output never enters this conversation. \
+         Use for broad exploration; do direct reads/greps for simple lookups. The prompt must \
+         be self-contained (the subagent sees nothing of this conversation)."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "Self-contained subtask description"},
+                "tools": {"type": "array", "items": {"type": "string"}, "description": "Extra tool names to allow beyond the read-only default (optional)"}
+            },
+            "required": ["prompt"]
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolOutput> {
+        let Some(prompt) = args["prompt"]
+            .as_str()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        else {
+            return Ok(ToolOutput::err(
+                "[Error] task requires a non-empty 'prompt'",
+            ));
+        };
+
+        // 子注册表：默认全集或调用点指定的子集（仍在只读白名单内）
+        let extra: Vec<String> = args["tools"]
+            .as_array()
+            .map(|list| {
+                list.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut registry = ToolRegistry::new();
+        for tool in &self.tools {
+            let allowed = extra.is_empty() || extra.iter().any(|name| name == tool.name());
+            if allowed {
+                registry.register(tool.clone());
+            }
+        }
+
+        // 嵌套 runtime：独立对话与预算；事件排空（不向父流转发）
+        let runtime = AgentRuntime::new(self.provider.clone())
+            .with_tools(registry)
+            .with_limits(self.max_turns, 8192);
+        let mut messages = vec![Message::user(prompt)];
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let result = runtime
+            .run(
+                SUB_SYSTEM_PROMPT,
+                &mut messages,
+                &tx,
+                &CancellationToken::new(),
+                &SteeringQueue::new(),
+            )
+            .await;
+        drop(tx);
+        let _ = drain.await;
+
+        match result {
+            Ok(answer) => {
+                // 答案超长：截断并标注（子代理产物即摘要；要完整细节应缩小任务）
+                let chars = answer.chars().count();
+                if chars <= MAX_ANSWER_CHARS {
+                    Ok(ToolOutput::ok(answer))
+                } else {
+                    let cut: String = answer.chars().take(MAX_ANSWER_CHARS).collect();
+                    let original_bytes = answer.len() as u64;
+                    Ok(ToolOutput::ok(format!(
+                        "{cut}\n\n[subagent answer truncated at {MAX_ANSWER_CHARS} of {chars} chars — \
+                         narrow the task prompt and re-run for full detail]"
+                    ))
+                    .with_original_bytes(original_bytes))
+                }
+            }
+            // 子代理失败不炸父 run：以错误工具结果回传，父模型可重试或换法
+            Err(e) => Ok(ToolOutput::err(format!("[Subagent failed] {e}"))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use baiji_ai::{ChatRequest, ChatResponse, Protocol, StreamChunk};
+    use futures::StreamExt as _;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// 每一轮都返回工具调用；计数见底后回答（脚本化）
+    struct ScriptProvider {
+        /// 每轮都发工具调用（永不回答）→ 触发子代理 max_turns
+        always_tool: bool,
+        /// 最终答案（默认短）
+        answer: &'static str,
+        calls: AtomicU32,
+    }
+
+    impl ScriptProvider {
+        fn answering(answer: &'static str) -> Self {
+            Self {
+                always_tool: false,
+                answer,
+                calls: AtomicU32::new(0),
+            }
+        }
+
+        fn never_answering() -> Self {
+            Self {
+                always_tool: true,
+                answer: "",
+                calls: AtomicU32::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ScriptProvider {
+        async fn chat(&self, _: ChatRequest) -> anyhow::Result<ChatResponse> {
+            unreachable!()
+        }
+        async fn chat_stream(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<futures::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let chunks: Vec<anyhow::Result<StreamChunk>> = if self.always_tool || n == 1 {
+                vec![
+                    Ok(StreamChunk::ToolCallStart {
+                        id: "t1".into(),
+                        name: "lookup".into(),
+                    }),
+                    Ok(StreamChunk::ToolCallArguments {
+                        id: "t1".into(),
+                        arguments: "{}".into(),
+                    }),
+                    Ok(StreamChunk::Done),
+                ]
+            } else {
+                vec![
+                    Ok(StreamChunk::Content(self.answer.to_string())),
+                    Ok(StreamChunk::Done),
+                ]
+            };
+            Ok(futures::stream::iter(chunks).boxed())
+        }
+        fn protocol(&self) -> Protocol {
+            Protocol::OpenAIChat
+        }
+        fn model(&self) -> &str {
+            "mock"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    /// 返回大块标记文本的"检索"工具（子代理中间输出的替身）
+    struct LookupTool;
+
+    #[async_trait::async_trait]
+    impl AgentTool for LookupTool {
+        fn name(&self) -> &str {
+            "lookup"
+        }
+        fn description(&self) -> &str {
+            "bulk lookup"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolOutput> {
+            Ok(ToolOutput::ok("BULK-INTERMEDIATE-OUTPUT ".repeat(500)))
+        }
+    }
+
+    fn task_tool(provider: Arc<ScriptProvider>) -> SubagentTool {
+        SubagentTool::new(provider, vec![Arc::new(LookupTool)])
+    }
+
+    #[tokio::test]
+    async fn test_task_returns_summary_not_intermediate_output() {
+        let provider = Arc::new(ScriptProvider::answering(
+            "SUMMARY: found 3 call sites (see file:line refs)",
+        ));
+        let tool = task_tool(provider);
+
+        let out = tool
+            .execute(serde_json::json!({"prompt": "find all callers of foo"}))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        // 父上下文只见最终答案
+        assert!(
+            out.content.contains("SUMMARY: found 3 call sites"),
+            "{}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("BULK-INTERMEDIATE-OUTPUT"),
+            "intermediate output must not leak to the parent context"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_subagent_failure_is_error_result_not_panic() {
+        // 每轮都调工具 → 触发子代理 max_turns(2)
+        let provider = Arc::new(ScriptProvider::never_answering());
+        let tool = SubagentTool::new(provider, vec![Arc::new(LookupTool)]).with_max_turns(2);
+
+        let out = tool
+            .execute(serde_json::json!({"prompt": "loop forever"}))
+            .await
+            .unwrap();
+        assert!(out.is_error, "{}", out.content);
+        assert!(out.content.contains("[Subagent failed]"), "{}", out.content);
+        assert!(out.content.contains("最大迭代"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn test_recursion_filtered_from_sub_tools() {
+        let provider = Arc::new(ScriptProvider::answering("inner"));
+        let nested = task_tool(Arc::new(ScriptProvider::answering("nested")));
+        let tool = SubagentTool::new(provider, vec![Arc::new(LookupTool), Arc::new(nested)]);
+        // 子工具集里没有 task（深度上限 1）
+        assert!(!tool.sub_tool_names().contains(&"task"));
+        assert!(tool.sub_tool_names().contains(&"lookup"));
+    }
+
+    #[tokio::test]
+    async fn test_long_answer_truncated_with_note() {
+        let long = "x".repeat(20 * 1024);
+        let provider = Arc::new(ScriptProvider::answering("a"));
+        // 直接构造长答案 provider
+        struct LongAnswer;
+        #[async_trait::async_trait]
+        impl Provider for LongAnswer {
+            async fn chat(&self, _: ChatRequest) -> anyhow::Result<ChatResponse> {
+                unreachable!()
+            }
+            async fn chat_stream(
+                &self,
+                _: ChatRequest,
+            ) -> anyhow::Result<futures::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+            {
+                Ok(futures::stream::iter(vec![
+                    Ok(StreamChunk::Content("y".repeat(20 * 1024))),
+                    Ok(StreamChunk::Done),
+                ])
+                .boxed())
+            }
+            fn protocol(&self) -> Protocol {
+                Protocol::OpenAIChat
+            }
+            fn model(&self) -> &str {
+                "mock"
+            }
+            fn provider_name(&self) -> &str {
+                "mock"
+            }
+        }
+        let _ = long;
+        let tool = SubagentTool::new(Arc::new(LongAnswer), vec![Arc::new(LookupTool)]);
+        let out = tool
+            .execute(serde_json::json!({"prompt": "p"}))
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(
+            out.content.contains("truncated at"),
+            "{}",
+            out.content.chars().rev().take(200).collect::<String>()
+        );
+        assert!(out.original_bytes.is_some());
+    }
+
+    /// 父侧 provider：第一轮调 task 工具，第二轮给最终答案
+    struct ParentProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for ParentProvider {
+        async fn chat(&self, _: ChatRequest) -> anyhow::Result<ChatResponse> {
+            unreachable!()
+        }
+        async fn chat_stream(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<futures::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            static CALLS: AtomicU32 = AtomicU32::new(0);
+            let n = CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+            let chunks: Vec<anyhow::Result<StreamChunk>> = if n == 1 {
+                vec![
+                    Ok(StreamChunk::ToolCallStart {
+                        id: "p1".into(),
+                        name: "task".into(),
+                    }),
+                    Ok(StreamChunk::ToolCallArguments {
+                        id: "p1".into(),
+                        arguments: r#"{"prompt":"find all callers of foo"}"#.into(),
+                    }),
+                    Ok(StreamChunk::Done),
+                ]
+            } else {
+                vec![
+                    Ok(StreamChunk::Content(
+                        "done based on subagent findings".into(),
+                    )),
+                    Ok(StreamChunk::Done),
+                ]
+            };
+            Ok(futures::stream::iter(chunks).boxed())
+        }
+        fn protocol(&self) -> Protocol {
+            Protocol::OpenAIChat
+        }
+        fn model(&self) -> &str {
+            "mock"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parent_context_isolation_end_to_end() {
+        let sub = Arc::new(ScriptProvider::answering(
+            "SUMMARY: 3 call sites (a.rs:12, b.rs:7, c.rs:99)",
+        ));
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(SubagentTool::new(sub, vec![Arc::new(LookupTool)])));
+
+        let runtime = AgentRuntime::new(Arc::new(ParentProvider)).with_tools(registry);
+        let mut history = Vec::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let answer = runtime
+            .run(
+                "sys",
+                &mut history,
+                &tx,
+                &CancellationToken::new(),
+                &SteeringQueue::new(),
+            )
+            .await
+            .unwrap();
+        assert!(answer.contains("done based on subagent findings"));
+
+        // 父历史:task 工具结果携带子代理摘要;子代理中间输出与其 lookup
+        // 调用一律不出现
+        let tool_results: String = history
+            .iter()
+            .filter_map(|m| m.tool_results.as_ref())
+            .flat_map(|rs| rs.iter().map(|r| r.content.clone()))
+            .collect();
+        assert!(
+            tool_results.contains("SUMMARY: 3 call sites"),
+            "{tool_results}"
+        );
+        assert!(
+            !tool_results.contains("BULK-INTERMEDIATE-OUTPUT"),
+            "subagent intermediate output leaked into the parent history"
+        );
+        let parent_calls: Vec<String> = history
+            .iter()
+            .filter_map(|m| m.tool_calls.as_ref())
+            .flat_map(|cs| cs.iter().map(|c| c.name.clone()))
+            .collect();
+        assert_eq!(
+            parent_calls,
+            vec!["task"],
+            "only the task call in parent history"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prompt_required() {
+        let provider = Arc::new(ScriptProvider::answering("a"));
+        let tool = SubagentTool::new(provider, vec![Arc::new(LookupTool)]);
+        let out = tool.execute(serde_json::json!({})).await.unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("requires a non-empty 'prompt'"));
+    }
+}
