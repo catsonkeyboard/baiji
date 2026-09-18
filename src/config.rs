@@ -64,6 +64,11 @@ pub struct PolicyConfig {
     /// 环境变量 `BAIJI_COMPRESSION=off` 可免改配置临时关闭
     #[serde(default = "default_compression_enabled")]
     pub compression_enabled: bool,
+    /// verbosity steer：每轮请求向最后一条 user 消息追加恒定"简洁作答"
+    /// 指令（请求级注入，不改历史；实测可省约三分之一输出 token）。
+    /// 环境变量 `BAIJI_VERBOSITY_STEER=on|off` 可免改配置切换
+    #[serde(default)]
+    pub verbosity_steer: bool,
 }
 
 fn default_max_output_bytes() -> usize {
@@ -86,6 +91,7 @@ impl Default for PolicyConfig {
             max_tool_output_bytes: default_max_output_bytes(),
             bash_timeout_secs: default_bash_timeout(),
             compression_enabled: default_compression_enabled(),
+            verbosity_steer: false,
         }
     }
 }
@@ -159,11 +165,16 @@ impl AppConfig {
         Ok(config.with_env_overrides())
     }
 
-    /// 环境变量覆盖（A/B 对照免改配置）：`BAIJI_COMPRESSION=off|0|false|no` 关闭域压缩
+    /// 环境变量覆盖（A/B 对照免改配置）：`BAIJI_COMPRESSION=off|0|false|no` 关闭域压缩；
+    /// `BAIJI_VERBOSITY_STEER=on|1|true|yes` 开启（其余值关闭）
     fn with_env_overrides(mut self) -> Self {
         if let Ok(v) = std::env::var("BAIJI_COMPRESSION") {
             let off = matches!(v.to_lowercase().as_str(), "off" | "0" | "false" | "no");
             self.policy.compression_enabled = !off;
+        }
+        if let Ok(v) = std::env::var("BAIJI_VERBOSITY_STEER") {
+            let on = matches!(v.to_lowercase().as_str(), "on" | "1" | "true" | "yes");
+            self.policy.verbosity_steer = on;
         }
         self
     }
@@ -191,7 +202,8 @@ impl AppConfig {
                 "require_confirmation_tools": ["bash", "write", "edit"],
                 "max_tool_output_bytes": 32768,
                 "bash_timeout_secs": 30,
-                "compression_enabled": true
+                "compression_enabled": true,
+                "verbosity_steer": false
             },
             "ui": { "theme": "dark" }
         }))

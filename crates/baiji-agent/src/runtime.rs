@@ -24,7 +24,7 @@ use baiji_ai::{
     ChatRequest, Message, Provider, ReasoningBlock, Role, StopReason, StreamChunk, TokenUsage,
     ToolCall, ToolResult,
 };
-use baiji_telemetry::{attrs, AttrValue, NoopTelemetry, Telemetry};
+use baiji_telemetry::{AttrValue, NoopTelemetry, Telemetry, attrs};
 use futures::StreamExt;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -49,6 +49,9 @@ pub struct AgentRuntime {
     context_budget: std::sync::atomic::AtomicUsize,
     /// 瞬时错误重试次数
     max_retries: u32,
+    /// verbosity steer：向请求内最后一条 user 消息追加恒定"简洁作答"指令
+    /// （请求级注入，不改会话历史；参考 lean-ctx，输出 token 实测可省约三分之一）
+    verbosity_steer: bool,
 }
 
 impl AgentRuntime {
@@ -63,6 +66,7 @@ impl AgentRuntime {
             max_tokens: 8192,
             context_budget: std::sync::atomic::AtomicUsize::new(0),
             max_retries: 2,
+            verbosity_steer: false,
         }
     }
 
@@ -92,6 +96,14 @@ impl AgentRuntime {
         self.max_tokens = max_tokens.max(1);
         self
     }
+
+    /// 启用 verbosity steer（配置 `policy.verbosity_steer`）。
+    /// 每轮请求向最后一条 user 消息追加恒定的简洁指令
+    pub fn with_verbosity_steer(mut self, enabled: bool) -> Self {
+        self.verbosity_steer = enabled;
+        self
+    }
+
 
     pub fn with_limits(mut self, max_turns: u32, max_tokens: u32) -> Self {
         self.max_turns = max_turns;
@@ -218,8 +230,13 @@ impl AgentRuntime {
                 attrs(&[("turn", AttrValue::Uint(turn as u64))]),
             );
 
-            // LLM 流式调用（带重试）
-            let request = ChatRequest::new(convo.clone())
+            // LLM 流式调用（带重试）。verbosity steer 只注入请求副本，
+            // 会话历史（convo / messages）不受影响，也不会被持久化
+            let mut request_messages = convo.clone();
+            if self.verbosity_steer {
+                steer_last_user(&mut request_messages);
+            }
+            let request = ChatRequest::new(request_messages)
                 .with_tools(self.tools.definitions())
                 .with_max_tokens(self.max_tokens);
             let response = match self.stream_with_retry(request, events, cancel).await? {
@@ -456,7 +473,10 @@ impl AgentRuntime {
         let duration_ms = started.elapsed().as_millis() as u64;
         tool_span.set_attribute("duration_ms", AttrValue::Uint(duration_ms));
         tool_span.set_attribute("is_error", AttrValue::Bool(output.is_error));
-        tool_span.set_attribute("bytes_delivered", AttrValue::Uint(output.content.len() as u64));
+        tool_span.set_attribute(
+            "bytes_delivered",
+            AttrValue::Uint(output.content.len() as u64),
+        );
         tool_span.set_attribute(
             "tokens_delivered",
             AttrValue::Uint(crate::estimate_text_tokens(&output.content) as u64),
@@ -602,7 +622,11 @@ impl AgentRuntime {
                     }
                 }
             };
-            tool_calls.push(ToolCall { id, name, arguments });
+            tool_calls.push(ToolCall {
+                id,
+                name,
+                arguments,
+            });
         };
 
         loop {
@@ -722,8 +746,7 @@ struct TurnResponse {
 const KEEP_RECENT_TOOL_MESSAGES: usize = 3;
 /// 小于此字节数的工具结果不值得精简
 const ELIDE_MIN_BYTES: usize = 1024;
-const ELIDED_NOTE: &str =
-    "[elided to save context — this older tool output was removed; re-run the tool if you need it again]";
+const ELIDED_NOTE: &str = "[elided to save context — this older tool output was removed; re-run the tool if you need it again]";
 
 /// 粗略 token 估算（厂商未上报 usage 时的兜底）：ASCII ≈ 4 字符/token，其它 ≈ 2
 fn rough_token_estimate(messages: &[Message]) -> usize {
@@ -759,7 +782,9 @@ fn elide_old_tool_results(convo: &mut [Message]) -> usize {
         .filter(|(_, m)| m.tool_results.is_some())
         .map(|(i, _)| i)
         .collect();
-    let cutoff = tool_positions.len().saturating_sub(KEEP_RECENT_TOOL_MESSAGES);
+    let cutoff = tool_positions
+        .len()
+        .saturating_sub(KEEP_RECENT_TOOL_MESSAGES);
     let mut freed = 0;
     for &position in &tool_positions[..cutoff] {
         for result in convo[position].tool_results.iter_mut().flatten() {
@@ -782,9 +807,24 @@ fn commit(convo: &mut Vec<Message>, events: &UnboundedSender<AgentEvent>, messag
     convo.push(message);
 }
 
+/// verbosity steer 的恒定指令文本。逐字节恒定：同一会话内每轮请求的追加
+/// 内容相同，此前的前缀在 provider 侧的自动前缀缓存中仍然命中。
+const STEER_SUFFIX: &str = "\n\n[System note: Be concise. Answer directly without restating the \
+question or adding pleasantries; skip filler and long summaries unless asked for detail. Keep \
+code, commands and facts complete.]";
+
+/// 向最后一条 user 消息追加 verbosity 指令（只作用于请求副本；无 user 消息不注入）
+fn steer_last_user(messages: &mut [Message]) {
+    for m in messages.iter_mut().rev() {
+        if m.role == Role::User {
+            m.content.push_str(STEER_SUFFIX);
+            return;
+        }
+    }
+}
+
 /// steering 打断后，未执行的工具调用的占位结果
-const SKIPPED_BY_STEERING: &str =
-    "[Skipped] 用户在运行中发来了新指令，此工具调用未执行";
+const SKIPPED_BY_STEERING: &str = "[Skipped] 用户在运行中发来了新指令，此工具调用未执行";
 
 /// 用户取消后，未执行/被中断的工具调用的结果
 const CANCELLED_BY_USER: &str = "[Cancelled] 用户取消了本次运行，此工具调用未完成";
@@ -828,6 +868,146 @@ mod tests {
     use crate::tool::{AgentTool, ToolOutput};
     use async_trait::async_trait;
     use baiji_ai::{ChatResponse, Protocol, StreamChunk};
+
+    // ===== verbosity steer =====
+
+    /// 记录每次请求消息的捕获型 Provider
+    struct CapturingProvider {
+        requests: std::sync::Mutex<Vec<Vec<Message>>>,
+    }
+
+    #[async_trait]
+    impl Provider for CapturingProvider {
+        async fn chat(&self, _: ChatRequest) -> Result<ChatResponse> {
+            unreachable!("runtime uses chat_stream")
+        }
+        async fn chat_stream(
+            &self,
+            request: ChatRequest,
+        ) -> Result<futures::stream::BoxStream<'static, Result<StreamChunk>>> {
+            self.requests.lock().unwrap().push(request.messages.clone());
+            Ok(futures::stream::iter(vec![
+                Ok(StreamChunk::Content("ok".into())),
+                Ok(StreamChunk::Done),
+            ])
+            .boxed())
+        }
+        fn protocol(&self) -> Protocol {
+            Protocol::OpenAIChat
+        }
+        fn model(&self) -> &str {
+            "mock"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[test]
+    fn test_steer_last_user_targets_last_user_only() {
+        let mut msgs = vec![
+            Message::user("q1"),
+            Message::assistant("a1"),
+            Message::user("q2"),
+            Message::assistant("a2"),
+        ];
+        steer_last_user(&mut msgs);
+        assert_eq!(msgs[0].content, "q1");
+        assert_eq!(msgs[2].content.strip_suffix(STEER_SUFFIX), Some("q2"));
+
+        // 无 user 消息：不注入
+        let mut none = vec![Message::system("s"), Message::assistant("a")];
+        steer_last_user(&mut none);
+        assert_eq!(none[0].content, "s");
+    }
+
+    #[tokio::test]
+    async fn test_verbosity_steer_injects_into_request_copy_only() {
+        let provider = Arc::new(CapturingProvider {
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let runtime = AgentRuntime::new(provider.clone()).with_verbosity_steer(true);
+        let mut history = vec![Message::user("原始问题")];
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        runtime
+            .run(
+                "sys",
+                &mut history,
+                &tx,
+                &CancellationToken::new(),
+                &SteeringQueue::new(),
+            )
+            .await
+            .unwrap();
+
+        // 请求副本：最后一条 user 消息带恒定后缀
+        {
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let last_user = requests[0]
+                .iter()
+                .rev()
+                .find(|m| m.role == Role::User)
+                .unwrap();
+            assert_eq!(
+                last_user.content.strip_suffix(STEER_SUFFIX),
+                Some("原始问题")
+            );
+        }
+        // 会话历史未被污染（注入不持久化、不进上下文）
+        assert_eq!(history[0].content, "原始问题");
+
+        // 第二轮：后缀落在新的最后一条 user 消息上，旧 user 消息保持干净
+        history.push(Message::user("第二个问题"));
+        runtime
+            .run(
+                "sys",
+                &mut history,
+                &tx,
+                &CancellationToken::new(),
+                &SteeringQueue::new(),
+            )
+            .await
+            .unwrap();
+        {
+            let requests = provider.requests.lock().unwrap();
+            let users: Vec<&Message> = requests[1]
+                .iter()
+                .filter(|m| m.role == Role::User)
+                .collect();
+            assert_eq!(users.len(), 2);
+            assert_eq!(users[0].content, "原始问题");
+            assert_eq!(
+                users[1].content.strip_suffix(STEER_SUFFIX),
+                Some("第二个问题")
+            );
+        }
+        assert_eq!(history[0].content, "原始问题");
+        assert_eq!(history[2].content, "第二个问题");
+    }
+
+    #[tokio::test]
+    async fn test_verbosity_steer_disabled_by_default() {
+        let provider = Arc::new(CapturingProvider {
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let runtime = AgentRuntime::new(provider.clone());
+        let mut history = vec![Message::user("q")];
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        runtime
+            .run(
+                "sys",
+                &mut history,
+                &tx,
+                &CancellationToken::new(),
+                &SteeringQueue::new(),
+            )
+            .await
+            .unwrap();
+        let requests = provider.requests.lock().unwrap();
+        assert!(!requests[0].iter().any(|m| m.content.contains(STEER_SUFFIX)));
+    }
     use baiji_telemetry::RecordingTelemetry;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1106,9 +1286,11 @@ mod tests {
         drive(&runtime, &mut messages).await;
 
         // 工具结果被替换为 Deny 文案，但循环继续并给出最终答案
-        assert!(messages[2].tool_results.as_ref().unwrap()[0]
-            .content
-            .contains("[Denied by hook]"));
+        assert!(
+            messages[2].tool_results.as_ref().unwrap()[0]
+                .content
+                .contains("[Denied by hook]")
+        );
         assert_eq!(messages[3].content, "ok");
     }
 
@@ -1177,7 +1359,13 @@ mod tests {
 
         let mut messages = vec![Message::user("hi")];
         runtime
-            .run("sys", &mut messages, &tx, &CancellationToken::new(), &steering)
+            .run(
+                "sys",
+                &mut messages,
+                &tx,
+                &CancellationToken::new(),
+                &steering,
+            )
             .await
             .unwrap();
         drop(tx);
@@ -1221,16 +1409,20 @@ mod tests {
         let steering = Arc::new(SteeringQueue::new());
         let mut tools = ToolRegistry::new();
         tools.register(Arc::new(SteeringTool(steering.clone())));
-        let runtime = AgentRuntime::new(Arc::new(MockProvider::new(
-            Script::ThreeToolsThenAnswer,
-        )))
-        .with_tools(tools);
+        let runtime = AgentRuntime::new(Arc::new(MockProvider::new(Script::ThreeToolsThenAnswer)))
+            .with_tools(tools);
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         let mut messages = vec![Message::user("hi")];
         runtime
-            .run("sys", &mut messages, &tx, &CancellationToken::new(), &steering)
+            .run(
+                "sys",
+                &mut messages,
+                &tx,
+                &CancellationToken::new(),
+                &steering,
+            )
             .await
             .unwrap();
 
@@ -1278,24 +1470,33 @@ mod tests {
 
         let mut tools = ToolRegistry::new();
         tools.register(Arc::new(CountingTool));
-        let runtime = AgentRuntime::new(Arc::new(MockProvider::new(
-            Script::TruncatedToolThenAnswer,
-        )))
-        .with_tools(tools);
+        let runtime =
+            AgentRuntime::new(Arc::new(MockProvider::new(Script::TruncatedToolThenAnswer)))
+                .with_tools(tools);
 
         let mut messages = vec![Message::user("hi")];
         let events = drive(&runtime, &mut messages).await;
 
-        assert_eq!(EXECUTED.load(Ordering::SeqCst), 0, "must not run with `{{}}`");
+        assert_eq!(
+            EXECUTED.load(Ordering::SeqCst),
+            0,
+            "must not run with `{{}}`"
+        );
         let result = &messages[2].tool_results.as_ref().unwrap()[0];
         assert_eq!(result.tool_call_id, "t1");
         assert!(result.content.contains("NOT executed"));
         assert!(result.content.contains("max_tokens"));
         // 历史中的参数仍是合法对象，UI 收到错误结果，运行继续到最终答案
-        assert!(messages[1].tool_calls.as_ref().unwrap()[0].arguments.is_object());
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::ToolFinished { is_error: true, .. })));
+        assert!(
+            messages[1].tool_calls.as_ref().unwrap()[0]
+                .arguments
+                .is_object()
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolFinished { is_error: true, .. }))
+        );
         assert_eq!(messages.last().unwrap().content, "done");
     }
 
@@ -1322,9 +1523,8 @@ mod tests {
 
         let mut tools = ToolRegistry::new();
         tools.register(Arc::new(SlowTool));
-        let runtime =
-            AgentRuntime::new(Arc::new(MockProvider::new(Script::ThreeToolsThenAnswer)))
-                .with_tools(tools);
+        let runtime = AgentRuntime::new(Arc::new(MockProvider::new(Script::ThreeToolsThenAnswer)))
+            .with_tools(tools);
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let cancel = CancellationToken::new();
@@ -1340,7 +1540,10 @@ mod tests {
             .run("sys", &mut messages, &tx, &cancel, &SteeringQueue::new())
             .await
             .unwrap();
-        assert!(started.elapsed() < Duration::from_secs(5), "tool was not interrupted");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "tool was not interrupted"
+        );
         assert_eq!(answer, "");
 
         // 三个调用都有结果：被中断的 + 两个未执行的
@@ -1415,19 +1618,19 @@ mod tests {
             args: r#"{"text":"x"}"#,
             answer: "ok",
         });
-        let gate = crate::ConfirmationGate::new(
-            vec!["append".to_string()],
-            Arc::new(StrictApprover),
-        );
+        let gate =
+            crate::ConfirmationGate::new(vec!["append".to_string()], Arc::new(StrictApprover));
         let runtime = runtime_with(provider).with_confirmation(gate);
 
         let mut messages = vec![Message::user("hi")];
         drive(&runtime, &mut messages).await;
 
         // 工具被用户拒绝，结果回传 Deny 文案，循环继续到最终答案
-        assert!(messages[2].tool_results.as_ref().unwrap()[0]
-            .content
-            .contains("[Denied by user]"));
+        assert!(
+            messages[2].tool_results.as_ref().unwrap()[0]
+                .content
+                .contains("[Denied by user]")
+        );
         assert_eq!(messages[3].content, "ok");
     }
 
@@ -1563,7 +1766,11 @@ mod tests {
             )
             .await;
         assert!(result.unwrap_err().to_string().contains("401"));
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 1, "401 must not be retried");
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            1,
+            "401 must not be retried"
+        );
     }
 
     #[test]

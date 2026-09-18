@@ -261,6 +261,10 @@ async fn main() -> Result<()> {
             approver,
         ));
     }
+    if app_config.policy.verbosity_steer {
+        info!("verbosity steer enabled (constant conciseness suffix on the last user turn)");
+        runtime_builder = runtime_builder.with_verbosity_steer(true);
+    }
     let runtime = Arc::new(runtime_builder);
 
     let mut harness = match &options.session {
