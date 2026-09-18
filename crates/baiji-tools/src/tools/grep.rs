@@ -8,6 +8,7 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::compressors::search_results;
 use crate::env::ExecutionEnv;
 
 /// 最多返回的匹配行数
@@ -41,8 +42,9 @@ impl AgentTool for GrepTool {
 
     fn description(&self) -> &str {
         "Search file contents with a regex, recursively from a path (default '.'). \
-         Returns 'path:line: text' matches. Respects .gitignore. Optional glob filter \
-         (e.g. '*.rs', '*.{ts,tsx}', 'src/**/*.rs')."
+         Returns 'path:line: text' matches (consecutive matches in the same file are \
+         grouped under a 'File: path' header when that is shorter). Respects .gitignore. \
+         Optional glob filter (e.g. '*.rs', '*.{ts,tsx}', 'src/**/*.rs')."
     }
 
     fn parameters(&self) -> Value {
@@ -59,7 +61,9 @@ impl AgentTool for GrepTool {
 
     async fn execute(&self, args: Value) -> Result<ToolOutput> {
         let Some(pattern) = args["pattern"].as_str() else {
-            return Ok(ToolOutput::err("[Error] missing required argument 'pattern'"));
+            return Ok(ToolOutput::err(
+                "[Error] missing required argument 'pattern'",
+            ));
         };
         let path = args["path"].as_str().unwrap_or(".");
         let glob = args["glob"].as_str().map(str::to_string);
@@ -69,7 +73,7 @@ impl AgentTool for GrepTool {
             Err(e) => {
                 return Ok(ToolOutput::err(format!(
                     "[Error] invalid regex '{pattern}': {e}"
-                )))
+                )));
             }
         };
 
@@ -117,12 +121,9 @@ impl AgentTool for GrepTool {
             }
             return Ok(ToolOutput::ok(message));
         }
-        let mut joined = matches.join("\n");
-        let (mut delivered, original) = {
-            let truncated = self.env.truncate_with_meta(&joined);
-            joined.clear();
-            truncated
-        };
+        let (mut delivered, original) = self
+            .env
+            .truncate_with_meta(&search_results::render(&matches));
         // 提示放在截断之后追加，保证一定可见
         for note in &notes {
             delivered.push('\n');
@@ -258,7 +259,10 @@ mod tests {
         let tool = GrepTool::new(Arc::new(ExecutionEnv::new(dir.path())));
 
         // .gitignore 生效（不要求是 git 仓库）
-        let out = tool.execute(serde_json::json!({"pattern": "needle"})).await.unwrap();
+        let out = tool
+            .execute(serde_json::json!({"pattern": "needle"}))
+            .await
+            .unwrap();
         assert!(!out.content.contains("generated"), "{}", out.content);
         assert!(out.content.contains("c.rs"));
 
@@ -286,6 +290,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_grep_groups_same_file_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = (1..=12)
+            .map(|i| format!("needle line {i}\n"))
+            .collect::<String>();
+        std::fs::write(dir.path().join("src.txt"), content).unwrap();
+        let tool = GrepTool::new(Arc::new(ExecutionEnv::new(dir.path())));
+
+        let out = tool
+            .execute(serde_json::json!({"pattern": "needle", "glob": "src.txt"}))
+            .await
+            .unwrap();
+        // ≥8 条同文件匹配：归组为 File: 头 + 行号行（路径只出现一次）
+        assert!(out.content.starts_with("File: "), "{}", out.content);
+        assert!(
+            out.content.contains("src.txt\n1: needle line 1"),
+            "{}",
+            out.content
+        );
+        assert!(out.content.contains("3: needle line 3"), "{}", out.content);
+        assert!(
+            out.content.contains("12: needle line 12"),
+            "{}",
+            out.content
+        );
+        assert!(!out.content.contains("src.txt:3:"), "{}", out.content);
+        assert_eq!(out.content.matches("src.txt").count(), 1);
+    }
+
+    #[tokio::test]
     async fn test_grep_reports_skipped_large_files() {
         let dir = tempfile::tempdir().unwrap();
         let mut env = ExecutionEnv::new(dir.path());
@@ -293,7 +327,10 @@ mod tests {
         std::fs::write(dir.path().join("big.txt"), "needle in a big file\n").unwrap();
         let tool = GrepTool::new(Arc::new(env));
 
-        let out = tool.execute(serde_json::json!({"pattern": "needle"})).await.unwrap();
+        let out = tool
+            .execute(serde_json::json!({"pattern": "needle"}))
+            .await
+            .unwrap();
         assert!(out.content.contains("No matches"));
         assert!(out.content.contains("NOT searched"), "{}", out.content);
     }

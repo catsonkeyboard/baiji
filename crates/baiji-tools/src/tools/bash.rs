@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
 
+use crate::compressors;
 use crate::env::ExecutionEnv;
 
 /// 单条命令允许的最大超时
@@ -141,11 +142,17 @@ fn is_noise_line(line: &str) -> bool {
         return false; // 空行保留（由折叠逻辑处理）
     }
     let is_braille = |c: char| ('\u{2800}'..='\u{28FF}').contains(&c);
-    let is_block = |c: char| matches!(c, '█' | '▓' | '▒' | '░' | '▏' | '▎' | '▍' | '▌' | '▋' | '▊' | '▉');
+    let is_block = |c: char| {
+        matches!(
+            c,
+            '█' | '▓' | '▒' | '░' | '▏' | '▎' | '▍' | '▌' | '▋' | '▊' | '▉'
+        )
+    };
 
     // 纯 spinner / 方块进度条（必须含 braille 或方块字符；`---`、`===`、`...` 不算）
     if t.chars().any(|c| is_braille(c) || is_block(c))
-        && t.chars().all(|c| is_braille(c) || is_block(c) || matches!(c, ' ' | '|' | '[' | ']'))
+        && t.chars()
+            .all(|c| is_braille(c) || is_block(c) || matches!(c, ' ' | '|' | '[' | ']'))
     {
         return true;
     }
@@ -162,7 +169,11 @@ fn is_noise_line(line: &str) -> bool {
     // ASCII 进度条行："[====>    ] 45%"、"[####  ] 12/26"
     if let (Some(open), Some(close)) = (t.find('['), t.find(']')) {
         let bar = t.get(open + 1..close).unwrap_or("");
-        if bar.len() >= 3 && bar.chars().all(|c| matches!(c, '=' | '>' | '#' | '-' | '.' | ' ')) {
+        if bar.len() >= 3
+            && bar
+                .chars()
+                .all(|c| matches!(c, '=' | '>' | '#' | '-' | '.' | ' '))
+        {
             return true;
         }
     }
@@ -171,7 +182,9 @@ fn is_noise_line(line: &str) -> bool {
     let is_progress_token = |tok: &str| {
         let digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit() || c == '.');
         tok.strip_suffix('%').is_some_and(digits)
-            || tok.split_once('/').is_some_and(|(a, b)| digits(a) && digits(b))
+            || tok
+                .split_once('/')
+                .is_some_and(|(a, b)| digits(a) && digits(b))
     };
     t.split_whitespace().all(is_progress_token)
 }
@@ -210,7 +223,9 @@ impl AgentTool for BashTool {
 
     async fn execute(&self, args: Value) -> Result<ToolOutput> {
         let Some(command) = args["command"].as_str() else {
-            return Ok(ToolOutput::err("[Error] missing required argument 'command'"));
+            return Ok(ToolOutput::err(
+                "[Error] missing required argument 'command'",
+            ));
         };
         let timeout_ms = args["timeout_ms"]
             .as_u64()
@@ -264,11 +279,24 @@ impl AgentTool for BashTool {
 
         let (stdout, stdout_total) = finish_capture(out_buf, out_task, PIPE_DRAIN_GRACE).await;
         let (stderr, stderr_total) = finish_capture(err_buf, err_task, PIPE_DRAIN_GRACE).await;
-        let original_bytes = stdout_total + stderr_total;
+        let raw_bytes = stdout_total + stderr_total;
+        let success = status.success();
 
-        // 输出压缩：噪声行过滤 + 连续重复行折叠
-        let stdout = compress_shell_output(&stdout);
-        let stderr = compress_shell_output(&stderr);
+        // 输出压缩，三级管道：
+        // 1) ANSI 剥离（无损）
+        // 2) 通用规则：噪声行过滤 + 连续重复行折叠
+        // 3) 内容感知域压缩：JSON / 表格 / 构建日志。
+        //    失败命令只做无损清理——诊断上下文宁可多给（有损必须可经 expand 取回）
+        let stdout = compressors::compress(
+            &compress_shell_output(&compressors::strip_ansi(&stdout)),
+            &self.env,
+            success,
+        );
+        let stderr = compressors::compress(
+            &compress_shell_output(&compressors::strip_ansi(&stderr)),
+            &self.env,
+            success,
+        );
 
         let mut combined = format!("exit: {}\n", status.code().unwrap_or(-1));
         if !stdout.is_empty() {
@@ -279,14 +307,15 @@ impl AgentTool for BashTool {
         }
 
         let (delivered, truncated_at) = self.env.truncate_with_meta(&combined);
-        // 规则折叠或截断任一生效都计入台账原始字节
-        let original = truncated_at.unwrap_or(original_bytes as u64);
+        // 台账口径：原始管道字节是"不压缩会发送多少"的反事实基准；
+        // 截断时的预截断长度取两者较大值
+        let original = truncated_at.unwrap_or(0).max(raw_bytes as u64);
         let mut result = if (delivered.len() as u64) < original {
             ToolOutput::ok(delivered).with_original_bytes(original)
         } else {
             ToolOutput::ok(delivered)
         };
-        result.is_error = !status.success();
+        result.is_error = !success;
         Ok(result)
     }
 }
@@ -352,7 +381,10 @@ mod tests {
             .unwrap();
         assert!(out.content.contains("[Timeout]"));
         tokio::time::sleep(Duration::from_millis(2500)).await;
-        assert!(!dir.path().join("survived").exists(), "grandchild survived timeout");
+        assert!(
+            !dir.path().join("survived").exists(),
+            "grandchild survived timeout"
+        );
     }
 
     #[tokio::test]
@@ -407,6 +439,112 @@ mod tests {
         assert!(out.bytes_saved() > 0);
     }
 
+    #[tokio::test]
+    async fn test_bash_json_domain_compression_with_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let env = Arc::new(ExecutionEnv::new(dir.path()).with_ctx_store(store.path()));
+        let tool = BashTool::new(env.clone());
+
+        // 紧凑 JSON + 60 元素数组：无损段无可省 → 有损段截数组 + spill
+        let items: Vec<serde_json::Value> = (0..60)
+            .map(|i| serde_json::json!({"id": i, "name": format!("record-number-{i}")}))
+            .collect();
+        let compact = serde_json::to_string(&serde_json::json!({"records": items})).unwrap();
+        std::fs::write(dir.path().join("data.json"), &compact).unwrap();
+
+        let out = tool
+            .execute(serde_json::json!({"command": "cat data.json"}))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("more item(s) elided"),
+            "{}",
+            out.content
+        );
+        assert!(out.content.contains("ctx:"), "must carry recovery handle");
+        assert!(out.content.contains("record-number-0\""));
+        assert!(out.content.contains("record-number-59\""));
+        assert!(!out.content.contains("record-number-45\""));
+        // 台账：域压缩计入原始字节
+        assert!(out.original_bytes.is_some());
+        assert!(out.bytes_saved() > 0);
+        // 原文可经 expand 底层路径完整取回
+        let handle = &out.content[out.content.find("ctx:").unwrap() + 4..][..16];
+        assert_eq!(env.retrieve(handle).unwrap(), compact);
+    }
+
+    #[tokio::test]
+    async fn test_bash_failed_command_skips_lossy_compression() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let tool = BashTool::new(Arc::new(
+            ExecutionEnv::new(dir.path()).with_ctx_store(store.path()),
+        ));
+
+        let items: Vec<serde_json::Value> = (0..60)
+            .map(|i| serde_json::json!({"id": i, "name": format!("record-number-{i}")}))
+            .collect();
+        let compact = serde_json::to_string(&serde_json::json!({"records": items})).unwrap();
+        std::fs::write(dir.path().join("data.json"), &compact).unwrap();
+
+        // exit=1：诊断上下文宁可多给——只做无损清理，不做有损截断
+        let out = tool
+            .execute(serde_json::json!({"command": "cat data.json; exit 1"}))
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(!out.content.contains("elided"), "{}", out.content);
+        assert!(!out.content.contains("ctx:"));
+        assert_eq!(out.content.matches("record-number-").count(), 60);
+    }
+
+    #[tokio::test]
+    async fn test_bash_build_log_domain_compression() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let tool = BashTool::new(Arc::new(
+            ExecutionEnv::new(dir.path()).with_ctx_store(store.path()),
+        ));
+
+        let out = tool
+            .execute(serde_json::json!({
+                "command": "for i in $(seq 0 59); do echo \"   Compiling crate-$i v0.1.0\"; done"
+            }))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        // 区间保前 2 后 2，中间计数；标记携带句柄
+        assert!(
+            out.content.contains("Compiling crate-0 v0.1.0"),
+            "{}",
+            out.content
+        );
+        assert!(out.content.contains("Compiling crate-59 v0.1.0"));
+        assert!(!out.content.contains("Compiling crate-30"));
+        assert!(out.content.contains("lines elided"));
+        assert!(out.content.contains("ctx:"));
+        assert!(out.original_bytes.is_some());
+        assert!(out.bytes_saved() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_bash_ansi_codes_stripped() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = BashTool::new(Arc::new(ExecutionEnv::new(dir.path())));
+
+        let out = tool
+            .execute(serde_json::json!({"command": "printf '\\033[32mok\\033[0m done\\n'"}))
+            .await
+            .unwrap();
+        assert!(out.content.contains("ok done"), "{}", out.content);
+        assert!(
+            !out.content.contains('\x1b'),
+            "ANSI escape must be stripped"
+        );
+    }
+
     #[test]
     fn test_compress_shell_output_rules() {
         // 连续重复折叠（3 行相同 → 1 行 + 总次数标记）
@@ -440,12 +578,24 @@ mod tests {
             assert_eq!(compress_shell_output(keep), keep, "must keep: {keep}");
         }
         // 纯进度行仍然删除
-        for noise in ["45% 12/26", "12/26", "[====>     ] 45%", "████░░░░", "[###   ] 3/9"] {
+        for noise in [
+            "45% 12/26",
+            "12/26",
+            "[====>     ] 45%",
+            "████░░░░",
+            "[###   ] 3/9",
+        ] {
             assert_eq!(compress_shell_output(noise), "", "must drop: {noise}");
         }
 
         // 有信息的行保留（git/npm 树、百分比以外的数字）
-        assert_eq!(compress_shell_output("12 files changed"), "12 files changed");
-        assert_eq!(compress_shell_output("├── left-pad@1.0.0"), "├── left-pad@1.0.0");
+        assert_eq!(
+            compress_shell_output("12 files changed"),
+            "12 files changed"
+        );
+        assert_eq!(
+            compress_shell_output("├── left-pad@1.0.0"),
+            "├── left-pad@1.0.0"
+        );
     }
 }
