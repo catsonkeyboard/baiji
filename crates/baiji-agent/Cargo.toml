@@ -19,3 +19,5 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# 仅测试用（spill 闭包的生产实现）：dev 依赖允许与 tools → agent 反向
+baiji-tools = { workspace = true }

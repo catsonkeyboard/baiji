@@ -56,7 +56,14 @@ pub struct AgentRuntime {
     /// verbosity steer：向请求内最后一条 user 消息追加恒定"简洁作答"指令
     /// （请求级注入，不改会话历史；参考 lean-ctx，输出 token 实测可省约三分之一）
     verbosity_steer: bool,
+    /// spill 能力（可选）：运行中就地精简旧工具结果时，原文写入 ctx store
+    /// 返回句柄（可逆）。闭包注入而非依赖 baiji-tools——agent 在依赖图上
+    /// 位于 tools 之下，直接依赖会成环
+    spill: Option<SpillFn>,
 }
+
+/// spill 闭包：内容 → ctx 句柄（main.rs 用 baiji_tools::spill_to_store 构造）
+type SpillFn = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
 impl AgentRuntime {
     pub fn new(provider: Arc<dyn Provider>) -> Self {
@@ -73,6 +80,7 @@ impl AgentRuntime {
             retry_base_delay: Duration::from_millis(500),
             retry_max_delay: Duration::from_millis(30_000),
             verbosity_steer: false,
+            spill: None,
         }
     }
 
@@ -107,6 +115,12 @@ impl AgentRuntime {
     /// 每轮请求向最后一条 user 消息追加恒定的简洁指令
     pub fn with_verbosity_steer(mut self, enabled: bool) -> Self {
         self.verbosity_steer = enabled;
+        self
+    }
+
+    /// 注入 spill 能力：运行中精简旧工具结果时原文可逆（ctx 句柄 + expand 取回）
+    pub fn with_spill(mut self, spill: SpillFn) -> Self {
+        self.spill = Some(spill);
         self
     }
 
@@ -374,7 +388,7 @@ impl AgentRuntime {
                             .unwrap_or(0)
                             .max(rough_token_estimate(convo));
                         if observed > budget {
-                            let freed = elide_old_tool_results(convo);
+                            let freed = elide_old_tool_results(convo, self.spill.as_ref());
                             if freed > 0 {
                                 warn!(
                                     "context ~{observed} tokens over budget {budget}: elided {freed} bytes of old tool results"
@@ -795,7 +809,8 @@ fn rough_token_estimate(messages: &[Message]) -> usize {
 
 /// 把较早的大块工具结果替换为占位说明，返回释放的字节数。
 /// 消息条数与 tool_call ↔ tool_result 的配对保持不变（API 要求严格配对）。
-fn elide_old_tool_results(convo: &mut [Message]) -> usize {
+/// spill 可用时占位携带 ctx 句柄（可逆，expand 取回）；否则回退不可逆占位。
+fn elide_old_tool_results(convo: &mut [Message], spill: Option<&SpillFn>) -> usize {
     let tool_positions: Vec<usize> = convo
         .iter()
         .enumerate()
@@ -809,8 +824,16 @@ fn elide_old_tool_results(convo: &mut [Message]) -> usize {
     for &position in &tool_positions[..cutoff] {
         for result in convo[position].tool_results.iter_mut().flatten() {
             if result.content.len() >= ELIDE_MIN_BYTES {
-                freed += result.content.len() - ELIDED_NOTE.len();
-                result.content = ELIDED_NOTE.to_string();
+                let bytes = result.content.len();
+                let replacement = match spill.and_then(|f| f(&result.content)) {
+                    Some(handle) => format!(
+                        "[ctx stub: {bytes} bytes of older tool output elided; \
+                         full content handle: ctx:{handle} — call the expand tool with this handle to retrieve it]"
+                    ),
+                    None => ELIDED_NOTE.to_string(),
+                };
+                freed += bytes.saturating_sub(replacement.len());
+                result.content = replacement;
             }
         }
     }
@@ -1860,7 +1883,7 @@ mod tests {
         convo.push(tool_msg("small", 10)); // 第 6 条工具消息，很小
 
         let before = convo.len();
-        let freed = elide_old_tool_results(&mut convo);
+        let freed = elide_old_tool_results(&mut convo, None);
         assert!(freed > 0);
         assert_eq!(convo.len(), before, "message count must not change");
 
@@ -1881,7 +1904,42 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["t0", "t1", "t2", "t3", "t4", "small"]);
         // 幂等
-        assert_eq!(elide_old_tool_results(&mut convo), 0);
+        assert_eq!(elide_old_tool_results(&mut convo, None), 0);
+    }
+
+    #[test]
+    fn test_elide_with_spill_is_reversible() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("ctx");
+        // 生产同款 spill 实现（main.rs 注入的就是它）
+        let spill: SpillFn =
+            Arc::new(move |content: &str| baiji_tools::spill_to_store(&store, content));
+        let original = "meaningful old tool output\n".repeat(80); // 2.2KB
+        let tool_msg = |id: &str, content: String| Message {
+            tool_results: Some(vec![ToolResult {
+                tool_call_id: id.to_string(),
+                content,
+            }]),
+            ..Message::tool("")
+        };
+        let mut convo = vec![Message::system("sys"), Message::user("go")];
+        convo.push(tool_msg("t0", original.clone()));
+        // 凑满 KEEP_RECENT_TOOL_MESSAGES(3) 窗口，让 t0 落入精简区
+        for id in ["t1", "t2", "t3"] {
+            convo.push(tool_msg(id, "recent".into()));
+        }
+
+        let freed = elide_old_tool_results(&mut convo, Some(&spill));
+        assert!(freed > 0);
+        let stub = &convo[2].tool_results.as_ref().unwrap()[0].content;
+        assert!(stub.starts_with("[ctx stub:"), "{stub}");
+        assert!(stub.contains("ctx:"), "must carry recovery handle");
+        // 原文可凭句柄逐字取回
+        let handle = &stub[stub.find("ctx:").unwrap() + 4..][..16];
+        let retrieved = std::fs::read_to_string(dir.path().join("ctx").join(handle)).unwrap();
+        assert_eq!(retrieved, original);
+        // 幂等：占位已小于阈值
+        assert_eq!(elide_old_tool_results(&mut convo, Some(&spill)), 0);
     }
 
     #[tokio::test]
