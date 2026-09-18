@@ -49,6 +49,10 @@ pub struct AgentRuntime {
     context_budget: std::sync::atomic::AtomicUsize,
     /// 瞬时错误重试次数
     max_retries: u32,
+    /// 指数退避基距（base × 2^attempt）
+    retry_base_delay: Duration,
+    /// 单次退避上限（服务端 Retry-After 同样受约束）
+    retry_max_delay: Duration,
     /// verbosity steer：向请求内最后一条 user 消息追加恒定"简洁作答"指令
     /// （请求级注入，不改会话历史；参考 lean-ctx，输出 token 实测可省约三分之一）
     verbosity_steer: bool,
@@ -66,6 +70,8 @@ impl AgentRuntime {
             max_tokens: 8192,
             context_budget: std::sync::atomic::AtomicUsize::new(0),
             max_retries: 2,
+            retry_base_delay: Duration::from_millis(500),
+            retry_max_delay: Duration::from_millis(30_000),
             verbosity_steer: false,
         }
     }
@@ -104,6 +110,13 @@ impl AgentRuntime {
         self
     }
 
+    /// 瞬时错误重试策略（配置 `retry` 段）：次数 + 指数退避基距 + 单次上限
+    pub fn with_retry(mut self, max_retries: u32, base_delay_ms: u64, max_delay_ms: u64) -> Self {
+        self.max_retries = max_retries;
+        self.retry_base_delay = Duration::from_millis(base_delay_ms.max(1));
+        self.retry_max_delay = Duration::from_millis(max_delay_ms.max(1));
+        self
+    }
 
     pub fn with_limits(mut self, max_turns: u32, max_tokens: u32) -> Self {
         self.max_turns = max_turns;
@@ -562,12 +575,12 @@ impl AgentRuntime {
                     if streamed_text {
                         events.send(AgentEvent::StreamRestarted).ok();
                     }
-                    // 服务端给了 Retry-After 就听它的（上限 30s），否则指数退避
-                    let delay = baiji_ai::retry_after(&e)
-                        .map(|d| d.min(Duration::from_secs(30)))
-                        .unwrap_or_else(|| {
-                            Duration::from_millis(500u64.saturating_mul(1 << attempt))
-                        });
+                    let delay = retry_delay(
+                        self.retry_base_delay,
+                        attempt,
+                        self.retry_max_delay,
+                        baiji_ai::retry_after(&e),
+                    );
                     warn!(
                         "LLM call failed (attempt {}/{}): {}; retrying in {:?}",
                         attempt + 1,
@@ -807,6 +820,18 @@ fn commit(convo: &mut Vec<Message>, events: &UnboundedSender<AgentEvent>, messag
     convo.push(message);
 }
 
+/// 重试退避延迟：优先服务端 Retry-After，否则 base×2^attempt；
+/// 一律不超过上限（服务端要求过长等待也截断，避免悬挂）
+fn retry_delay(
+    base: Duration,
+    attempt: u32,
+    cap: Duration,
+    server_retry_after: Option<Duration>,
+) -> Duration {
+    let raw = server_retry_after.unwrap_or_else(|| base.saturating_mul(1u32 << attempt.min(16)));
+    raw.min(cap)
+}
+
 /// verbosity steer 的恒定指令文本。逐字节恒定：同一会话内每轮请求的追加
 /// 内容相同，此前的前缀在 provider 侧的自动前缀缓存中仍然命中。
 const STEER_SUFFIX: &str = "\n\n[System note: Be concise. Answer directly without restating the \
@@ -901,6 +926,37 @@ mod tests {
         fn provider_name(&self) -> &str {
             "mock"
         }
+    }
+
+    #[test]
+    fn test_retry_delay_exponential_with_cap() {
+        let base = Duration::from_millis(500);
+        let cap = Duration::from_millis(30_000);
+        // 指数退避：500ms → 1s → 2s → 4s
+        assert_eq!(retry_delay(base, 0, cap, None), Duration::from_millis(500));
+        assert_eq!(
+            retry_delay(base, 1, cap, None),
+            Duration::from_millis(1_000)
+        );
+        assert_eq!(
+            retry_delay(base, 2, cap, None),
+            Duration::from_millis(2_000)
+        );
+        assert_eq!(
+            retry_delay(base, 3, cap, None),
+            Duration::from_millis(4_000)
+        );
+        // 封顶：2^6×500 = 32s > 30s cap
+        assert_eq!(retry_delay(base, 6, cap, None), cap);
+        // 服务端 Retry-After 优先，但同样受上限约束
+        assert_eq!(
+            retry_delay(base, 0, cap, Some(Duration::from_secs(2))),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            retry_delay(base, 0, cap, Some(Duration::from_secs(120))),
+            cap
+        );
     }
 
     #[test]

@@ -33,10 +33,18 @@ pub async fn run(
     confirm_rx: Option<UnboundedReceiver<ConfirmDialog>>,
     config_path: std::path::PathBuf,
     settings: RuntimeSettings,
+    settings_summary: String,
 ) -> Result<()> {
-    app::App::new(harness, theme, confirm_rx, config_path, settings)
-        .run()
-        .await
+    app::App::new(
+        harness,
+        theme,
+        confirm_rx,
+        config_path,
+        settings,
+        settings_summary,
+    )
+    .run()
+    .await
 }
 
 #[cfg(test)]
