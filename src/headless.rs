@@ -152,30 +152,60 @@ pub async fn run_auto(
 }
 
 /// 打印会话列表（--sessions）。直接读存储，不创建新会话。
+/// 按项目分组：当前目录所属项目在最前，其余按最近活动排序，旧会话最后。
 pub fn print_sessions(sessions_dir: &std::path::Path) -> Result<()> {
     let sessions = baiji_harness::JsonlStore::new(sessions_dir).list()?;
     if sessions.is_empty() {
         println!("（暂无会话，位于 ~/.baiji/sessions/）");
         return Ok(());
     }
-    // 树形：根会话最新在前，分叉出的子会话缩进显示在其父之下
-    let tree = baiji_harness::SessionTree::from_metas(sessions);
-    println!("{:<28} {:<20} TITLE", "SESSION", "CREATED");
-    for (depth, meta) in tree.flattened() {
-        let branch = if depth > 0 {
-            format!("{}└ ", "  ".repeat(depth - 1))
-        } else {
-            String::new()
-        };
-        println!(
-            "{:<28} {:<20} {}{}",
-            meta.id,
-            &meta.created_at[..meta.created_at.len().min(19)],
-            branch,
-            meta.title.as_deref().unwrap_or("(无标题)"),
-        );
-    }
+    let current_key = std::env::current_dir()
+        .ok()
+        .map(|dir| baiji_harness::project_key(&dir));
+    print!(
+        "{}",
+        format_session_groups(sessions, current_key.as_deref())
+    );
     Ok(())
+}
+
+/// 分组渲染（纯函数，测试用）：每组一段 = 头部 + 树形表
+pub fn format_session_groups(
+    sessions: Vec<baiji_harness::SessionMeta>,
+    current_project: Option<&str>,
+) -> String {
+    let mut groups = baiji_harness::group_by_project(sessions);
+    // 当前项目组提到最前（若存在）
+    if let Some(current) = current_project {
+        groups.sort_by_key(|(key, _)| *key != Some(current.to_string()));
+    }
+
+    let mut out = String::new();
+    for (key, metas) in &groups {
+        let header = match key {
+            Some(key) if Some(key.as_str()) == current_project => format!("⌂ {key}（当前项目）"),
+            Some(key) => format!("⌂ {key}"),
+            None => "⌂ （未记录项目——旧版会话）".to_string(),
+        };
+        out.push_str(&format!("{header}\n"));
+        let tree = baiji_harness::SessionTree::from_metas(metas.clone());
+        for (depth, meta) in tree.flattened() {
+            let branch = if depth > 0 {
+                format!("{}└ ", "  ".repeat(depth - 1))
+            } else {
+                String::new()
+            };
+            out.push_str(&format!(
+                "  {:<28} {:<20} {}{}\n",
+                meta.id,
+                &meta.created_at[..meta.created_at.len().min(19)],
+                branch,
+                meta.title.as_deref().unwrap_or("(无标题)"),
+            ));
+        }
+        out.push('\n');
+    }
+    out
 }
 
 #[cfg(test)]
@@ -447,6 +477,30 @@ mod tests {
             .filter(|m| m.content == baiji_harness::AUTO_CONTINUE_PROMPT)
             .count();
         assert_eq!(relay_count, 1, "only one relay before the cap");
+    }
+
+    #[test]
+    fn test_format_session_groups() {
+        let mk = |id: &str, project: Option<&str>, created: &str| baiji_harness::SessionMeta {
+            id: id.into(),
+            parent_id: None,
+            created_at: created.into(),
+            title: Some(format!("t-{id}")),
+            project: project.map(str::to_string),
+        };
+        let sessions = vec![
+            mk("old", None, "2026-01-01T10:00:00+00:00"),
+            mk("b1", Some("beta-2222"), "2026-04-01T10:00:00+00:00"),
+            mk("a1", Some("alpha-1111"), "2026-02-01T10:00:00+00:00"),
+        ];
+        let out = format_session_groups(sessions, Some("alpha-1111"));
+        // 当前项目组在最前，附标注；旧会话组殿后
+        let alpha_pos = out.find("alpha-1111（当前项目）").unwrap();
+        let beta_pos = out.find("beta-2222").unwrap();
+        let legacy_pos = out.find("未记录项目").unwrap();
+        assert!(alpha_pos < beta_pos && beta_pos < legacy_pos, "{out}");
+        assert!(out.contains("a1"), "{out}");
+        assert!(out.contains("t-old"), "{out}");
     }
 
     #[test]
