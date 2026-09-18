@@ -5,6 +5,7 @@
 //! 路径白名单与输出限制约束。输出超限截断时完整内容 spill 到
 //! 内容寻址存储（CCR），LLM 可用 `expand` 凭句柄取回。
 
+pub mod compressors;
 pub mod env;
 pub mod index;
 pub mod signatures;
