@@ -5,10 +5,10 @@
 //! - 输出截断（防止工具结果撑爆上下文）
 //! - 文件大小 / 搜索深度 / 命令超时限制
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use sha2::{Digest, Sha256};
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// 执行环境
 #[derive(Debug, Clone)]
@@ -28,10 +28,22 @@ pub struct ExecutionEnv {
     /// 内容寻址存储目录（CCR）：截断的完整输出 spill 至此，
     /// `expand` 工具凭句柄取回。None = 截断即丢弃（旧行为）。
     ctx_store: Option<PathBuf>,
+    /// spill 文件保留时长；初始化存储时清理过期句柄（防无限增长）
+    ctx_store_ttl: Duration,
     /// 预算降级：read 输出将超限时自动按信息熵 density 选行，
     /// 而不是硬截断（true 默认；false 恢复纯截断行为）
     pub density_fallback: bool,
+    /// 内容感知域压缩（JSON/表格/构建日志）开关。
+    /// 关闭即 A/B 对照臂：只保留通用 shell 规则与截断。
+    pub compression_enabled: bool,
 }
+
+/// 句柄文件默认保留 7 天：覆盖"隔天 resume 会话后 expand 旧句柄"的场景，
+/// 同时保证 ctx-store 不会只增不减。
+pub const DEFAULT_CTX_STORE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// 每进程只自动清理一次（TUI 单进程长跑；重复调用无意义且有 IO 成本）
+static CTX_STORE_PRUNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 impl ExecutionEnv {
     pub fn new(workdir: impl AsRef<Path>) -> Self {
@@ -43,7 +55,9 @@ impl ExecutionEnv {
             max_search_depth: 10,
             command_timeout: Duration::from_secs(30),
             ctx_store: None,
+            ctx_store_ttl: DEFAULT_CTX_STORE_TTL,
             density_fallback: true,
+            compression_enabled: true,
         }
     }
 
@@ -53,11 +67,26 @@ impl ExecutionEnv {
         self
     }
 
-    /// 启用内容寻址存储（截断可逆）。目录自动创建。
+    /// 关闭内容感知域压缩（A/B 对照用；通用 shell 规则与截断不受影响）
+    pub fn without_compression(mut self) -> Self {
+        self.compression_enabled = false;
+        self
+    }
+
+    /// 启用内容寻址存储（截断可逆）。目录自动创建，并做一次过期清理。
     pub fn with_ctx_store(mut self, dir: impl AsRef<Path>) -> Self {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir).ok();
-        self.ctx_store = Some(dir);
+        self.ctx_store = Some(dir.clone());
+        if !CTX_STORE_PRUNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            prune_ctx_store(&dir, self.ctx_store_ttl);
+        }
+        self
+    }
+
+    /// 自定义句柄保留时长（测试用短 TTL 验证清理）
+    pub fn with_ctx_store_ttl(mut self, ttl: Duration) -> Self {
+        self.ctx_store_ttl = ttl;
         self
     }
 
@@ -71,7 +100,11 @@ impl ExecutionEnv {
     pub fn spill(&self, content: &str) -> Option<String> {
         let store = self.ctx_store.as_ref()?;
         let digest = Sha256::digest(content.as_bytes());
-        let handle = digest.iter().take(8).map(|b| format!("{b:02x}")).collect::<String>();
+        let handle = digest
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         let file = store.join(&handle);
         // 已存在则跳过写入（去重）
         if !file.exists() {
@@ -87,7 +120,9 @@ impl ExecutionEnv {
             .as_deref()
             .ok_or_else(|| anyhow!("ctx store not configured"))?;
         if !is_valid_handle(handle) {
-            return Err(anyhow!("invalid handle '{handle}' (expected 16-char hex like ctx:0123abcd…)"));
+            return Err(anyhow!(
+                "invalid handle '{handle}' (expected 16-char hex like ctx:0123abcd…)"
+            ));
         }
         let file = store.join(handle);
         std::fs::read_to_string(&file)
@@ -128,8 +163,7 @@ impl ExecutionEnv {
         let normalized = lexical_normalize(&joined);
 
         let allowed = self.allowed_roots.iter().any(|root| {
-            normalized.starts_with(root)
-                && (normalized == *root || is_child_of(&normalized, root))
+            normalized.starts_with(root) && (normalized == *root || is_child_of(&normalized, root))
         });
         if !allowed {
             return Err(anyhow!(
@@ -178,24 +212,21 @@ impl ExecutionEnv {
                 "\n[truncated at {} bytes; full content handle: ctx:{handle} — call the expand tool with this handle to retrieve it]",
                 output.len()
             ),
-            None => format!(
-                "\n[truncated at {} bytes of {}]",
-                cut,
-                output.len()
-            ),
+            None => format!("\n[truncated at {} bytes of {}]", cut, output.len()),
         };
         format!("{}{}", &output[..cut], marker)
     }
 
-    /// 截断并返回压缩元信息：(交付文本, 原始字节数)。
-    /// 发生截断时返回 Some(原始字节)，供台账统计。
-    pub fn truncate_with_meta(&self, output: &str) -> (String, Option<u64>) {
+    /// 截断并返回压缩元信息：(交付文本, 原始字节数, 原始 token 估算)。
+    /// 发生截断时返回 Some，供台账按字节与 token 双口径统计。
+    pub fn truncate_with_meta(&self, output: &str) -> (String, Option<u64>, Option<u64>) {
         if output.len() <= self.max_output_bytes {
-            return (output.to_string(), None);
+            return (output.to_string(), None, None);
         }
         (
             self.truncate_output(output),
             Some(output.len() as u64),
+            Some(baiji_agent::estimate_text_tokens(output) as u64),
         )
     }
 }
@@ -239,6 +270,34 @@ fn is_valid_handle(handle: &str) -> bool {
             .bytes()
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
+
+/// 清理过期的句柄文件：只删名字形如 16 位十六进制、mtime 超过 ttl 的文件；
+/// 非句柄文件一律不动。尽力而为（IO 错误忽略），返回删除数量。
+pub fn prune_ctx_store(dir: &Path, ttl: Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !is_valid_handle(&name) {
+            continue;
+        }
+        let expired = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
+            .is_some_and(|age| age > ttl);
+        if expired && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 
 /// 词法归一化：消除 `.` 与 `..`，不触碰文件系统
 /// （`..` 越过根时按根截断，行为等价于 canonicalize 的路径部分）
@@ -361,7 +420,8 @@ mod tests {
 
         // 指向白名单外的目录链接 / 文件链接 / 悬空链接
         std::os::unix::fs::symlink(outside.path(), dir.path().join("out")).unwrap();
-        std::os::unix::fs::symlink(outside.path().join("secret.txt"), dir.path().join("f")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.txt"), dir.path().join("f"))
+            .unwrap();
         std::os::unix::fs::symlink(outside.path().join("new.txt"), dir.path().join("dangling"))
             .unwrap();
         assert!(env.resolve_path("out/secret.txt").is_err());
@@ -384,7 +444,10 @@ mod tests {
         let other = tempfile::tempdir().unwrap();
         let env = ExecutionEnv::new(dir.path()).with_allowed_root(other.path());
 
-        assert!(env.resolve_path(other.path().join("a.txt").to_str().unwrap()).is_ok());
+        assert!(
+            env.resolve_path(other.path().join("a.txt").to_str().unwrap())
+                .is_ok()
+        );
         assert!(env.resolve_path("/etc/hosts").is_err());
     }
 
@@ -419,18 +482,22 @@ mod tests {
         assert_eq!(env.retrieve(&handle).unwrap(), content);
 
         // 截断标记携带句柄
-        let small = ExecutionEnv::new(".").with_ctx_store(dir.path()).with_max_output_bytes(10);
+        let small = ExecutionEnv::new(".")
+            .with_ctx_store(dir.path())
+            .with_max_output_bytes(10);
         let truncated = small.truncate_output(&content);
         assert!(truncated.contains(&format!("ctx:{handle}")));
 
-        // 截断 + 元信息
-        let (delivered, original) = small.truncate_with_meta(&content);
+        // 截断 + 元信息（字节与 token 双口径）
+        let (delivered, original, original_tokens) = small.truncate_with_meta(&content);
         assert!(delivered.contains("ctx:"));
         assert_eq!(original, Some(content.len() as u64));
+        assert!(original_tokens.unwrap() > 0);
         // 未超限时无元信息
-        let (delivered, original) = small.truncate_with_meta("tiny");
+        let (delivered, original, original_tokens) = small.truncate_with_meta("tiny");
         assert_eq!(delivered, "tiny");
         assert_eq!(original, None);
+        assert_eq!(original_tokens, None);
     }
 
     #[test]
@@ -455,6 +522,32 @@ mod tests {
         assert!(env.retrieve("GGGGGGGGGGGGGGGG").is_err()); // 非十六进制
         assert!(env.retrieve("0123456789ABCDEF").is_err()); // 大写
         assert!(env.retrieve("0123456789abcdef").is_err()); // 合法但不存在
+    }
+
+    #[test]
+    fn test_prune_ctx_store_removes_expired_handles_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("0123456789abcdef"), "old").unwrap();
+        std::fs::write(store.join("fedcba9876543210"), "fresh").unwrap();
+        std::fs::write(store.join("not-a-handle.txt"), "keep").unwrap();
+
+        // TTL 5ms：等 10ms 后两个句柄都过期 → 删除；非句柄文件不动
+        std::thread::sleep(Duration::from_millis(10));
+        let removed = prune_ctx_store(&store, Duration::from_millis(5));
+        assert_eq!(removed, 2);
+        assert!(!store.join("0123456789abcdef").exists());
+        assert!(!store.join("fedcba9876543210").exists());
+        assert!(
+            store.join("not-a-handle.txt").exists(),
+            "non-handle files must stay"
+        );
+
+        // 长 TTL：新句柄保留
+        std::fs::write(store.join("0011223344556677"), "fresh").unwrap();
+        assert_eq!(prune_ctx_store(&store, DEFAULT_CTX_STORE_TTL), 0);
+        assert!(store.join("0011223344556677").exists());
     }
 
     #[test]

@@ -147,10 +147,16 @@ pub fn sanitize_paste(text: &str) -> String {
 
 /// 斜杠命令注册表：(名称, 用法说明)
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("config", "打开配置向导：选厂商 → 端点 → API Key → 模型（热生效）"),
+    (
+        "config",
+        "打开配置向导：选厂商 → 端点 → API Key → 模型（热生效）",
+    ),
     ("model", "切换模型：/model <名称>，或不带参数打开模型选择器"),
     ("status", "查看当前 vendor / endpoint / model / session"),
-    ("fork", "分叉会话：/fork 继承全部历史；/fork <n> 回到 n 轮之前重来（原会话保留）"),
+    (
+        "fork",
+        "分叉会话：/fork 继承全部历史；/fork <n> 回到 n 轮之前重来（原会话保留）",
+    ),
     ("help", "显示命令帮助"),
 ];
 
@@ -301,6 +307,8 @@ pub struct App {
     steering: Arc<SteeringQueue>,
     /// 本次会话累计节省的上下文字节（工具输出压缩台账）
     bytes_saved: u64,
+    /// 本次会话累计节省的 token 估算（与字节台账同源）
+    tokens_saved: u64,
     /// 配置文件路径（/config 向导写回）
     config_path: std::path::PathBuf,
     /// 当前生效设置镜像（vendor/endpoint/model/key）
@@ -348,7 +356,8 @@ impl App {
             models_tx: None,
             hint_selected: 0,
             lines: vec![ChatLine::System(
-                "Enter 发送 · 运行中输入为 steering · Esc 取消 · Ctrl+O 会话 · Ctrl+C 退出".to_string(),
+                "Enter 发送 · 运行中输入为 steering · Esc 取消 · Ctrl+O 会话 · Ctrl+C 退出"
+                    .to_string(),
             )],
             input: String::new(),
             scroll: usize::MAX,
@@ -361,6 +370,7 @@ impl App {
             cancel: CancellationToken::new(),
             steering: Arc::new(SteeringQueue::new()),
             bytes_saved: 0,
+            tokens_saved: 0,
             picker: None,
             pending: None,
             confirm_rx,
@@ -529,8 +539,7 @@ impl App {
             KeyCode::Esc => {
                 if self.agent_running {
                     self.cancel.cancel();
-                    self.lines
-                        .push(ChatLine::System("已请求取消…".to_string()));
+                    self.lines.push(ChatLine::System("已请求取消…".to_string()));
                 } else {
                     return true;
                 }
@@ -642,9 +651,8 @@ impl App {
                 ConfirmationDecision::AllowAll => "已允许（本次运行内不再询问）",
                 ConfirmationDecision::Deny(_) => "已拒绝",
             };
-            self.lines.push(ChatLine::System(format!(
-                "⚠ {name}: {note}"
-            )));
+            self.lines
+                .push(ChatLine::System(format!("⚠ {name}: {note}")));
             self.scroll_to_bottom();
         }
     }
@@ -689,7 +697,9 @@ impl App {
     async fn wizard_enter(&mut self, ui_tx: &UnboundedSender<UiEvent>) {
         let _ = ui_tx;
         // 先取只读快照，避免与下方可变借用冲突
-        let Some(wizard) = self.wizard.as_ref() else { return };
+        let Some(wizard) = self.wizard.as_ref() else {
+            return;
+        };
         let step = wizard.step.clone();
         let selected = wizard.selected;
 
@@ -711,10 +721,13 @@ impl App {
                     .as_ref()
                     .and_then(|w| baiji_ai::find_vendor(&w.vendor))
                     .and_then(|preset| {
-                        preset
-                            .endpoint_names()
-                            .get(selected)
-                            .map(|n| if *n == "api" { None } else { Some(n.to_string()) })
+                        preset.endpoint_names().get(selected).map(|n| {
+                            if *n == "api" {
+                                None
+                            } else {
+                                Some(n.to_string())
+                            }
+                        })
                     });
                 let Some(endpoint) = endpoint else {
                     return;
@@ -808,7 +821,9 @@ impl App {
 
     /// 模型发现结果回填
     fn handle_models(&mut self, result: Result<Vec<baiji_ai::ModelInfo>, String>) {
-        let Some(wizard) = &mut self.wizard else { return };
+        let Some(wizard) = &mut self.wizard else {
+            return;
+        };
         if wizard.step != WizardStep::Model {
             return;
         }
@@ -824,12 +839,15 @@ impl App {
 
     /// 保存 + 重建 Provider + 热切换 + 状态栏更新
     async fn apply_wizard(&mut self) {
-        let Some(wizard) = self.wizard.take() else { return };
+        let Some(wizard) = self.wizard.take() else {
+            return;
+        };
         let api_key = self.wizard_key(&wizard);
         // 新模型的上下文窗口（发现值优先，否则内置兜底）→ 压缩阈值
-        let limits = wizard.model.as_deref().map(|id| {
-            baiji_ai::model_limits(id, wizard.models.iter().find(|m| m.id == id))
-        });
+        let limits = wizard
+            .model
+            .as_deref()
+            .map(|id| baiji_ai::model_limits(id, wizard.models.iter().find(|m| m.id == id)));
         // 只有用户显式输入的 Key 才落盘；展开后的明文（来自 $ENV）绝不回写
         let typed_key = wizard.api_key.clone();
         let key_update = if !typed_key.is_empty() {
@@ -863,13 +881,11 @@ impl App {
                     }
                 }
                 self.status_hint = hint;
-                let endpoint = new_settings
-                    .endpoint
-                    .as_deref()
-                    .unwrap_or("api");
+                let endpoint = new_settings.endpoint.as_deref().unwrap_or("api");
                 self.lines.push(ChatLine::System(format!(
                     "✓ 配置已生效：{} · endpoint={} · model={}（已写入配置文件）",
-                    new_settings.vendor, endpoint,
+                    new_settings.vendor,
+                    endpoint,
                     new_settings.model.as_deref().unwrap_or("?")
                 )));
                 self.settings = new_settings;
@@ -914,8 +930,9 @@ impl App {
             }
             "fork" => {
                 if self.agent_running {
-                    self.lines
-                        .push(ChatLine::System("运行中无法分叉，先按 Esc 取消".to_string()));
+                    self.lines.push(ChatLine::System(
+                        "运行中无法分叉，先按 Esc 取消".to_string(),
+                    ));
                 } else {
                     match args.trim() {
                         "" => self.fork_session(0).await,
@@ -940,8 +957,9 @@ impl App {
             }
             "config" => {
                 if self.agent_running {
-                    self.lines
-                        .push(ChatLine::System("运行中不可修改配置，请先等待或 Esc 取消".to_string()));
+                    self.lines.push(ChatLine::System(
+                        "运行中不可修改配置，请先等待或 Esc 取消".to_string(),
+                    ));
                     return;
                 }
                 let s = &self.settings;
@@ -949,8 +967,9 @@ impl App {
             }
             "model" => {
                 if self.agent_running {
-                    self.lines
-                        .push(ChatLine::System("运行中不可修改配置，请先等待或 Esc 取消".to_string()));
+                    self.lines.push(ChatLine::System(
+                        "运行中不可修改配置，请先等待或 Esc 取消".to_string(),
+                    ));
                     return;
                 }
                 if args.is_empty() {
@@ -1077,13 +1096,17 @@ impl App {
                 self.lines.push(ChatLine::System(if turns_back == 0 {
                     format!("已从当前会话分叉 → {new_id}（历史已继承）")
                 } else {
-                    format!("已分叉 → {new_id}（回退 {turns_back} 轮；原会话保留，可用会话选择器切回）")
+                    format!(
+                        "已分叉 → {new_id}（回退 {turns_back} 轮；原会话保留，可用会话选择器切回）"
+                    )
                 }));
                 if let Some(input) = dropped {
                     self.input = sanitize_paste(&input);
                 }
             }
-            Err(e) => self.lines.push(ChatLine::System(format!("✗ 分叉失败: {e}"))),
+            Err(e) => self
+                .lines
+                .push(ChatLine::System(format!("✗ 分叉失败: {e}"))),
         }
         self.scroll_to_bottom();
     }
@@ -1180,6 +1203,7 @@ impl App {
                 output,
                 is_error,
                 original_bytes,
+                original_tokens,
                 ..
             } => {
                 self.tool_calls += 1;
@@ -1187,6 +1211,12 @@ impl App {
                     self.bytes_saved = self
                         .bytes_saved
                         .saturating_add(original.saturating_sub(output.len() as u64));
+                }
+                if let Some(original) = original_tokens {
+                    let delivered = baiji_agent::estimate_text_tokens(&output) as u64;
+                    self.tokens_saved = self
+                        .tokens_saved
+                        .saturating_add(original.saturating_sub(delivered));
                 }
                 let brief: String = output.chars().take(120).collect();
                 let mark = if is_error { "✗" } else { "✓" };
@@ -1197,8 +1227,7 @@ impl App {
             AgentEvent::TurnFinished { .. } => self.thinking.clear(),
             AgentEvent::RunCompleted { answer } => {
                 if !self.streaming.is_empty() {
-                    self.lines
-                        .push(ChatLine::assistant(self.streaming.clone()));
+                    self.lines.push(ChatLine::assistant(self.streaming.clone()));
                     self.streaming.clear();
                 } else if !answer.is_empty() {
                     self.lines.push(ChatLine::assistant(&answer));
@@ -1267,15 +1296,16 @@ impl App {
 
     pub(crate) fn status_line(&self) -> String {
         let state = if self.agent_running {
-            format!(
-                "⏳ Turn {} | {} tools",
-                self.current_turn, self.tool_calls
-            )
+            format!("⏳ Turn {} | {} tools", self.current_turn, self.tool_calls)
         } else {
             "就绪".to_string()
         };
         let saved = if self.bytes_saved > 0 {
-            format!(" · 省 {}", format_bytes(self.bytes_saved))
+            format!(
+                " · 省 {} (~{} tok)",
+                format_bytes(self.bytes_saved),
+                self.tokens_saved
+            )
         } else {
             String::new()
         };
@@ -1402,7 +1432,8 @@ impl App {
                         .map(|name| {
                             if *name == "api" {
                                 format!("api — 默认端点（按量付费）· {}", preset.base_url)
-                            } else if let Some(v) = preset.variants.iter().find(|v| v.name == *name) {
+                            } else if let Some(v) = preset.variants.iter().find(|v| v.name == *name)
+                            {
                                 format!("{} — {} · {}", v.name, v.note, v.base_url)
                             } else {
                                 name.to_string()
@@ -1417,13 +1448,14 @@ impl App {
                     rows.push("（模型列表获取中…）".to_string());
                 } else if let Some(err) = &wizard.models_error {
                     rows.push(format!("模型列表获取失败：{err}"));
-                    rows.push("→ 请选末项「手动输入模型名…」直接指定（Coding Plan 端点常无列表接口）".to_string());
+                    rows.push(
+                        "→ 请选末项「手动输入模型名…」直接指定（Coding Plan 端点常无列表接口）"
+                            .to_string(),
+                    );
                 } else {
-                    rows.extend(wizard.models.iter().map(|m| {
-                        match &m.display_name {
-                            Some(d) if d != &m.id => format!("{} — {}", m.id, d),
-                            _ => m.id.clone(),
-                        }
+                    rows.extend(wizard.models.iter().map(|m| match &m.display_name {
+                        Some(d) if d != &m.id => format!("{} — {}", m.id, d),
+                        _ => m.id.clone(),
                     }));
                 }
                 rows.push("✏ 手动输入模型名…".to_string());
@@ -1481,8 +1513,8 @@ mod tests {
         use async_trait::async_trait;
         use baiji_agent::{AgentRuntime, ToolRegistry};
         use baiji_ai::{ChatRequest, ChatResponse, Protocol, Provider, StreamChunk};
-        use futures::stream::BoxStream;
         use futures::StreamExt as _;
+        use futures::stream::BoxStream;
 
         struct Echo;
         #[async_trait]
@@ -1508,8 +1540,7 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let runtime =
-            Arc::new(AgentRuntime::new(Arc::new(Echo)).with_tools(ToolRegistry::new()));
+        let runtime = Arc::new(AgentRuntime::new(Arc::new(Echo)).with_tools(ToolRegistry::new()));
         let harness = AgentHarness::new(runtime, dir.path().join("sessions")).unwrap();
         let mut app = App::new(
             Arc::new(tokio::sync::Mutex::new(harness)),
@@ -1531,9 +1562,12 @@ mod tests {
 
         // 多行回答保留换行（回归：曾被压成一行）；长中文回复贴底时末行可见
         // （回归：按字符数而非显示宽度估行，滚不到底）
-        app.lines.push(ChatLine::Assistant("fn main() {\n    hi();\n}".to_string()));
         app.lines
-            .push(ChatLine::Assistant(format!("{}终点标记", "中文".repeat(400))));
+            .push(ChatLine::Assistant("fn main() {\n    hi();\n}".to_string()));
+        app.lines.push(ChatLine::Assistant(format!(
+            "{}终点标记",
+            "中文".repeat(400)
+        )));
         app.scroll_to_bottom();
         terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
         let screen = |t: &ratatui::Terminal<ratatui::backend::TestBackend>| -> Vec<String> {
@@ -1556,7 +1590,10 @@ mod tests {
         terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
         let rows = screen(&terminal);
         let code_row = rows.iter().position(|r| r.contains("fn main() {")).unwrap();
-        assert!(rows[code_row + 1].contains("    hi();"), "newlines preserved");
+        assert!(
+            rows[code_row + 1].contains("    hi();"),
+            "newlines preserved"
+        );
         assert!(rows[code_row + 2].contains('}'));
         app.lines.clear();
 
@@ -1590,13 +1627,17 @@ mod tests {
         // 输入步骤按键路径：字符/退格/粘贴必须进输入框（回归：曾被吞掉）
         use crossterm::event::{KeyCode as K, KeyModifiers as M};
         let ui_tx = tokio::sync::mpsc::unbounded_channel().0;
-        app.handle_key(KeyEvent::new(K::Char('s'), M::NONE), &ui_tx).await;
+        app.handle_key(KeyEvent::new(K::Char('s'), M::NONE), &ui_tx)
+            .await;
         assert_eq!(app.input(), "s", "after 's'");
-        app.handle_key(KeyEvent::new(K::Char('k'), M::NONE), &ui_tx).await;
+        app.handle_key(KeyEvent::new(K::Char('k'), M::NONE), &ui_tx)
+            .await;
         assert_eq!(app.input(), "sk", "after 'k'");
-        app.handle_key(KeyEvent::new(K::Backspace, M::NONE), &ui_tx).await;
+        app.handle_key(KeyEvent::new(K::Backspace, M::NONE), &ui_tx)
+            .await;
         assert_eq!(app.input(), "s", "after backspace");
-        app.handle_key(KeyEvent::new(K::Char('-'), M::NONE), &ui_tx).await;
+        app.handle_key(KeyEvent::new(K::Char('-'), M::NONE), &ui_tx)
+            .await;
         assert_eq!(app.input(), "s-", "after '-'");
         // 粘贴同样进输入框（含尾随换行被净化）
         app.handle_paste("live-key\n".to_string());
@@ -1673,10 +1714,8 @@ mod tests {
             created_at: format!("2026-09-17T00:0{id}:00Z"),
             title: Some(format!("title-{id}")),
         };
-        let mut picker = SessionPicker::from_metas(
-            vec![mk("3", None), mk("2", Some("1")), mk("1", None)],
-            "2",
-        );
+        let mut picker =
+            SessionPicker::from_metas(vec![mk("3", None), mk("2", Some("1")), mk("1", None)], "2");
         // 树形顺序：根最新在前，分叉紧跟其父
         let ids: Vec<&str> = picker.items.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["3", "1", "2"]);

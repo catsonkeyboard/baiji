@@ -9,7 +9,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use baiji_agent::{AgentTool, ToolOutput};
+use baiji_agent::{estimate_text_tokens, AgentTool, ToolOutput};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -119,13 +119,20 @@ impl ReadTool {
         self.deliver(numbered, slice)
     }
 
-    /// 输出落账（截断保护 + 台账）
+    /// 输出落账（截断保护 + 台账，字节与 token 双口径）
     fn deliver(&self, text: String, slice: &[&str]) -> ToolOutput {
         let original_estimate: u64 = slice.iter().map(|l| l.len() + 8).sum::<usize>() as u64;
-        let (delivered, truncated_at) = self.env.truncate_with_meta(&text);
+        let token_estimate: u64 = slice
+            .iter()
+            .map(|l| estimate_text_tokens(l) as u64)
+            .sum();
+        let (delivered, truncated_at, truncated_tokens) = self.env.truncate_with_meta(&text);
         let original = truncated_at.unwrap_or(original_estimate);
+        let original_tokens = truncated_tokens.unwrap_or(token_estimate);
         if (delivered.len() as u64) < original {
-            ToolOutput::ok(delivered).with_original_bytes(original)
+            ToolOutput::ok(delivered)
+                .with_original_bytes(original)
+                .with_original_tokens(original_tokens)
         } else {
             ToolOutput::ok(delivered)
         }

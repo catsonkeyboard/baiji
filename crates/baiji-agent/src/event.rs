@@ -16,7 +16,11 @@ pub enum AgentEvent {
     /// 模型思考内容增量（思考模型在给出答案/调用工具前的推理；不计入最终答案）
     ReasoningDelta { text: String },
     /// 工具调用开始
-    ToolStarted { id: String, name: String, args: Value },
+    ToolStarted {
+        id: String,
+        name: String,
+        args: Value,
+    },
     /// 工具调用结束
     ToolFinished {
         id: String,
@@ -26,6 +30,8 @@ pub enum AgentEvent {
         duration_ms: u64,
         /// 压缩前的原始字节数（上下文节省台账）
         original_bytes: Option<u64>,
+        /// 压缩前的原始 token 估算（台账 token 口径）
+        original_tokens: Option<u64>,
     },
     /// 一条新消息已进入对话历史（steering/assistant/tool）。
     /// 持久化层据此增量落盘，崩溃时不丢已完成的轮次
@@ -33,7 +39,10 @@ pub enum AgentEvent {
     /// 本轮 LLM 调用因瞬时错误重试：此前收到的 TextDelta 作废，UI 应清空流式缓冲
     StreamRestarted,
     /// 厂商上报的真实 token 用量（一次 LLM 调用）
-    UsageReported { input_tokens: u32, output_tokens: u32 },
+    UsageReported {
+        input_tokens: u32,
+        output_tokens: u32,
+    },
     /// 一次 LLM 轮次结束
     TurnFinished { turn: u32 },
     /// 整个运行完成
@@ -76,7 +85,10 @@ mod tests {
             "text_delta"
         );
         assert_eq!(
-            AgentEvent::RunCompleted { answer: String::new() }.kind(),
+            AgentEvent::RunCompleted {
+                answer: String::new()
+            }
+            .kind(),
             "run_completed"
         );
     }

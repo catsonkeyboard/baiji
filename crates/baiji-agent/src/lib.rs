@@ -21,6 +21,8 @@ pub use event::AgentEvent;
 pub use hooks::{Hook, HookDecision, HookRegistry};
 pub use queue::SteeringQueue;
 pub use runtime::AgentRuntime;
-pub use tool::{AgentTool, ToolOutput, ToolRegistry};
+pub use tool::{AgentTool, ToolOutput, ToolRegistry, estimate_text_tokens};
 
-pub use baiji_ai::{ChatRequest, ChatResponse, Message, Role, StreamChunk, ToolCall, ToolDefinition, ToolResult};
+pub use baiji_ai::{
+    ChatRequest, ChatResponse, Message, Role, StreamChunk, ToolCall, ToolDefinition, ToolResult,
+};
