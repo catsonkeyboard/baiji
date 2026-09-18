@@ -95,28 +95,32 @@ async fn main() -> Result<()> {
         && app_config.protocol.is_none()
         && let Some(endpoint) = baiji_ai::auto_endpoint(resolved.vendor, &provider_config.model)
     {
-            let routed = baiji_ai::resolve_vendor(
-                resolved.vendor,
-                Some(endpoint),
-                app_config.base_url.as_deref(),
-                None,
-            )?;
-            if routed.protocol != provider_config.protocol {
-                info!(
-                    "model '{}' routed to endpoint '{endpoint}' ({})",
-                    provider_config.model,
-                    routed.protocol.as_str()
-                );
-            }
-            provider_config.protocol = routed.protocol;
-            provider_config.base_url = routed.base_url;
+        let routed = baiji_ai::resolve_vendor(
+            resolved.vendor,
+            Some(endpoint),
+            app_config.base_url.as_deref(),
+            None,
+        )?;
+        if routed.protocol != provider_config.protocol {
+            info!(
+                "model '{}' routed to endpoint '{endpoint}' ({})",
+                provider_config.model,
+                routed.protocol.as_str()
+            );
+        }
+        provider_config.protocol = routed.protocol;
+        provider_config.base_url = routed.base_url;
     }
     let limits = baiji_ai::model_limits(&provider_config.model, discovered.as_ref());
     info!(
         "model limits: context={} max_output={:?} ({})",
         limits.context_length,
         limits.max_output_tokens,
-        if limits.discovered { "from vendor API" } else { "built-in fallback" }
+        if limits.discovered {
+            "from vendor API"
+        } else {
+            "built-in fallback"
+        }
     );
     let model_name = provider_config.model.clone();
     let api_key = provider_config.api_key.clone();
@@ -171,7 +175,10 @@ async fn main() -> Result<()> {
     let mcporter_config = workdir.join("mcporter.json");
     match baiji_extensions::register_mcp_tools(&mut tools, mcporter_config.clone()).await {
         Ok(count) if count > 0 => {
-            info!("registered {count} MCP tools from {}", mcporter_config.display())
+            info!(
+                "registered {count} MCP tools from {}",
+                mcporter_config.display()
+            )
         }
         Ok(_) => {}
         Err(e) => warn!("MCP discovery failed: {e}"),
@@ -265,6 +272,15 @@ async fn main() -> Result<()> {
         info!("verbosity steer enabled (constant conciseness suffix on the last user turn)");
         runtime_builder = runtime_builder.with_verbosity_steer(true);
     }
+    // 运行时限制与重试（配置 `max_turns` / `retry` 段；缺省值即旧行为）
+    let effective_max_tokens = runtime_builder.max_tokens();
+    runtime_builder = runtime_builder
+        .with_limits(app_config.max_turns, effective_max_tokens)
+        .with_retry(
+            app_config.retry.max_retries,
+            app_config.retry.base_delay_ms,
+            app_config.retry.max_delay_ms,
+        );
     let runtime = Arc::new(runtime_builder);
 
     let mut harness = match &options.session {
@@ -275,8 +291,13 @@ async fn main() -> Result<()> {
         _ => AgentHarness::new(runtime, baiji_dir.join("sessions"))?,
     };
 
-    // 压缩阈值随模型上下文窗口而定（不再固定 48k）
+    // 压缩阈值随模型上下文窗口而定（不再固定 48k）；
+    // `compaction` 段可覆盖预算/保留轮次，enabled=false 时两级压缩全关
     harness.set_context_window(limits.context_length);
+    harness.set_compaction_policy(app_config.compaction_policy(
+        limits.context_length,
+        effective_max_tokens,
+    ));
 
     // 历史 tool result stub 化与 expand 工具共用同一 ctx store
     harness.set_ctx_store(baiji_dir.join("ctx-store"));
@@ -296,7 +317,10 @@ async fn main() -> Result<()> {
 
     // 自定义系统提示：项目级 ./.baiji/system.md 优先于用户级 ~/.baiji/system.md
     // （模板变量 {{cwd}} {{date}} {{os}} {{model}} 每次运行时渲染）
-    for candidate in [workdir.join(".baiji").join("system.md"), baiji_dir.join("system.md")] {
+    for candidate in [
+        workdir.join(".baiji").join("system.md"),
+        baiji_dir.join("system.md"),
+    ] {
         if let Ok(custom) = std::fs::read_to_string(&candidate)
             && !custom.trim().is_empty()
         {
@@ -315,7 +339,10 @@ async fn main() -> Result<()> {
         info!(
             "loaded {} prompt templates: {:?}",
             templates.len(),
-            templates.iter().map(|t| t.name.as_str()).collect::<Vec<_>>()
+            templates
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>()
         );
         harness.set_templates(templates);
     }
@@ -363,7 +390,11 @@ async fn main() -> Result<()> {
     let config_path = config::AppConfig::default_path()?;
 
     let harness = Arc::new(tokio::sync::Mutex::new(harness));
-    if let Err(e) = baiji_tui::run(harness, theme, confirm_rx, config_path, tui_settings).await {
+    let settings_summary = app_config.runtime_summary();
+    if let Err(e) =
+        baiji_tui::run(harness, theme, confirm_rx, config_path, tui_settings, settings_summary)
+            .await
+    {
         error!("TUI error: {e}");
         return Err(e);
     }
@@ -396,7 +427,11 @@ async fn pick_model(
     match baiji_ai::discover_models(vendor, provider_config).await {
         Ok(models) => match baiji_ai::pick_default_model(vendor, &models) {
             Some(picked) => {
-                info!("discovered {} models via API, using '{}'", models.len(), picked.id);
+                info!(
+                    "discovered {} models via API, using '{}'",
+                    models.len(),
+                    picked.id
+                );
                 eprintln!(
                     "未配置 model，已自动选择 '{}'（共 {} 个可用；可用 /model 或配置文件更改）",
                     picked.id,
@@ -405,7 +440,10 @@ async fn pick_model(
                 Ok(picked.clone())
             }
             None => {
-                warn!("no chat-capable model in list of {}, {vendor_hint}", models.len());
+                warn!(
+                    "no chat-capable model in list of {}, {vendor_hint}",
+                    models.len()
+                );
                 anyhow::bail!("模型列表中没有可用的对话模型（{vendor_hint}）")
             }
         },

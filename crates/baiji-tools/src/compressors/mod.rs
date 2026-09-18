@@ -56,7 +56,8 @@ pub(crate) fn strip_ansi(input: &str) -> String {
 /// 内容感知压缩入口：分类 → 域压缩器 → 门槛仲裁。
 /// `allow_lossy` 仅当命令成功（exit=0）时为 true。
 pub(crate) fn compress(content: &str, env: &ExecutionEnv, allow_lossy: bool) -> String {
-    if content.len() < MIN_INPUT_BYTES {
+    // 域压缩关闭（A/B 对照臂）：只保留通用 shell 规则与截断
+    if content.len() < MIN_INPUT_BYTES || !env.compression_enabled {
         return content.to_string();
     }
     if let Some(value) = json::parse(content) {
@@ -108,6 +109,34 @@ mod tests {
         // 无损紧凑被采纳：单行、无换行缩进
         assert!(!out.contains('\n'), "{out}");
         assert!(out.contains("\"key_1\":\"value-1\""));
+    }
+
+    #[test]
+    fn test_compression_disabled_returns_original() {
+        // A/B 对照臂：域压缩关闭，pretty JSON 原样返回（不走无损紧凑）
+        let mut obj = serde_json::Map::new();
+        for i in 0..24 {
+            obj.insert(
+                format!("key_{i}"),
+                serde_json::Value::String(format!("value-{i}")),
+            );
+        }
+        let pretty = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&serde_json::Value::Object(obj)).unwrap()
+        );
+        assert!(pretty.len() >= MIN_INPUT_BYTES);
+        let mut env = env();
+        env.compression_enabled = false;
+        assert_eq!(compress(&pretty, &env, true), pretty);
+        // 开关打开时同一输入被压缩
+        assert_ne!(compress(&pretty, &env_with_compression(), true), pretty);
+    }
+
+    fn env_with_compression() -> ExecutionEnv {
+        let mut env = ExecutionEnv::new(".");
+        env.compression_enabled = true;
+        env
     }
 
     #[test]

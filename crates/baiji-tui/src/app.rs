@@ -311,6 +311,8 @@ pub struct App {
     tokens_saved: u64,
     /// 配置文件路径（/config 向导写回）
     config_path: std::path::PathBuf,
+    /// 运行时设置摘要（来自 AppConfig，/status 展示）
+    settings_summary: String,
     /// 当前生效设置镜像（vendor/endpoint/model/key）
     settings: RuntimeSettings,
     /// 配置向导打开时为 Some
@@ -334,6 +336,7 @@ impl App {
         confirm_rx: Option<UnboundedReceiver<ConfirmDialog>>,
         config_path: std::path::PathBuf,
         settings: RuntimeSettings,
+        settings_summary: String,
     ) -> Self {
         let session_id = harness
             .try_lock()
@@ -352,6 +355,7 @@ impl App {
             theme,
             settings,
             config_path,
+            settings_summary,
             wizard: None,
             models_tx: None,
             hint_selected: 0,
@@ -948,11 +952,12 @@ impl App {
             "status" => {
                 let s = &self.settings;
                 self.lines.push(ChatLine::System(format!(
-                    "vendor: {} · endpoint: {} · model: {} · session: {}",
+                    "vendor: {} · endpoint: {} · model: {} · session: {}\n{}",
                     s.vendor,
                     s.endpoint.as_deref().unwrap_or("api"),
                     s.model.as_deref().unwrap_or("自动发现"),
-                    self.session_id
+                    self.session_id,
+                    self.settings_summary
                 )));
             }
             "config" => {
@@ -1553,6 +1558,7 @@ mod tests {
                 model: Some("glm-4.7".to_string()),
                 api_key: "k".to_string(),
             },
+            "max_turns: 24 · compaction: on (auto)".to_string(),
         );
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
