@@ -11,6 +11,8 @@ pub struct CliOptions {
     pub yes: bool,
     /// `--sessions`：列出全部会话后退出
     pub list_sessions: bool,
+    /// `--continue-until-done`：headless 自动接力（todo 未完成则继续，直到完成或轮次上限）
+    pub continue_until_done: bool,
     /// `-h/--help`
     pub help: bool,
 }
@@ -30,6 +32,8 @@ baiji — 终端 AI coding agent
   -e, --exec <msg>     headless 执行的消息
   --session <id>       恢复的会话 ID（见 --sessions）
   -y, --yes            headless 模式自动放行需确认的工具（默认拒绝）
+      --continue-until-done
+                       自动接力：todo 未完成则继续，直到完成或轮次上限
       --sessions       列出会话
   环境变量 BAIJI_TELEMETRY=file 时，把 span/event 追加写入 ~/.baiji/traces/";
 
@@ -42,6 +46,7 @@ pub fn parse(args: &[String]) -> CliOptions {
             "-h" | "--help" => opts.help = true,
             "--sessions" | "--list-sessions" => opts.list_sessions = true,
             "-y" | "--yes" => opts.yes = true,
+            "--continue-until-done" => opts.continue_until_done = true,
             "-e" | "--exec" => {
                 if let Some(msg) = args.get(i + 1) {
                     opts.exec = Some(msg.clone());
@@ -110,6 +115,14 @@ mod tests {
         assert!(parse(&args(&["--list-sessions"])).list_sessions);
         assert!(parse(&args(&["-h"])).help);
         assert!(parse(&args(&["--help"])).help);
+    }
+
+    #[test]
+    fn test_parse_continue_until_done() {
+        let opts = parse(&args(&["-e", "做个大任务", "--continue-until-done"]));
+        assert!(opts.continue_until_done);
+        assert_eq!(opts.exec.as_deref(), Some("做个大任务"));
+        assert!(!parse(&args(&["-e", "x"])).continue_until_done);
     }
 
     #[test]

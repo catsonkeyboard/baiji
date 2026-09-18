@@ -20,16 +20,30 @@ pub struct RuntimeSettings {
     pub api_key: String,
 }
 
+/// 自动接力配置（T4）：run 结束且 todo 未完成时自动继续
+#[derive(Debug, Clone, Copy)]
+pub struct AutoContinueConfig {
+    pub enabled: bool,
+    /// 接力链的累计轮次上限
+    pub max_turns: u32,
+}
+
+impl Default for AutoContinueConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_turns: 96,
+        }
+    }
+}
+
 /// 状态栏提示（"智谱 GLM · glm-4.7"）
 pub fn status_hint(settings: &RuntimeSettings) -> String {
     let vendor = baiji_ai::find_vendor(&settings.vendor);
     let name = vendor
         .map(|v| v.display_name)
         .unwrap_or_else(|| settings.vendor.as_str());
-    let model = settings
-        .model
-        .as_deref()
-        .unwrap_or("自动发现");
+    let model = settings.model.as_deref().unwrap_or("自动发现");
     format!("{name} · {model}")
 }
 
@@ -43,10 +57,7 @@ pub fn load(config_path: &Path) -> Result<RuntimeSettings> {
     let value: serde_json::Value = serde_json::from_str(&expanded)
         .with_context(|| format!("解析配置失败: {}", config_path.display()))?;
 
-    let api_key = value["api_key"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
+    let api_key = value["api_key"].as_str().unwrap_or_default().to_string();
     Ok(RuntimeSettings {
         vendor: value["vendor"].as_str().unwrap_or_default().to_string(),
         endpoint: value["endpoint"].as_str().map(String::from),
@@ -170,20 +181,13 @@ pub fn build_provider(settings: &RuntimeSettings) -> Result<Arc<dyn Provider>> {
 }
 
 /// 拉取厂商模型列表（向导模型选择用；endpoint 变体参与 URL 路由）
-pub async fn discover_models_async(
-    settings: &RuntimeSettings,
-) -> Result<Vec<baiji_ai::ModelInfo>> {
+pub async fn discover_models_async(settings: &RuntimeSettings) -> Result<Vec<baiji_ai::ModelInfo>> {
     if settings.api_key.trim().is_empty() {
         anyhow::bail!("缺少 API Key，无法获取模型列表");
     }
     let vendor = baiji_ai::find_vendor(&settings.vendor)
         .with_context(|| format!("未知厂商 '{}'", settings.vendor))?;
-    let config = baiji_ai::resolve_vendor(
-        vendor,
-        settings.endpoint.as_deref(),
-        None,
-        None,
-    )?;
+    let config = baiji_ai::resolve_vendor(vendor, settings.endpoint.as_deref(), None, None)?;
     let config = baiji_ai::ProviderConfig {
         api_key: settings.api_key.clone(),
         ..config

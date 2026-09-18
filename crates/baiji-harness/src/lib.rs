@@ -26,6 +26,23 @@ pub use templates::render;
 pub use templates::{PromptTemplate, load_templates};
 pub use todo::{TodoItem, TodoStatus, TodoStore, TodoTool, todo_section};
 
+/// 自动接力的固定输入（用户可见、进入会话历史——下一轮模型自然衔接）
+pub const AUTO_CONTINUE_PROMPT: &str = "继续，按 todo 清单推进任务";
+
+/// 自动接力判定（TUI / headless 共用）：
+/// 自主模式开 && todo 有未完成项 && 本次 run 正常完成（未被取消/失败）
+/// && 累计轮次未超上限。上限按"一次用户输入触发的接力链"计，
+/// 用户下一次手动输入时由调用方清零重新计。
+pub fn should_auto_continue(
+    enabled: bool,
+    max_turns: u32,
+    has_open_todos: bool,
+    turns_used: u32,
+    run_completed_normally: bool,
+) -> bool {
+    enabled && has_open_todos && run_completed_normally && turns_used < max_turns
+}
+
 use anyhow::Result;
 use baiji_agent::{AgentEvent, AgentRuntime, SteeringQueue};
 use baiji_ai::Message;
@@ -1106,6 +1123,18 @@ mod tests {
         let file = store_dir.join(format!("{}.jsonl", harness.session().meta.id));
         let jsonl = std::fs::read_to_string(&file).unwrap();
         assert!(!jsonl.contains("\"summary\""), "{jsonl}");
+    }
+
+    #[test]
+    fn test_should_auto_continue_truth_table() {
+        let yes = should_auto_continue(true, 10, true, 5, true);
+        assert!(yes);
+        // 任一条件不满足即停
+        assert!(!should_auto_continue(false, 10, true, 5, true)); // 开关关
+        assert!(!should_auto_continue(true, 10, false, 5, true)); // todo 全完成
+        assert!(!should_auto_continue(true, 10, true, 10, true)); // 轮次触顶
+        assert!(!should_auto_continue(true, 10, true, 11, true)); // 超上限
+        assert!(!should_auto_continue(true, 10, true, 5, false)); // 被中断
     }
 
     // ===== usage 锚定（T2）=====

@@ -11,7 +11,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::confirm::ConfirmDialog;
-use crate::settings::{self, RuntimeSettings};
+use crate::settings::{self, AutoContinueConfig, RuntimeSettings};
 use crate::theme::Theme;
 
 /// 聊天区的一行（逻辑行）
@@ -313,6 +313,12 @@ pub struct App {
     config_path: std::path::PathBuf,
     /// 运行时设置摘要（来自 AppConfig，/status 展示）
     settings_summary: String,
+    /// 自动接力配置（T4）
+    auto: AutoContinueConfig,
+    /// 本次接力链已用轮次（用户手动提交时清零；TurnStarted 累计）
+    auto_turns: u32,
+    /// 本次 run 是否被中断（中断后不再接力）
+    run_interrupted: bool,
     /// 当前生效设置镜像（vendor/endpoint/model/key）
     settings: RuntimeSettings,
     /// 配置向导打开时为 Some
@@ -330,6 +336,7 @@ pub struct App {
 }
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         harness: Arc<tokio::sync::Mutex<AgentHarness>>,
         theme: Theme,
@@ -337,6 +344,7 @@ impl App {
         config_path: std::path::PathBuf,
         settings: RuntimeSettings,
         settings_summary: String,
+        auto: AutoContinueConfig,
     ) -> Self {
         let session_id = harness
             .try_lock()
@@ -356,6 +364,9 @@ impl App {
             settings,
             config_path,
             settings_summary,
+            auto,
+            auto_turns: 0,
+            run_interrupted: false,
             wizard: None,
             models_tx: None,
             hint_selected: 0,
@@ -480,7 +491,7 @@ impl App {
                     }
                 }
                 LoopEvent::Agent(agent_event) => {
-                    self.handle_agent_event(agent_event);
+                    self.handle_agent_event(agent_event, &ui_tx);
                     if terminal.draw(|frame| crate::ui::draw(frame, self)).is_err() {
                         return Ok(());
                     }
@@ -571,6 +582,7 @@ impl App {
                         .push(ChatLine::System(format!("（steering）{text}")));
                 } else {
                     self.lines.push(ChatLine::user(&text));
+                    self.auto_turns = 0; // 用户手动输入 = 新的接力链
                     self.spawn_run(text, ui_tx.clone());
                 }
                 self.scroll_to_bottom();
@@ -1169,10 +1181,11 @@ impl App {
         self.streaming.clear();
     }
 
-    /// 处理 Agent 事件
-    fn handle_agent_event(&mut self, event: AgentEvent) {
+    /// 处理 Agent 事件（`ui_tx` 供自动接力发起下一次 run）
+    fn handle_agent_event(&mut self, event: AgentEvent, ui_tx: &UnboundedSender<UiEvent>) {
         match event {
             AgentEvent::TurnStarted { turn } => {
+                self.auto_turns += 1; // 接力链预算（用户手动提交时清零）
                 self.current_turn = turn;
             }
             // 持久化层的内部事件（Harness 不转发），UI 无需处理
@@ -1238,6 +1251,7 @@ impl App {
                     self.lines.push(ChatLine::assistant(&answer));
                 }
                 self.finish_run();
+                self.maybe_auto_continue(ui_tx.clone());
             }
             AgentEvent::RunFailed { error } => {
                 self.streaming.clear();
@@ -1250,6 +1264,7 @@ impl App {
                 self.streaming.clear();
                 self.thinking.clear();
                 self.lines.push(ChatLine::System("已取消".to_string()));
+                self.run_interrupted = true; // 中断后本次接力链终止
                 self.finish_run();
             }
         }
@@ -1262,6 +1277,35 @@ impl App {
         self.scroll_to_bottom();
     }
 
+    /// 自动接力（T4）：run 正常结束且 todo 仍有未完成项、轮次未超上限时，
+    /// 以固定输入继续（用户可见、进入历史；Esc 可随时终止链）
+    fn maybe_auto_continue(&mut self, ui_tx: UnboundedSender<UiEvent>) {
+        if !self.auto.enabled || self.agent_running || self.run_interrupted {
+            return;
+        }
+        let has_open = self
+            .harness
+            .try_lock()
+            .map(|h| h.has_open_todos())
+            .unwrap_or(false);
+        if !has_open {
+            return;
+        }
+        if self.auto_turns >= self.auto.max_turns {
+            self.lines.push(ChatLine::System(format!(
+                "⏹ 自动接力停止：达到轮次上限 {}（todo 仍有未完成项，可手动继续）",
+                self.auto.max_turns
+            )));
+            return;
+        }
+        self.lines.push(ChatLine::System(format!(
+            "⏩ 自动接力（轮次 {}/{}）：todo 未完成，继续任务（Esc 可停）",
+            self.auto_turns, self.auto.max_turns
+        )));
+        self.scroll_to_bottom();
+        self.spawn_run(baiji_harness::AUTO_CONTINUE_PROMPT.to_string(), ui_tx);
+    }
+
     fn scroll_to_bottom(&mut self) {
         self.scroll = usize::MAX; // 哨兵值，渲染时钳制
     }
@@ -1269,6 +1313,7 @@ impl App {
     /// 启动一次 agent 运行（后台任务），事件转发回 UI 通道
     fn spawn_run(&mut self, text: String, ui_tx: UnboundedSender<UiEvent>) {
         self.agent_running = true;
+        self.run_interrupted = false;
 
         let steering = Arc::new(SteeringQueue::new());
         self.steering = Arc::clone(&steering);
@@ -1305,6 +1350,11 @@ impl App {
         } else {
             "就绪".to_string()
         };
+        let auto = if self.auto.enabled && self.auto_turns > 0 {
+            format!(" · 自动 {}/{}", self.auto_turns, self.auto.max_turns)
+        } else {
+            String::new()
+        };
         let saved = if self.bytes_saved > 0 {
             format!(
                 " · 省 {} (~{} tok)",
@@ -1320,8 +1370,8 @@ impl App {
             String::new()
         };
         format!(
-            "{} · session {} · {}{}{}",
-            self.status_hint, self.session_id, state, context, saved
+            "{} · session {} · {}{}{}{}",
+            self.status_hint, self.session_id, state, context, auto, saved
         )
     }
 
@@ -1559,6 +1609,7 @@ mod tests {
                 api_key: "k".to_string(),
             },
             "max_turns: 24 · compaction: on (auto)".to_string(),
+            AutoContinueConfig::default(),
         );
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();

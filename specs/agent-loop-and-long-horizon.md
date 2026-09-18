@@ -130,7 +130,7 @@ pi 的 `estimateContextTokens`（`packages/agent/src/harness/compaction/compacti
 
 ---
 
-## T4 · 自动接力（自主循环 + 预算上限）【P1，依赖 T1+T2】
+## T4 · 自动接力（自主循环 + 预算上限）【P1 · ✅ 已完成 2026-09-18（依赖 T1+T2 均已就位）】
 
 ### 动机
 `run()` 结束 = 任务暂停，必须用户再按一次回车。长程任务需要"todo 未完成则继续，
