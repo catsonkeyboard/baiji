@@ -166,6 +166,17 @@ async fn main() -> Result<()> {
         baiji_dir.join("skills"),
         workdir.join(".baiji").join("skills"),
     ]);
+    // 配置过滤:skills.enabled 总开关 + disabled 按名禁用
+    let (skills, skills_skipped) = baiji_harness::filter_skills(
+        skills,
+        app_config.skills.enabled,
+        &app_config.skills.disabled,
+    );
+    if !app_config.skills.enabled {
+        info!("skills disabled by config (BAIJI_SKILLS=off does the same without editing)");
+    } else if !skills_skipped.is_empty() {
+        warn!("skills disabled by name: {:?}", skills_skipped);
+    }
     if !skills.is_empty() {
         info!(
             "loaded {} skills: {:?}",
@@ -319,10 +330,9 @@ async fn main() -> Result<()> {
     // 压缩阈值随模型上下文窗口而定（不再固定 48k）；
     // `compaction` 段可覆盖预算/保留轮次，enabled=false 时两级压缩全关
     harness.set_context_window(limits.context_length);
-    harness.set_compaction_policy(app_config.compaction_policy(
-        limits.context_length,
-        effective_max_tokens,
-    ));
+    harness.set_compaction_policy(
+        app_config.compaction_policy(limits.context_length, effective_max_tokens),
+    );
 
     // 历史 tool result stub 化与 expand 工具共用同一 ctx store
     harness.set_ctx_store(ctx_store_dir);
@@ -391,7 +401,10 @@ async fn main() -> Result<()> {
         });
 
         let outcome = if options.continue_until_done {
-            info!("headless auto-continue enabled (cap {} turns)", app_config.policy.auto_continue_max_turns);
+            info!(
+                "headless auto-continue enabled (cap {} turns)",
+                app_config.policy.auto_continue_max_turns
+            );
             headless::run_auto(
                 &mut harness,
                 &input,

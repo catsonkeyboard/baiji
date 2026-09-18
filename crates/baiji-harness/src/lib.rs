@@ -20,7 +20,7 @@ pub use compaction::{CompactionPolicy, compact, compact_with_llm, estimate_token
 pub use memory::{MemoryEntry, MemoryKind, MemoryStore, MemoryTool, memory_section, project_key};
 pub use persist::{JsonlStore, Record};
 pub use session::{Session, SessionMeta, SessionTree, new_session_id};
-pub use skills::{Skill, SkillTool, load_skills};
+pub use skills::{Skill, SkillTool, filter_skills, load_skills};
 pub use stub::stub_tool_results;
 pub use templates::render;
 pub use templates::{PromptTemplate, load_templates};

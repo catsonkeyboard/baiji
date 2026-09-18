@@ -40,7 +40,12 @@ pub fn load_skills(dirs: &[std::path::PathBuf]) -> Vec<Skill> {
         let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
         };
-        for entry in entries.flatten() {
+        // 排序:同一根目录下若多个目录声明了相同的 frontmatter name,
+        // 去重结果不依赖文件系统返回顺序——路径字典序大者后处理、获胜
+        // (与多根目录"后者覆盖前者"的心智一致)
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
+        for entry in entries {
             let skill_file = entry.path().join("SKILL.md");
             if let Some(skill) = load_skill_file(&skill_file) {
                 if let Some(existing) = skills.iter_mut().find(|s| s.name == skill.name) {
@@ -87,7 +92,10 @@ pub(crate) fn split_frontmatter(content: &str) -> (Option<String>, String) {
     if let Some(rest) = trimmed.strip_prefix("---") {
         if let Some(end) = rest.find("\n---") {
             let frontmatter = rest[..end].trim().to_string();
-            let body = rest[end + 4..].trim_start_matches('-').trim_start().to_string();
+            let body = rest[end + 4..]
+                .trim_start_matches('-')
+                .trim_start()
+                .to_string();
             return (Some(frontmatter), body);
         }
     }
@@ -100,6 +108,29 @@ pub(crate) fn parse_kv(line: &str, key: &str) -> Option<String> {
         .strip_prefix(&prefix)
         .map(|v| v.trim().trim_matches('"').to_string())
         .filter(|v| !v.is_empty())
+}
+
+/// 按配置过滤技能:`enabled = false` 全关(返回空);`disabled` 按名剔除。
+/// 返回 (保留的技能, 被禁用的名字)——调用方用于日志。
+pub fn filter_skills(
+    skills: Vec<Skill>,
+    enabled: bool,
+    disabled: &[String],
+) -> (Vec<Skill>, Vec<String>) {
+    if !enabled {
+        let skipped = skills.iter().map(|s| s.name.clone()).collect();
+        return (Vec::new(), skipped);
+    }
+    let mut kept = Vec::new();
+    let mut skipped = Vec::new();
+    for skill in skills {
+        if disabled.iter().any(|name| name == &skill.name) {
+            skipped.push(skill.name);
+        } else {
+            kept.push(skill);
+        }
+    }
+    (kept, skipped)
 }
 
 /// 生成注入系统提示的技能清单段
@@ -144,7 +175,9 @@ impl SkillTool {
                 .components()
                 .any(|c| !matches!(c, std::path::Component::Normal(_)));
         if escapes {
-            return Err(format!("'{file}' must be a relative path inside the skill directory"));
+            return Err(format!(
+                "'{file}' must be a relative path inside the skill directory"
+            ));
         }
         let root = skill
             .dir
@@ -210,6 +243,8 @@ impl AgentTool for SkillTool {
                     .into_iter()
                     .flatten()
                     .flatten()
+                    // 只列文件:目录经 'file' 参数读不出来,列了只会引来失败调用
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
                     .map(|e| e.file_name().to_string_lossy().to_string())
                     .filter(|f| f != "SKILL.md" && !f.starts_with('.'))
                     .collect();
@@ -234,7 +269,11 @@ mod tests {
     fn write_skill(root: &Path, name: &str, frontmatter: &str, body: &str) {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("SKILL.md"), format!("---\n{frontmatter}---\n{body}")).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\n{frontmatter}---\n{body}"),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -264,8 +303,18 @@ mod tests {
     fn test_later_dir_overrides_same_name() {
         let a = tempfile::tempdir().unwrap();
         let b = tempfile::tempdir().unwrap();
-        write_skill(a.path(), "deploy", "name: deploy\ndescription: old\n", "old body");
-        write_skill(b.path(), "deploy", "name: deploy\ndescription: new\n", "new body");
+        write_skill(
+            a.path(),
+            "deploy",
+            "name: deploy\ndescription: old\n",
+            "old body",
+        );
+        write_skill(
+            b.path(),
+            "deploy",
+            "name: deploy\ndescription: new\n",
+            "new body",
+        );
 
         let skills = load_skills(&[a.path().to_path_buf(), b.path().to_path_buf()]);
         assert_eq!(skills.len(), 1);
@@ -291,7 +340,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
-        write_skill(dir.path(), "deploy", "name: deploy\ndescription: d\n", "Run the checklist.");
+        write_skill(
+            dir.path(),
+            "deploy",
+            "name: deploy\ndescription: d\n",
+            "Run the checklist.",
+        );
         std::fs::write(dir.path().join("deploy").join("checklist.md"), "1. test").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(
@@ -302,7 +356,10 @@ mod tests {
 
         let tool = SkillTool::new(load_skills(&[dir.path().to_path_buf()]));
 
-        let out = tool.execute(serde_json::json!({"name": "deploy"})).await.unwrap();
+        let out = tool
+            .execute(serde_json::json!({"name": "deploy"}))
+            .await
+            .unwrap();
         assert!(!out.is_error);
         assert!(out.content.contains("Run the checklist."));
         assert!(out.content.contains("checklist.md"));
@@ -323,9 +380,100 @@ mod tests {
             assert!(!out.content.contains("secret"));
         }
 
-        let out = tool.execute(serde_json::json!({"name": "nope"})).await.unwrap();
+        let out = tool
+            .execute(serde_json::json!({"name": "nope"}))
+            .await
+            .unwrap();
         assert!(out.is_error);
         assert!(out.content.contains("deploy"));
+    }
+
+    #[test]
+    fn test_same_root_duplicate_name_is_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        // 两个目录声明同一个 frontmatter name——路径字典序,后者(bar)稳定覆盖前者(foo)
+        write_skill(
+            dir.path(),
+            "foo",
+            "name: shared\ndescription: from foo\n",
+            "foo body",
+        );
+        write_skill(
+            dir.path(),
+            "bar",
+            "name: shared\ndescription: from bar\n",
+            "bar body",
+        );
+
+        for _ in 0..5 {
+            let skills = load_skills(&[dir.path().to_path_buf()]);
+            assert_eq!(skills.len(), 1, "same-name dedup");
+            assert_eq!(
+                skills[0].description, "from bar",
+                "path-sorted later entry wins"
+            );
+        }
+    }
+
+    #[test]
+    fn test_filter_skills_config() {
+        let skills = vec![
+            Skill {
+                name: "a".into(),
+                description: String::new(),
+                body: String::new(),
+                dir: PathBuf::new(),
+            },
+            Skill {
+                name: "b".into(),
+                description: String::new(),
+                body: String::new(),
+                dir: PathBuf::new(),
+            },
+        ];
+
+        // 全开
+        let (kept, skipped) = filter_skills(skills.clone(), true, &[]);
+        assert_eq!(kept.len(), 2);
+        assert!(skipped.is_empty());
+
+        // 按名禁用
+        let (kept, skipped) = filter_skills(skills.clone(), true, &["b".to_string()]);
+        assert_eq!(
+            kept.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["a"]
+        );
+        assert_eq!(skipped, vec!["b".to_string()]);
+
+        // 总开关关闭
+        let (kept, skipped) = filter_skills(skills, false, &[]);
+        assert!(kept.is_empty());
+        assert_eq!(skipped.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_skill_listing_excludes_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        write_skill(
+            dir.path(),
+            "deploy",
+            "name: deploy\ndescription: d\n",
+            "body",
+        );
+        std::fs::write(dir.path().join("deploy").join("notes.md"), "n").unwrap();
+        std::fs::create_dir(dir.path().join("deploy").join("assets")).unwrap();
+
+        let tool = SkillTool::new(load_skills(&[dir.path().to_path_buf()]));
+        let out = tool
+            .execute(serde_json::json!({"name": "deploy"}))
+            .await
+            .unwrap();
+        assert!(out.content.contains("notes.md"), "{}", out.content);
+        assert!(
+            !out.content.contains("assets"),
+            "directories must not be listed: {}",
+            out.content
+        );
     }
 
     #[test]
