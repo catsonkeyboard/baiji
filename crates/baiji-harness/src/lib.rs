@@ -20,8 +20,8 @@ pub use compaction::{CompactionPolicy, compact, compact_with_llm, estimate_token
 pub use memory::{MemoryEntry, MemoryKind, MemoryStore, MemoryTool, memory_section, project_key};
 pub use persist::{JsonlStore, Record};
 pub use session::{Session, SessionMeta, SessionTree, new_session_id};
-pub use stub::stub_tool_results;
 pub use skills::{Skill, SkillTool, load_skills};
+pub use stub::stub_tool_results;
 pub use templates::render;
 pub use templates::{PromptTemplate, load_templates};
 pub use todo::{TodoItem, TodoStatus, TodoStore, TodoTool, todo_section};
@@ -79,7 +79,26 @@ pub struct AgentHarness {
     ctx_store: Option<PathBuf>,
     /// 会话级任务清单（与 TodoTool 共享；None = 未启用 todo 工具）
     todos: Option<Arc<TodoStore>>,
+    /// usage 锚点：最近一次厂商上报的真实上下文占用 + 当时的消息数。
+    /// 压缩触发估算 = usage + 锚点后新增消息的字符估算（参考 pi 的
+    /// estimateContextTokens——不可见的系统提示/工具定义/tokenizer 差异
+    /// 全部体现在真实值里）。
+    usage_anchor: Option<UsageAnchor>,
+    /// 历史版本号：压缩/stub/切换/分叉等重写历史的操作递增，锚点据此失效
+    /// （防陈旧锚点：消息数恰好回到锚点值但内容已不同）
+    history_version: u64,
     telemetry: Arc<dyn baiji_telemetry::Telemetry>,
+}
+
+/// usage 锚点（会话内存态，不持久化——重放后首个 run 重建）
+#[derive(Debug, Clone, Copy)]
+struct UsageAnchor {
+    /// 厂商上报的 input + output token
+    tokens: usize,
+    /// 上报时的会话消息数
+    message_count: usize,
+    /// 上报时的历史版本
+    version: u64,
 }
 
 impl AgentHarness {
@@ -106,6 +125,8 @@ impl AgentHarness {
             memory: None,
             ctx_store: None,
             todos: None,
+            usage_anchor: None,
+            history_version: 0,
             telemetry: Arc::new(NoopTelemetry),
         })
     }
@@ -131,6 +152,8 @@ impl AgentHarness {
             memory: None,
             ctx_store: None,
             todos: None,
+            usage_anchor: None,
+            history_version: 0,
             telemetry: Arc::new(NoopTelemetry),
         })
     }
@@ -189,6 +212,7 @@ impl AgentHarness {
         }
         self.session = child;
         self.last_context_tokens = None; // 历史变短了，旧读数作废
+        self.invalidate_usage_anchor();
         info!(
             "branched session -> {} (rewound {turns_back} turn(s))",
             self.session.meta.id
@@ -257,6 +281,19 @@ impl AgentHarness {
         self.todos.as_ref().is_some_and(|t| t.has_open())
     }
 
+    /// 版本与消息数均吻合的有效锚点（否则 None = 用全量字符估算）
+    fn valid_usage_anchor(&self) -> Option<UsageAnchor> {
+        self.usage_anchor.filter(|a| {
+            a.version == self.history_version && a.message_count <= self.session.messages.len()
+        })
+    }
+
+    /// 历史被重写（压缩/stub/切换/分叉）后调用：锚点作废，版本递增
+    fn invalidate_usage_anchor(&mut self) {
+        self.usage_anchor = None;
+        self.history_version += 1;
+    }
+
     /// 列出存储中的全部会话（供 UI 选择器）
     pub fn list_sessions(&self) -> Result<Vec<SessionMeta>> {
         self.store.list()
@@ -265,6 +302,7 @@ impl AgentHarness {
     /// 切换到已有会话（历史从 JSONL 重放）
     pub fn switch_session(&mut self, session_id: &str) -> Result<()> {
         self.session = self.store.load(session_id)?;
+        self.invalidate_usage_anchor(); // 历史整体替换
         // 任务清单跟随切换（TodoTool 共享同一存储，随即看到新状态）
         if let Some(todos) = &self.todos {
             todos.replace(self.session.todos.clone());
@@ -359,35 +397,57 @@ impl AgentHarness {
             }
         }
 
-        // 2. 上下文压缩（超限时旧轮次折叠为摘要；会缩短消息列表，须在其后取 checkpoint）
+        // 2. 上下文压缩（超限时旧轮次折叠为摘要；会缩短消息列表，须其后取 checkpoint）
         let run_span = self.telemetry.span("harness.run", vec![]);
-        // 启发式估算之外，再看厂商上报的真实占用：真实值已超阈值则强制压缩
-        // （估算不含系统提示与工具定义，对代码/中文也常偏低）
-        let policy = match self.last_context_tokens {
-            Some(observed) if observed > self.compaction.max_estimated_tokens => {
-                info!(
-                    "observed context {observed} tokens exceeds budget {}, forcing compaction",
-                    self.compaction.max_estimated_tokens
-                );
-                CompactionPolicy {
-                    max_estimated_tokens: 0,
-                    ..self.compaction.clone()
-                }
-            }
-            _ => self.compaction.clone(),
+        // usage 锚定：锚点可用时，触发判定按「字符估算 + 偏移」进行，
+        // 其中偏移 = 真实占用 − 锚点前字符估算（系统提示/工具定义/tokenizer
+        // 差异）。预算按偏移收紧后，stub/compact 内部的循环判据自动等价于
+        // 真实占用 + 尾部估算 ≤ 预算。锚点在历史被重写后失效（版本不符）。
+        let anchored = self.valid_usage_anchor();
+        let offset = anchored
+            .and_then(|a| {
+                compaction::anchored_estimate(&self.session.messages, a.tokens, a.message_count)
+            })
+            .map(|(_, offset)| offset)
+            .unwrap_or(0);
+        let anchored_policy = CompactionPolicy {
+            max_estimated_tokens: self.compaction.max_estimated_tokens.saturating_sub(offset),
+            ..self.compaction.clone()
         };
         // 2a. 先尝试 stub 化：保留窗口外的大体积 tool result 换成 ctx 句柄引用
-        //     （可逆、零 LLM 成本）。用常规预算判断；观察值强制的摘要场景不受影响
+        //     （可逆、零 LLM 成本）；预算已含锚定偏移
         let (stubbed, stub_saved) = stub::stub_tool_results(
             &mut self.session.messages,
             self.ctx_store.as_deref(),
-            &self.compaction,
+            &anchored_policy,
         );
         if stubbed > 0 {
             info!(
                 "stubbed {stubbed} old tool result(s), ~{stub_saved} tokens saved (reversible via expand)"
             );
+            self.invalidate_usage_anchor(); // stub 改写了历史内容
         }
+        // 强制判定只信真实值：锚定总量（锚点可用时），或厂商观察值（无锚点时，
+        // 如首次 run/失效后）。纯启发式估算不触发强制（与旧行为一致）。
+        let estimated_total = compaction::estimate_tokens(&self.session.messages) + offset;
+        let force = if anchored.is_some() {
+            estimated_total > self.compaction.max_estimated_tokens
+        } else {
+            self.last_context_tokens
+                .is_some_and(|observed| observed > self.compaction.max_estimated_tokens)
+        };
+        let policy = if force {
+            info!(
+                "anchored/observed context ~{estimated_total} tokens exceeds budget {}, forcing compaction",
+                self.compaction.max_estimated_tokens
+            );
+            CompactionPolicy {
+                max_estimated_tokens: 0,
+                ..self.compaction.clone()
+            }
+        } else {
+            anchored_policy.clone()
+        };
         let compacted = if self.llm_compaction {
             compact_with_llm(
                 self.runtime.provider().as_ref(),
@@ -400,6 +460,7 @@ impl AgentHarness {
         };
         if let Some(summary) = compacted {
             self.last_context_tokens = None; // 压缩后旧读数作废
+            self.invalidate_usage_anchor();
             info!("context compacted (summary {} chars)", summary.len());
             // 压缩后 = [摘要] + 保留的最近消息（含刚写入的 user 输入，均已在文件中）
             let kept_messages = Some(self.session.messages.len().saturating_sub(1));
@@ -497,8 +558,15 @@ impl AgentHarness {
             original_tokens,
             delivered_tokens,
         ) = forward.await.unwrap_or((0, 0, 0, 0, None, 0, 0));
-        if context_tokens.is_some() {
+        if let Some(observed) = context_tokens {
             self.last_context_tokens = context_tokens;
+            // usage 锚点：消息此刻已同步完（含本次 run 的新增），真实占用代表
+            // 锚点前历史；最终答案属 output token，亦已计入
+            self.usage_anchor = Some(UsageAnchor {
+                tokens: observed,
+                message_count: self.session.messages.len(),
+                version: self.history_version,
+            });
         }
 
         // 4. 补写尚未增量落盘的新增消息（无论成败都保留进度）
@@ -567,7 +635,7 @@ mod tests {
     use anyhow::Result;
     use async_trait::async_trait;
     use baiji_agent::ToolRegistry;
-    use baiji_ai::{ChatRequest, ChatResponse, Protocol, Provider, StreamChunk};
+    use baiji_ai::{ChatRequest, ChatResponse, Protocol, Provider, StreamChunk, TokenUsage};
     use futures::StreamExt as _;
     use futures::stream::BoxStream;
 
@@ -585,6 +653,41 @@ mod tests {
         ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
             Ok(futures::stream::iter(vec![
                 Ok(StreamChunk::Content("收到：".into())),
+                Ok(StreamChunk::Done),
+            ])
+            .boxed())
+        }
+        fn protocol(&self) -> Protocol {
+            Protocol::OpenAIChat
+        }
+        fn model(&self) -> &str {
+            "mock"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    /// 上报固定 usage 的 Mock Provider（usage 锚定测试用）
+    struct UsageProvider {
+        input_tokens: u32,
+    }
+
+    #[async_trait]
+    impl Provider for UsageProvider {
+        async fn chat(&self, _: ChatRequest) -> Result<ChatResponse> {
+            unreachable!("runtime uses chat_stream")
+        }
+        async fn chat_stream(
+            &self,
+            _: ChatRequest,
+        ) -> Result<futures::stream::BoxStream<'static, Result<StreamChunk>>> {
+            Ok(futures::stream::iter(vec![
+                Ok(StreamChunk::Usage(TokenUsage {
+                    input_tokens: self.input_tokens,
+                    output_tokens: 10,
+                })),
+                Ok(StreamChunk::Content("ok".into())),
                 Ok(StreamChunk::Done),
             ])
             .boxed())
@@ -957,7 +1060,10 @@ mod tests {
 
         // 预置大历史：8 轮，每轮带 1.2KB 工具结果（约 2.6k token > 2k 预算）
         for i in 0..8 {
-            harness.session.messages.push(Message::user(format!("question {i}")));
+            harness
+                .session
+                .messages
+                .push(Message::user(format!("question {i}")));
             harness
                 .session
                 .messages
@@ -991,9 +1097,7 @@ mod tests {
             .flat_map(|rs| rs.into_iter().map(|r| r.content))
             .collect();
         assert!(
-            contents
-                .iter()
-                .any(|c| c.starts_with(stub::STUB_PREFIX)),
+            contents.iter().any(|c| c.starts_with(stub::STUB_PREFIX)),
             "expected stubbed results"
         );
         assert_eq!(contents.last().unwrap(), &"x".repeat(1200));
@@ -1002,6 +1106,101 @@ mod tests {
         let file = store_dir.join(format!("{}.jsonl", harness.session().meta.id));
         let jsonl = std::fs::read_to_string(&file).unwrap();
         assert!(!jsonl.contains("\"summary\""), "{jsonl}");
+    }
+
+    // ===== usage 锚定（T2）=====
+
+    #[tokio::test]
+    async fn test_usage_anchor_drives_compaction_and_invalidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("sessions");
+
+        // 第一次 run：上报巨大 usage（99_999），而历史的字符估算很小
+        let runtime = Arc::new(AgentRuntime::new(Arc::new(UsageProvider {
+            input_tokens: 99_999,
+        })));
+        let mut harness = AgentHarness::new(runtime, store_dir.clone()).unwrap();
+        harness.set_compaction_policy(CompactionPolicy {
+            max_estimated_tokens: 48_000,
+            keep_recent_turns: 1,
+        });
+        for (q, a) in [("q1", "a1"), ("q2", "a2")] {
+            harness.session.messages.push(Message::user(q));
+            harness.session.messages.push(Message::assistant(a));
+        }
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        harness
+            .run("go", &tx, &CancellationToken::new(), &SteeringQueue::new())
+            .await
+            .unwrap();
+
+        // 锚点已记录：消息数 = 4 预置 + "go" + 答案 = 6，版本 0
+        let anchor = harness.usage_anchor.expect("anchor recorded after usage");
+        assert_eq!(anchor.message_count, 6);
+        assert_eq!(anchor.tokens, 99_999 + 10);
+
+        // 第二次 run 换 EchoProvider（不再上报 usage）：锚定总量 ≈ 100k > 48k
+        // → 必须强制压缩——纯启发式估算远低于预算，旧行为不会压缩
+        harness.runtime.swap_provider(Arc::new(EchoProvider));
+        harness
+            .run(
+                "again",
+                &tx,
+                &CancellationToken::new(),
+                &SteeringQueue::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            harness
+                .session
+                .messages
+                .iter()
+                .any(|m| m.content.contains("[Conversation Summary]")),
+            "anchored estimate must trigger compaction despite small heuristic"
+        );
+        // 压缩使锚点失效，且本次 run 无新 usage → 保持失效
+        assert!(harness.usage_anchor.is_none());
+        assert_eq!(harness.history_version, 1);
+    }
+
+    #[tokio::test]
+    async fn test_usage_anchor_invalidated_by_session_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("sessions");
+
+        let runtime = Arc::new(AgentRuntime::new(Arc::new(UsageProvider {
+            input_tokens: 500,
+        })));
+        let mut harness = AgentHarness::new(runtime.clone(), store_dir.clone()).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        harness
+            .run("go", &tx, &CancellationToken::new(), &SteeringQueue::new())
+            .await
+            .unwrap();
+        assert!(harness.usage_anchor.is_some());
+        let first_id = harness.session().meta.id.clone();
+
+        // 同库另建一个会话并切换：锚点失效（历史整体替换）
+        let mut other = AgentHarness::new(runtime, store_dir.clone()).unwrap();
+        let other_id = other.session().meta.id.clone();
+        drop(other);
+        harness.switch_session(&other_id).unwrap();
+        assert!(harness.usage_anchor.is_none());
+        assert_eq!(harness.history_version, 1);
+
+        // 切回原会话：可重新建立锚点
+        harness.switch_session(&first_id).unwrap();
+        harness
+            .run(
+                "back",
+                &tx,
+                &CancellationToken::new(),
+                &SteeringQueue::new(),
+            )
+            .await
+            .unwrap();
+        assert!(harness.usage_anchor.is_some());
     }
 
     // ===== 任务清单（todo）=====
@@ -1019,7 +1218,14 @@ mod tests {
         assert!(!harness.has_open_todos());
 
         todos.add("step one".into());
-        todos.update(1, Some(TodoStatus::InProgress), None, Some(Some("wip".into()))).unwrap();
+        todos
+            .update(
+                1,
+                Some(TodoStatus::InProgress),
+                None,
+                Some(Some("wip".into())),
+            )
+            .unwrap();
         todos.add("step two".into());
         assert!(harness.has_open_todos());
 
@@ -1035,7 +1241,8 @@ mod tests {
 
         // resume：新 harness + 新存储，清单从重放恢复
         let runtime2 = Arc::new(AgentRuntime::new(Arc::new(EchoProvider)));
-        let mut restored = AgentHarness::load(runtime2, store_dir, &harness.session().meta.id).unwrap();
+        let mut restored =
+            AgentHarness::load(runtime2, store_dir, &harness.session().meta.id).unwrap();
         let fresh = Arc::new(TodoStore::new());
         restored.set_todos(fresh.clone());
         let items = fresh.items();
@@ -1071,11 +1278,13 @@ mod tests {
             todos.add(format!("step {i}"));
         }
         for i in 0..10 {
-            harness.session.messages.push(Message::user(format!("question {i}")));
             harness
                 .session
                 .messages
-                .push(Message::assistant(format!("answer {i} with padding to grow context")));
+                .push(Message::user(format!("question {i}")));
+            harness.session.messages.push(Message::assistant(format!(
+                "answer {i} with padding to grow context"
+            )));
         }
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();

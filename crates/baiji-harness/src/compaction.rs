@@ -71,6 +71,24 @@ pub fn estimate_tokens(messages: &[Message]) -> usize {
         .sum()
 }
 
+/// usage 锚定估算（参考 pi 的 estimateContextTokens）：锚点前的历史以厂商
+/// 上报的真实占用为准，其后新增消息用字符估算补足——系统提示、工具定义、
+/// tokenizer 差异全部体现在真实值里。返回 `(总量, 偏移)`；偏移 =
+/// usage − 锚点前字符估算，可把各决策函数的预算收紧为
+/// `预算 − 偏移`（估算+偏移 ≤ 预算 ⇔ 真实+尾部估算 ≤ 预算）。
+/// 锚点越过消息尾部（历史被压缩缩短）返回 None = 陈旧，须回退全量估算。
+pub fn anchored_estimate(
+    messages: &[Message],
+    usage_tokens: usize,
+    anchor_len: usize,
+) -> Option<(usize, usize)> {
+    if anchor_len > messages.len() {
+        return None;
+    }
+    let offset = usage_tokens.saturating_sub(estimate_tokens(&messages[..anchor_len]));
+    Some((estimate_tokens(messages) + offset, offset))
+}
+
 /// 压缩消息列表。超限时把旧轮次折叠为摘要并替换原列表，
 /// 返回 Some(摘要文本)；未触发返回 None。
 pub fn compact(messages: &mut Vec<Message>, policy: &CompactionPolicy) -> Option<String> {
@@ -349,6 +367,38 @@ mod tests {
             )));
         }
         msgs
+    }
+
+    #[test]
+    fn test_anchored_estimate() {
+        let messages: Vec<Message> = (0..6)
+            .flat_map(|i| {
+                [
+                    Message::user(format!("question {i} with padding")),
+                    Message::assistant(format!("answer {i} with padding")),
+                ]
+            })
+            .collect();
+        let whole = estimate_tokens(&messages);
+        let prefix = estimate_tokens(&messages[..4]);
+
+        // 锚点在中间：总量 = 全量估算 + (usage − 前缀估算)
+        let (total, offset) = anchored_estimate(&messages, prefix + 500, 4).unwrap();
+        assert_eq!(offset, 500);
+        assert_eq!(total, whole + 500);
+
+        // 锚点在末尾（无新增）：总量 = usage，偏移 = usage − 全量估算
+        let (total, offset) = anchored_estimate(&messages, whole, messages.len()).unwrap();
+        assert_eq!(total, whole);
+        assert_eq!(offset, 0);
+
+        // usage 低于字符估算（启发式高估）：偏移饱和为 0，退回全量估算
+        let (total, offset) = anchored_estimate(&messages, 1, 4).unwrap();
+        assert_eq!(offset, 0);
+        assert_eq!(total, whole);
+
+        // 锚点越界（历史被压缩缩短）：None = 陈旧
+        assert!(anchored_estimate(&messages, 100, messages.len() + 1).is_none());
     }
 
     #[test]
