@@ -19,11 +19,19 @@ use std::sync::Arc;
 
 /// 注册全部内置工具（共享同一个执行环境）
 pub fn builtin_tools(env: ExecutionEnv) -> Vec<Arc<dyn AgentTool>> {
+    builtin_tools_with_jobs(env).0
+}
+
+/// 同 [`builtin_tools`]，并返回共享的后台任务注册表
+/// （TUI 的 /tasks、/kill 用它查看与停止后台任务）
+pub fn builtin_tools_with_jobs(
+    env: ExecutionEnv,
+) -> (Vec<Arc<dyn AgentTool>>, Arc<tools::jobs::JobRegistry>) {
     let env = Arc::new(env);
     // 后台任务注册表：bash(生产) 与 jobs(消费) 共享；
     // Drop 时击杀全部仍在运行的任务（进程退出不留孤儿）
     let job_registry = Arc::new(tools::jobs::JobRegistry::new());
-    vec![
+    let tools: Vec<Arc<dyn AgentTool>> = vec![
         Arc::new(tools::ReadTool::new(env.clone())),
         Arc::new(tools::WriteTool::new(env.clone())),
         Arc::new(tools::EditTool::new(env.clone())),
@@ -31,12 +39,13 @@ pub fn builtin_tools(env: ExecutionEnv) -> Vec<Arc<dyn AgentTool>> {
             env.clone(),
             job_registry.clone(),
         )),
-        Arc::new(tools::JobsTool::new(env.clone(), job_registry)),
+        Arc::new(tools::JobsTool::new(env.clone(), job_registry.clone())),
         Arc::new(tools::GrepTool::new(env.clone())),
         Arc::new(tools::FindTool::new(env.clone())),
         Arc::new(tools::LsTool::new(env.clone())),
         Arc::new(tools::SearchTool::new(env.clone())),
         Arc::new(tools::ImportsTool::new(env.clone())),
         Arc::new(tools::ExpandTool::new(env)),
-    ]
+    ];
+    (tools, job_registry)
 }

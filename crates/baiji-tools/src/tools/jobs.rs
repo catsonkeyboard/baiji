@@ -29,7 +29,8 @@ pub enum JobState {
 }
 
 impl JobState {
-    fn label(&self) -> String {
+    /// 展示标签（TUI /tasks 列表用）
+    pub fn label(&self) -> String {
         match self {
             Self::Running => "RUNNING".to_string(),
             Self::Finished(Some(code)) => format!("EXIT {code}"),

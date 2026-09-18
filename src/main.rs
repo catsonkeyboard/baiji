@@ -143,7 +143,9 @@ async fn main() -> Result<()> {
     }
 
     let mut tools = ToolRegistry::new();
-    for tool in baiji_tools::builtin_tools(env) {
+    // 注册表同 bash(生产)/jobs(消费) 共享，TUI 的 /tasks、/kill 也用它
+    let (builtin, job_registry) = baiji_tools::builtin_tools_with_jobs(env);
+    for tool in builtin {
         tools.register(tool);
     }
 
@@ -477,6 +479,7 @@ async fn main() -> Result<()> {
         tui_settings,
         settings_summary,
         auto_continue,
+        Some(job_registry),
     )
     .await
     {

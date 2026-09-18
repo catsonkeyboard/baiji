@@ -51,7 +51,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 /// 默认 coding-agent 系统提示
 pub const DEFAULT_PROMPT: &str = "\
@@ -347,6 +347,70 @@ impl AgentHarness {
         }
         info!("switched to session {session_id}");
         Ok(())
+    }
+
+    /// 开新会话（同一项目、同一 provider/配置）；当前会话完整保留在磁盘。
+    /// 返回新会话 id
+    pub fn start_new_session(&mut self) -> Result<String> {
+        let mut session = Session::new(None);
+        session.meta.project = self.session.meta.project.clone();
+        let id = session.meta.id.clone();
+        self.store.append(
+            &id,
+            &Record::Started {
+                meta: session.meta.clone(),
+            },
+        )?;
+        self.session = session;
+        self.last_context_tokens = None;
+        self.invalidate_usage_anchor();
+        if let Some(todos) = &self.todos {
+            todos.replace(Vec::new());
+        }
+        info!("started new session {id}");
+        Ok(id)
+    }
+
+    /// 手动压缩当前会话上下文（/compact）：强制执行两级收缩（可逆 stub 化 +
+    /// 摘要压缩）并落盘 Summary 记录。返回 (stub 条数, 摘要)——历史不足时摘要为 None
+    pub async fn compact_now(&mut self) -> (usize, Option<String>) {
+        let policy = CompactionPolicy {
+            max_estimated_tokens: 0, // 强制：等同 run() 中超预算的强制压缩
+            ..self.compaction.clone()
+        };
+        let (stubbed, _) = stub::stub_tool_results(
+            &mut self.session.messages,
+            self.ctx_store.as_deref(),
+            &policy,
+        );
+        if stubbed > 0 {
+            self.invalidate_usage_anchor();
+        }
+        let compacted = if self.llm_compaction {
+            compact_with_llm(
+                self.runtime.provider().as_ref(),
+                &mut self.session.messages,
+                &policy,
+            )
+            .await
+        } else {
+            compact(&mut self.session.messages, &policy)
+        };
+        if let Some(summary) = &compacted {
+            self.last_context_tokens = None;
+            self.invalidate_usage_anchor();
+            let kept_messages = Some(self.session.messages.len().saturating_sub(1));
+            if let Err(e) = self.store.append(
+                &self.session.meta.id,
+                &Record::Summary {
+                    content: summary.clone(),
+                    kept_messages,
+                },
+            ) {
+                warn!("persist compaction summary failed: {e}");
+            }
+        }
+        (stubbed, compacted)
     }
 
     pub fn set_telemetry(&mut self, telemetry: Arc<dyn baiji_telemetry::Telemetry>) {
@@ -1515,5 +1579,79 @@ mod tests {
             .map(|m| m.content.as_str())
             .collect();
         assert!(!roles.iter().any(|c| c.contains("ledger")));
+    }
+
+    #[tokio::test]
+    async fn test_compact_now_forces_reduction_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("sessions");
+        let runtime = Arc::new(AgentRuntime::new(Arc::new(EchoProvider)));
+        let mut harness = AgentHarness::new(runtime, store_dir.clone()).unwrap();
+        // 只保留最近 2 轮：4 轮后必有可压缩内容
+        harness.set_compaction_policy(CompactionPolicy {
+            max_estimated_tokens: 48_000,
+            keep_recent_turns: 2,
+        });
+
+        let old_id = harness.session().meta.id.clone();
+        for i in 0..4 {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            harness
+                .run(&format!("q{i}"), &tx, &CancellationToken::new(), &SteeringQueue::new())
+                .await
+                .unwrap();
+        }
+        assert!(harness.session().messages.len() >= 8);
+
+        let (stubbed, summary) = harness.compact_now().await;
+        assert_eq!(stubbed, 0, "no ctx store: nothing to stub");
+        assert!(summary.is_some(), "history beyond keep window must compact");
+        // 老轮次折叠成首条 System 摘要，消息数显著减少
+        assert_eq!(harness.session().messages[0].role, baiji_ai::Role::System);
+        assert!(harness.session().messages.len() < 8);
+
+        // 落盘可重放：重载后首条同样是摘要
+        let loaded = JsonlStore::new(store_dir).load(&old_id).unwrap();
+        assert!(loaded.messages[0].content.starts_with("[Conversation Summary]"));
+    }
+
+    #[tokio::test]
+    async fn test_start_new_session_resets_and_keeps_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("sessions");
+        let runtime = Arc::new(AgentRuntime::new(Arc::new(EchoProvider)));
+        let mut harness =
+            AgentHarness::new_with_project(runtime, store_dir.clone(), Some("proj-xx".to_string()))
+                .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        harness
+            .run("q1", &tx, &CancellationToken::new(), &SteeringQueue::new())
+            .await
+            .unwrap();
+        assert_eq!(harness.session().messages.len(), 2);
+
+        let old_id = harness.session().meta.id.clone();
+        let todos = Arc::new(TodoStore::new());
+        todos.replace(vec![TodoItem {
+            id: 1,
+            content: "遗留任务".to_string(),
+            status: TodoStatus::Pending,
+            note: None,
+        }]);
+        harness.set_todos(todos.clone());
+
+        let new_id = harness.start_new_session().unwrap();
+        assert_ne!(new_id, old_id);
+        assert!(harness.session().messages.is_empty());
+        assert_eq!(
+            harness.session().meta.project.as_deref(),
+            Some("proj-xx"),
+            "project carried over to the new session"
+        );
+        assert!(todos.items().is_empty(), "shared todo store cleared");
+
+        // 旧会话在磁盘上完好
+        let old = JsonlStore::new(store_dir).load(&old_id).unwrap();
+        assert_eq!(old.messages.len(), 2);
     }
 }

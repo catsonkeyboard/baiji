@@ -27,6 +27,7 @@ pub use theme::Theme;
 /// - `confirm_rx`：HITL 确认请求通道（无确认需求时传 None）
 /// - `config_path`：配置文件路径（/config 向导写回）
 /// - `settings`：当前生效设置镜像（/model、向导、状态栏使用）
+/// - `jobs`：后台任务注册表（/tasks、/kill；未启用时传 None）
 pub async fn run(
     harness: Arc<tokio::sync::Mutex<AgentHarness>>,
     theme: Theme,
@@ -35,6 +36,7 @@ pub async fn run(
     settings: RuntimeSettings,
     settings_summary: String,
     auto_continue: AutoContinueConfig,
+    jobs: Option<Arc<baiji_tools::tools::jobs::JobRegistry>>,
 ) -> Result<()> {
     app::App::new(
         harness,
@@ -44,6 +46,7 @@ pub async fn run(
         settings,
         settings_summary,
         auto_continue,
+        jobs,
     )
     .run()
     .await
