@@ -7,7 +7,7 @@ A terminal AI coding agent built on a multi-crate Rust workspace: async streamin
 ```bash
 cargo build                # Build the whole workspace
 cargo run                  # Run the TUI app (default)
-cargo test --workspace     # Run all tests (291 total)
+cargo test --workspace     # Run all tests (297 total)
 baiji -e "msg" --yes      # Headless one-shot run (streams to stdout)
 baiji --sessions          # List sessions (no API key needed)
 cargo test -p baiji-agent  # Test a single crate
@@ -79,7 +79,7 @@ Dependency direction: telemetry ← ai ← agent ← tools ← harness ← {tui,
 - `policy.require_confirmation_tools` (HITL): listed tools prompt a y/a/n confirmation dialog before executing; `a` (AllowAll) suppresses re-prompts for that tool for the rest of the run. Empty list = auto-approve everything.
 - `llm_compaction: true` switches context compaction to provider-generated summaries (falls back to the deterministic summary on API error).
 - `max_turns` caps LLM turns per run (default 24).
-- `compaction`: `enabled: false` disables both context-reduction tiers (tool-result stubbing + summary; the in-run anti-overflow trim stays); `max_estimated_tokens` overrides the window-derived budget (70% of the context window minus the output reserve, floor 16k); `keep_recent_turns` (default 6) is the intact-turn window.
+- `compaction`: `enabled: false` disables both context-reduction tiers (tool-result stubbing + summary; the in-run anti-overflow trim stays); `max_estimated_tokens` overrides the window-derived budget (70% of the context window minus the output reserve, floor 16k); `keep_recent_turns` (default 6) is the intact-turn window. The in-run anti-overflow trim (`elide_old_tool_results`, triggered at 85% of the window) is reversible too when a spill closure is injected: elided content goes to the ctx store with a `ctx:<handle>` marker (main.rs wires `baiji_tools::spill_to_store` via `AgentRuntime::with_spill` — a closure, because a direct agent→tools dependency would cycle).
 - `retry`: transient-error retries with exponential backoff (`base_delay_ms × 2^attempt`, capped at `max_delay_ms`; server `Retry-After` honored but also capped). Defaults 2 / 500ms / 30s.
 - `ui.theme`: `"dark"` (default) or `"light"` palettes.
 - MCP: place a `mcporter.json` in the project root; tools are discovered via `npx -y mcporter` at startup (requires Node). Tool names use `server.tool`.
@@ -122,7 +122,7 @@ run()
   ├─ loop (≤ max_turns, default 24):
   │    ├─ chat_stream with retry (transient: rate/timeout/5xx; backoff 500ms×2^n, ≤2 retries)
   │    ├─ accumulate Content→text, ToolCallStart/Arguments→tool calls
-  │    ├─ no tool calls → final answer, break
+  │    ├─ no tool calls → final answer, break (a `max_tokens`-truncated answer carries a visible continuation marker)
   │    └─ tool calls → per tool: hooks.on_tool_call (Deny→error result)
   │         → ConfirmationGate (HITL: Deny→error result, AllowAll remembered per run)
   │         → tool.execute → hooks.on_tool_result → events → telemetry span
@@ -140,7 +140,7 @@ run()
 ### Harness (`baiji-harness`)
 
 - `AgentHarness::run`: persist user message → **stub old tool results** (if over budget) → compact (if still over budget) → `AgentRuntime::run` → persist new messages. Checkpoint is taken **after** compaction (compaction shrinks the list).
-- Two-tier context reduction over one budget (`max_estimated_tokens`): **tier 1, reversible tool-result stubbing** (`stub.rs`, runs first when the ctx store is configured via `set_ctx_store`): tool results ≥512B outside the `keep_recent_turns` window are replaced oldest-turn-first with a `[ctx stub: … ctx:<handle>]` marker (original spilled via `baiji_tools::spill_to_store`, recoverable with `expand`); stops as soon as the estimate fits, in-memory view only — the JSONL keeps raw originals and each run re-derives (content-addressed spill is idempotent); `branch` forks inherit the current in-memory (possibly stubbed) view. **tier 2, summary compaction**: token estimate (ASCII ~0.25/char, CJK ~0.5/char, +4/message); keeps the last 6 turns intact, older turns folded into a summary. Default budget 48k tokens. `compact_with_llm` (opt-in via `llm_compaction: true`) asks the provider to summarize and falls back to the deterministic summary on error/empty.
+- Two-tier context reduction over one budget (`max_estimated_tokens`): **tier 1, reversible tool-result stubbing** (`stub.rs`, runs first when the ctx store is configured via `set_ctx_store`): tool results ≥512B outside the `keep_recent_turns` window are replaced oldest-turn-first with a `[ctx stub: … ctx:<handle>]` marker (original spilled via `baiji_tools::spill_to_store`, recoverable with `expand`); stops as soon as the estimate fits, in-memory view only — the JSONL keeps raw originals and each run re-derives (content-addressed spill is idempotent); `branch` forks inherit the current in-memory (possibly stubbed) view. **tier 2, summary compaction**: token estimate (ASCII ~0.25/char, CJK ~0.5/char, +4/message); keeps the last 6 turns intact, older turns folded into a summary that carries `Files read:` / `Files modified:` tail lines (tool-call path extraction, capped at 30 per kind, merged forward across compactions; bash paths are not parsed). Default budget 48k tokens. `compact_with_llm` (opt-in via `llm_compaction: true`) asks the provider to summarize and falls back to the deterministic summary on error/empty.
 - Sessions: `~/.baiji/sessions/<id>.jsonl`, append-only records `Started/Message/Summary`; `load`/`switch_session` replays (Summary → injected as `[Conversation Summary]` System message; history stays raw and self-heals via the next compaction). `branch()` forks a session (parent link, history copied). `list_sessions()` returns all metas for the UI picker.
 - Skills: `load_skills([dirs])` scans `*/SKILL.md` with `name:`/`description:` frontmatter; project `./.baiji/skills` overrides user `~/.baiji/skills`; rendered into the system prompt.
 - Templates: `render("... {{var}} ...", &vars)`.

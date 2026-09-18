@@ -101,7 +101,7 @@ pi 的 `estimateContextTokens`（`packages/agent/src/harness/compaction/compacti
 
 ---
 
-## T3 · 压缩摘要保留文件操作清单【P1】
+## T3 · 压缩摘要保留文件操作清单【P1 · ✅ 已完成 2026-09-18】
 
 ### 动机
 压缩后模型不知道"读过/改过哪些文件"，恢复定位靠猜。pi 的 compaction 用
@@ -162,7 +162,7 @@ pi 的 `estimateContextTokens`（`packages/agent/src/harness/compaction/compacti
 
 ---
 
-## T5 · 截断的最终答案明示【P1】
+## T5 · 截断的最终答案明示【P1 · ✅ 已完成 2026-09-18】
 
 ### 动机
 `stop == MaxTokens` 且无工具调用时，截断文本被当作最终答案返回，只有 warn 日志，
@@ -186,7 +186,7 @@ pi 的 `estimateContextTokens`（`packages/agent/src/harness/compaction/compacti
 
 ---
 
-## T6 · 运行中 elide 复用可逆 stub【P2】
+## T6 · 运行中 elide 复用可逆 stub【P2 · ✅ 已完成 2026-09-18（实现修正：闭包注入替代 agent→tools 依赖，避免依赖环）】
 
 ### 动机
 `elide_old_tool_results`（runtime.rs，85% 窗口紧急路径）把旧工具结果替换为**不可逆**的
