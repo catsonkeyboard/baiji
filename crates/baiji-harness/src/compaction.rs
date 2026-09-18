@@ -126,7 +126,7 @@ pub async fn compact_with_llm(
 const SUMMARIZE_PROMPT: &str = "\
 Summarize the following conversation turns for an AI coding agent's memory. \
 Preserve: user goals, decisions made, files/paths touched, tool actions taken, and unresolved questions. \
-Be concise (under 300 words), use bullet points, write in the conversation's language.";
+Carry over the 'Files read:' / 'Files modified:' lines from the earlier summary, extended with this round's files. Be concise (under 300 words), use bullet points, write in the conversation's language.";
 
 /// 触发判定 + 切分：返回需要压缩的旧轮次（None = 不触发）
 fn split_for_compaction(
@@ -192,41 +192,128 @@ fn previous_summary(message: &Message) -> Option<&str> {
         .flatten()
 }
 
-/// 确定性摘要：每轮的 user 问题 + assistant 首句与工具概要。
-/// 上一次压缩的摘要原样带入（否则二次压缩会丢掉更早的全部历史）。
+/// 摘要尾部的文件清单行前缀（我们的固定格式，跨压缩解析续传）
+const FILES_READ_PREFIX: &str = "Files read: ";
+const FILES_MODIFIED_PREFIX: &str = "Files modified: ";
+/// 单类文件清单上限（超出折叠计数）
+const MAX_FILES_PER_KIND: usize = 30;
+
+/// 确定性摘要：每轮的 user 问题 + assistant 首句与工具概要 +
+/// 文件操作清单尾节（resume 后模型能立刻知道动过哪些文件）。
+/// 上一次压缩的摘要正文原样带入，其文件清单拆出与本次合并（否则二次压缩会丢掉更早的历史）。
 fn summarize_turns(turns: &[Vec<Message>]) -> String {
-    turns
-        .iter()
-        .enumerate()
-        .map(|(i, turn)| {
-            if let Some(prev) = turn.first().and_then(previous_summary) {
-                return prev.to_string();
+    let mut lines: Vec<String> = Vec::new();
+    let mut files_read: Vec<String> = Vec::new();
+    let mut files_modified: Vec<String> = Vec::new();
+
+    for (i, turn) in turns.iter().enumerate() {
+        if let Some(prev) = turn.first().and_then(previous_summary) {
+            let (body, prev_read, prev_modified) = split_file_tail(prev);
+            merge_unique(&mut files_read, prev_read);
+            merge_unique(&mut files_modified, prev_modified);
+            lines.push(body);
+            continue;
+        }
+        // 收集本轮工具调用涉及的文件（bash 不解析：路径噪声大）
+        for message in turn {
+            for call in message.tool_calls.iter().flatten() {
+                let Some(path) = call.arguments["path"].as_str() else {
+                    continue;
+                };
+                let bucket = match call.name.as_str() {
+                    "write" | "edit" => &mut files_modified,
+                    "read" | "grep" | "find" | "ls" | "search" | "imports" => &mut files_read,
+                    _ => continue,
+                };
+                merge_unique(bucket, [path.to_string()]);
             }
-            let user = turn
-                .iter()
-                .find(|m| m.role == Role::User)
-                .map(|m| truncate_chars(&m.content, 80))
-                .unwrap_or_default();
+        }
+        let user = turn
+            .iter()
+            .find(|m| m.role == Role::User)
+            .map(|m| truncate_chars(&m.content, 80))
+            .unwrap_or_default();
 
-            let assistant = turn
-                .iter()
-                .find(|m| m.role == Role::Assistant)
-                .map(|m| {
-                    let first_line = truncate_chars(m.content.lines().next().unwrap_or(""), 100);
-                    match &m.tool_calls {
-                        Some(calls) if !calls.is_empty() => {
-                            let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
-                            format!("{first_line} [used tools: {}]", names.join(", "))
-                        }
-                        _ => first_line,
+        let assistant = turn
+            .iter()
+            .find(|m| m.role == Role::Assistant)
+            .map(|m| {
+                let first_line = truncate_chars(m.content.lines().next().unwrap_or(""), 100);
+                match &m.tool_calls {
+                    Some(calls) if !calls.is_empty() => {
+                        let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+                        format!("{first_line} [used tools: {}]", names.join(", "))
                     }
-                })
-                .unwrap_or_else(|| "(no response)".to_string());
+                    _ => first_line,
+                }
+            })
+            .unwrap_or_else(|| "(no response)".to_string());
 
-            format!("Turn {}: user asked \"{user}\" -> {assistant}", i + 1)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+        lines.push(format!(
+            "Turn {}: user asked \"{user}\" -> {assistant}",
+            i + 1
+        ));
+    }
+
+    if !files_read.is_empty() {
+        lines.push(format!("{FILES_READ_PREFIX}{}", render_files(&files_read)));
+    }
+    if !files_modified.is_empty() {
+        lines.push(format!(
+            "{FILES_MODIFIED_PREFIX}{}",
+            render_files(&files_modified)
+        ));
+    }
+    lines.join("\n")
+}
+
+/// 把上一次摘要拆成（正文, 读文件清单, 改文件清单）。
+/// 清单行在任何位置都识别（我们的固定格式，幂等）。
+fn split_file_tail(summary: &str) -> (String, Vec<String>, Vec<String>) {
+    let mut read = Vec::new();
+    let mut modified = Vec::new();
+    let mut body: Vec<&str> = Vec::new();
+    for line in summary.lines() {
+        if let Some(rest) = line.strip_prefix(FILES_READ_PREFIX) {
+            read.extend(split_file_list(rest));
+        } else if let Some(rest) = line.strip_prefix(FILES_MODIFIED_PREFIX) {
+            modified.extend(split_file_list(rest));
+        } else {
+            body.push(line);
+        }
+    }
+    while body.last().is_some_and(|l| l.trim().is_empty()) {
+        body.pop();
+    }
+    (body.join("\n"), read, modified)
+}
+
+fn split_file_list(list: &str) -> Vec<String> {
+    list.split(", ")
+        .map(|f| f.trim().trim_start_matches("… +"))
+        .filter(|f| !f.is_empty() && !f.ends_with(" more"))
+        .map(str::to_string)
+        .collect()
+}
+
+fn merge_unique(dst: &mut Vec<String>, src: impl IntoIterator<Item = String>) {
+    for item in src {
+        if !dst.contains(&item) {
+            dst.push(item);
+        }
+    }
+}
+
+fn render_files(files: &[String]) -> String {
+    if files.len() <= MAX_FILES_PER_KIND {
+        files.join(", ")
+    } else {
+        format!(
+            "{}, … +{} more",
+            files[..MAX_FILES_PER_KIND].join(", "),
+            files.len() - MAX_FILES_PER_KIND
+        )
+    }
 }
 
 /// 按字符数截断（避免 panic 于多字节边界）
@@ -363,6 +450,126 @@ mod tests {
             CompactionPolicy::for_context(8_000, 8_000).max_estimated_tokens,
             16_000
         );
+    }
+
+    /// 构造一轮带工具调用的消息（assistant 携带 tool_calls，tool 角色带结果）
+    fn tool_turn(user: &str, calls: &[(&str, &str)]) -> Vec<Message> {
+        let mut turn = vec![Message::user(user)];
+        turn.push(Message {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: Some(
+                calls
+                    .iter()
+                    .map(|(name, path)| baiji_ai::ToolCall {
+                        id: format!("t-{name}-{path}"),
+                        name: name.to_string(),
+                        arguments: serde_json::json!({ "path": path }),
+                    })
+                    .collect(),
+            ),
+            tool_results: None,
+            reasoning: None,
+        });
+        turn.push(Message {
+            role: Role::Tool,
+            content: String::new(),
+            tool_calls: None,
+            tool_results: Some(
+                calls
+                    .iter()
+                    .map(|(name, path)| baiji_ai::ToolResult {
+                        tool_call_id: format!("t-{name}-{path}"),
+                        content: "ok".into(),
+                    })
+                    .collect(),
+            ),
+            reasoning: None,
+        });
+        turn
+    }
+
+    #[test]
+    fn test_summary_includes_file_operations() {
+        let policy = CompactionPolicy {
+            max_estimated_tokens: 10,
+            keep_recent_turns: 1,
+        };
+        let mut msgs: Vec<Message> = vec![];
+        for turn in [
+            tool_turn(
+                "读一下结构",
+                &[("read", "src/main.rs"), ("grep", "src/lib")],
+            ),
+            tool_turn(
+                "改一下",
+                &[("edit", "src/main.rs"), ("write", "docs/new.md")],
+            ),
+            tool_turn("再看看", &[("bash", "ignored.rs")]),
+        ] {
+            msgs.extend(turn);
+        }
+        msgs.push(Message::user("final"));
+        msgs.push(Message::assistant("done"));
+
+        let summary = compact(&mut msgs, &policy).expect("should compact");
+        // 读/改清单各归其位；bash 不解析；去重
+        assert!(
+            summary.contains("Files read: src/main.rs, src/lib"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("Files modified: src/main.rs, docs/new.md"),
+            "{summary}"
+        );
+        assert!(!summary.contains("ignored.rs"), "{summary}");
+    }
+
+    #[test]
+    fn test_file_lists_merge_across_compactions() {
+        let policy = CompactionPolicy {
+            max_estimated_tokens: 10,
+            keep_recent_turns: 1,
+        };
+        let mut msgs: Vec<Message> = tool_turn("first", &[("read", "a.rs")])
+            .into_iter()
+            .collect::<Vec<_>>();
+        // 顶满轮次让首轮可折叠
+        msgs.push(Message::user("pad"));
+        msgs.push(Message::assistant("pad"));
+        let first = compact(&mut msgs, &policy).expect("first compaction");
+        assert!(first.contains("Files read: a.rs"), "{first}");
+
+        // 新增一轮读了 b.rs，再次压缩：旧清单保留且合并新文件，不重复出现两行
+        msgs.extend(tool_turn("second", &[("read", "b.rs")]));
+        msgs.push(Message::user("pad2"));
+        msgs.push(Message::assistant("pad2"));
+        let second = compact(&mut msgs, &policy).expect("second compaction");
+        assert!(second.contains("a.rs"), "{second}");
+        assert!(second.contains("b.rs"), "{second}");
+        assert_eq!(second.matches("Files read:").count(), 1, "{second}");
+    }
+
+    #[test]
+    fn test_file_list_cap_folds_with_count() {
+        let turns: Vec<Vec<Message>> = (0..40)
+            .map(|i| tool_turn("q", &[("read", &format!("src/file{i:02}.rs"))]))
+            .collect();
+        let summary = summarize_turns(&turns);
+        assert!(summary.contains("… +10 more"), "{summary}");
+        assert!(summary.contains("src/file00.rs"), "{summary}");
+        assert!(summary.contains("src/file29.rs"), "{summary}");
+        assert!(!summary.contains("src/file30.rs"), "{summary}");
+    }
+
+    #[test]
+    fn test_summary_without_files_has_no_file_lines() {
+        let summary = summarize_turns(&[make_one_turn_no_tools()]);
+        assert!(!summary.contains("Files read:"), "{summary}");
+        // 占位实现：单轮无工具
+        fn make_one_turn_no_tools() -> Vec<Message> {
+            vec![Message::user("q"), Message::assistant("a")]
+        }
     }
 
     #[test]
