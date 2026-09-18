@@ -276,6 +276,14 @@ async fn main() -> Result<()> {
         info!("verbosity steer enabled (constant conciseness suffix on the last user turn)");
         runtime_builder = runtime_builder.with_verbosity_steer(true);
     }
+    // 运行中精简旧工具结果时的可逆 spill（与 expand 共用 ctx store；
+    // 闭包注入避免 agent → tools 的依赖环）
+    let ctx_store_dir = baiji_dir.join("ctx-store");
+    runtime_builder = runtime_builder.with_spill({
+        let dir = ctx_store_dir.clone();
+        Arc::new(move |content: &str| baiji_tools::spill_to_store(&dir, content))
+    });
+
     // 运行时限制与重试（配置 `max_turns` / `retry` 段；缺省值即旧行为）
     let effective_max_tokens = runtime_builder.max_tokens();
     runtime_builder = runtime_builder
@@ -304,7 +312,7 @@ async fn main() -> Result<()> {
     ));
 
     // 历史 tool result stub 化与 expand 工具共用同一 ctx store
-    harness.set_ctx_store(baiji_dir.join("ctx-store"));
+    harness.set_ctx_store(ctx_store_dir);
 
     // 任务清单（与已注册的 TodoTool 共享存储）
     harness.set_todos(todo_store);
