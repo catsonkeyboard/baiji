@@ -55,6 +55,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub skills: SkillsConfig,
     #[serde(default)]
+    pub hooks: baiji_extensions::HooksConfig,
+    #[serde(default)]
     pub compaction: CompactionConfig,
     #[serde(default)]
     pub retry: RetryConfig,
@@ -319,6 +321,7 @@ const KNOWN_TOP_FIELDS: &[&str] = &[
     "llm_compaction",
     "max_turns",
     "skills",
+    "hooks",
     "policy",
     "compaction",
     "retry",
@@ -464,7 +467,7 @@ impl AppConfig {
         format!(
             "max_tokens: {} · max_turns: {} · compaction: {compaction} (keep {} turns) · \
              retry: {}×{}ms (cap {}ms) · compression: {} · verbosity_steer: {} · \
-             auto_continue: {} (cap {}) · skills: {} · project config: {}",
+             auto_continue: {} (cap {}) · skills: {} · hooks: {} · project config: {}",
             self.max_tokens
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "默认".into()),
@@ -483,6 +486,11 @@ impl AppConfig {
                 "on".to_string()
             } else {
                 format!("on ({} disabled)", self.skills.disabled.len())
+            },
+            if self.hooks.is_empty() {
+                "none".to_string()
+            } else {
+                format!("{} command(s)", self.hooks.count())
             },
             if self.project_config_applied {
                 "生效"
@@ -507,6 +515,11 @@ impl AppConfig {
         if let Ok(v) = std::env::var("BAIJI_SKILLS") {
             let off = matches!(v.to_lowercase().as_str(), "off" | "0" | "false" | "no");
             self.skills.enabled = !off;
+        }
+        if let Ok(v) = std::env::var("BAIJI_HOOKS")
+            && matches!(v.to_lowercase().as_str(), "off" | "0" | "false" | "no")
+        {
+            self.hooks = baiji_extensions::HooksConfig::default();
         }
         self
     }
@@ -534,6 +547,7 @@ impl AppConfig {
                 "enabled": true,
                 "disabled": []
             },
+            "hooks": {},
             "compaction": {
                 "enabled": true,
                 "max_estimated_tokens": null,
@@ -695,6 +709,49 @@ mod tests {
     }
 
     #[test]
+    fn test_hooks_config_security_and_kill_switch() {
+        // 解析:hooks 段嵌入 CommandHookSpec
+        let cfg: AppConfig = serde_json::from_value(serde_json::json!({
+            "vendor": "glm", "api_key": "k",
+            "hooks": { "tool_call": [ { "command": "./guard.sh", "timeout_secs": 5 } ] }
+        }))
+        .unwrap();
+        assert_eq!(cfg.hooks.count(), 1);
+        assert!(!cfg.hooks.is_empty());
+
+        // 项目级尝试注入 hooks → 白名单外,被丢弃(钩子执行任意 shell)
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("config.json");
+        std::fs::write(&global, r#"{"vendor":"glm","api_key":"k"}"#).unwrap();
+        let project = dir.path().join(".baiji").join("config.json");
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        std::fs::write(
+            &project,
+            r#"{"hooks": {"run_start": [{"command": "evil"}]}}"#,
+        )
+        .unwrap();
+        let cfg = AppConfig::load_with_project(&global, &project).unwrap();
+        assert!(cfg.hooks.is_empty(), "project-level hooks must be dropped");
+
+        // 环境变量总闸
+        std::fs::write(
+            &global,
+            r#"{"vendor":"glm","api_key":"k","hooks":{"run_start":[{"command":"echo"}]}}"#,
+        )
+        .unwrap();
+        unsafe { std::env::set_var("BAIJI_HOOKS", "off") };
+        let cfg = AppConfig::load_with_project(&global, &project).unwrap();
+        unsafe { std::env::remove_var("BAIJI_HOOKS") };
+        assert!(cfg.hooks.is_empty(), "BAIJI_HOOKS=off must clear all hooks");
+        let cfg = AppConfig::load_with_project(&global, &project).unwrap();
+        assert_eq!(cfg.hooks.count(), 1);
+
+        // 摘要
+        let summary = cfg.runtime_summary();
+        assert!(summary.contains("hooks: 1 command(s)"), "{summary}");
+    }
+
+    #[test]
     fn test_verbosity_steer_env_override() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
@@ -852,6 +909,7 @@ mod tests {
             llm_compaction: None,
             max_turns: 24,
             skills: SkillsConfig::default(),
+            hooks: baiji_extensions::HooksConfig::default(),
             policy: PolicyConfig::default(),
             compaction: CompactionConfig::default(),
             retry: RetryConfig::default(),
@@ -881,6 +939,7 @@ mod tests {
             llm_compaction: None,
             max_turns: 24,
             skills: SkillsConfig::default(),
+            hooks: baiji_extensions::HooksConfig::default(),
             policy: PolicyConfig::default(),
             compaction: CompactionConfig::default(),
             retry: RetryConfig::default(),
@@ -900,6 +959,7 @@ mod tests {
             llm_compaction: None,
             max_turns: 24,
             skills: SkillsConfig::default(),
+            hooks: baiji_extensions::HooksConfig::default(),
             policy: PolicyConfig::default(),
             compaction: CompactionConfig::default(),
             retry: RetryConfig::default(),
@@ -922,6 +982,7 @@ mod tests {
             llm_compaction: None,
             max_turns: 24,
             skills: SkillsConfig::default(),
+            hooks: baiji_extensions::HooksConfig::default(),
             policy: PolicyConfig::default(),
             compaction: CompactionConfig::default(),
             retry: RetryConfig::default(),
@@ -946,6 +1007,7 @@ mod tests {
             llm_compaction: None,
             max_turns: 24,
             skills: SkillsConfig::default(),
+            hooks: baiji_extensions::HooksConfig::default(),
             policy: PolicyConfig::default(),
             compaction: CompactionConfig::default(),
             retry: RetryConfig::default(),

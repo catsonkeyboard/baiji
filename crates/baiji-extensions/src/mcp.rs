@@ -5,9 +5,9 @@
 //! 依赖本机可用 `npx -y mcporter`；发现失败的服务器仅告警跳过。
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use baiji_agent::{AgentTool, ToolOutput, ToolRegistry};
 use baiji_ai::ToolDefinition;
-use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -64,7 +64,9 @@ impl McporterBridge {
         let mut all_tools = Vec::new();
         // 并发发现：串行时每个慢 server 都会给启动加最多 MCP_TIMEOUT_SECS 秒
         let results = futures::future::join_all(
-            server_names.iter().map(|name| self.discover_server_tools(name)),
+            server_names
+                .iter()
+                .map(|name| self.discover_server_tools(name)),
         )
         .await;
         for (name, result) in server_names.iter().zip(results) {
@@ -87,15 +89,16 @@ impl McporterBridge {
                 .kill_on_drop(true)
                 .stdin(std::process::Stdio::null())
                 .args([
-                "-y",
-                "mcporter",
-                "list",
-                server_name,
-                "--json",
-                "--schema",
-                "--config",
-                &self.config_path.to_string_lossy(),
-            ]).output(),
+                    "-y",
+                    "mcporter",
+                    "list",
+                    server_name,
+                    "--json",
+                    "--schema",
+                    "--config",
+                    &self.config_path.to_string_lossy(),
+                ])
+                .output(),
         )
         .await
         .with_context(|| format!("Timeout discovering tools for '{}'", server_name))?
@@ -141,18 +144,18 @@ impl McporterBridge {
                 .kill_on_drop(true)
                 .stdin(std::process::Stdio::null())
                 .args([
-                "-y",
-                "mcporter",
-                "call",
-                tool_name,
-                "--args",
-                &args_json,
-                "--output",
-                "json",
-                "--config",
-                &self.config_path.to_string_lossy(),
-            ])
-            .output(),
+                    "-y",
+                    "mcporter",
+                    "call",
+                    tool_name,
+                    "--args",
+                    &args_json,
+                    "--output",
+                    "json",
+                    "--config",
+                    &self.config_path.to_string_lossy(),
+                ])
+                .output(),
         )
         .await
         .with_context(|| format!("Timeout calling tool '{}'", tool_name))?
@@ -178,7 +181,13 @@ pub fn llm_tool_name(call_name: &str) -> String {
         .split('.')
         .map(|part| {
             part.chars()
-                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
                 .collect::<String>()
         })
         .collect::<Vec<_>>()
@@ -232,10 +241,7 @@ impl AgentTool for McpTool {
 
 /// 发现 mcporter.json 中的全部 MCP 工具并注册进工具表。
 /// 返回注册的工具数；文件不存在时返回 Ok(0)。
-pub async fn register_mcp_tools(
-    tools: &mut ToolRegistry,
-    config_path: PathBuf,
-) -> Result<usize> {
+pub async fn register_mcp_tools(tools: &mut ToolRegistry, config_path: PathBuf) -> Result<usize> {
     if !config_path.exists() {
         return Ok(0);
     }
@@ -262,11 +268,7 @@ mod tests {
     fn test_server_names_valid() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("mcporter.json");
-        std::fs::write(
-            &config,
-            r#"{"mcpServers": {"my-server": {}, "other": {}}}"#,
-        )
-        .unwrap();
+        std::fs::write(&config, r#"{"mcpServers": {"my-server": {}, "other": {}}}"#).unwrap();
         let bridge = McporterBridge::new(config);
         let mut names = bridge.server_names().unwrap();
         names.sort();

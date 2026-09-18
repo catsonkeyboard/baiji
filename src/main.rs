@@ -225,6 +225,17 @@ async fn main() -> Result<()> {
         applied.join(", ")
     );
 
+    // ---- 用户命令钩子（config `hooks` 段；BAIJI_HOOKS=off 总闸已在配置层处理） ----
+    if !app_config.hooks.is_empty() {
+        hooks.register(std::sync::Arc::new(baiji_extensions::CommandHooks::from_config(
+            app_config.hooks.clone(),
+        )));
+        info!(
+            "registered {} user command hook(s) (exit 2 on tool_call blocks; BAIJI_HOOKS=off disables)",
+            app_config.hooks.count()
+        );
+    }
+
     // ---- 遥测（BAIJI_TELEMETRY=file 时落盘 JSONL，默认 Noop）----
     let telemetry: Arc<dyn Telemetry> = match std::env::var("BAIJI_TELEMETRY").as_deref() {
         Ok("file") | Ok("jsonl") => {
