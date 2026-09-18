@@ -120,6 +120,7 @@ dependencies = [
  "async-trait",
  "baiji-ai",
  "baiji-telemetry",
+ "baiji-tools",
  "futures",
  "serde_json",
  "tempfile",
