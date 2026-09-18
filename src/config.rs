@@ -161,6 +161,17 @@ pub struct PolicyConfig {
     /// 环境变量 `BAIJI_VERBOSITY_STEER=on|off` 可免改配置切换
     #[serde(default)]
     pub verbosity_steer: bool,
+    /// 自动接力（T4）：run 结束且 todo 仍有未完成项时，以固定输入自动继续，
+    /// 直到完成或轮次上限（Esc / Ctrl-C 可停）。headless 用 --continue-until-done 开启
+    #[serde(default)]
+    pub auto_continue: bool,
+    /// 自动接力的累计轮次上限（按一次用户输入触发的接力链计）
+    #[serde(default = "default_auto_continue_max_turns")]
+    pub auto_continue_max_turns: u32,
+}
+
+fn default_auto_continue_max_turns() -> u32 {
+    96
 }
 
 fn default_max_output_bytes() -> usize {
@@ -184,6 +195,8 @@ impl Default for PolicyConfig {
             bash_timeout_secs: default_bash_timeout(),
             compression_enabled: default_compression_enabled(),
             verbosity_steer: false,
+            auto_continue: false,
+            auto_continue_max_turns: default_auto_continue_max_turns(),
         }
     }
 }
@@ -216,6 +229,8 @@ const PROJECT_ALLOWED_POLICY: &[&str] = &[
     "bash_timeout_secs",
     "compression_enabled",
     "verbosity_steer",
+    "auto_continue",
+    "auto_continue_max_turns",
 ];
 
 /// 深合并：对象递归合并，数组/标量整体覆盖（overlay 优先）——与 pi 的语义一致
@@ -424,7 +439,7 @@ impl AppConfig {
         format!(
             "max_tokens: {} · max_turns: {} · compaction: {compaction} (keep {} turns) · \
              retry: {}×{}ms (cap {}ms) · compression: {} · verbosity_steer: {} · \
-             project config: {}",
+             auto_continue: {} (cap {}) · project config: {}",
             self.max_tokens
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "默认".into()),
@@ -435,6 +450,8 @@ impl AppConfig {
             self.retry.max_delay_ms,
             on_off(self.policy.compression_enabled),
             on_off(self.policy.verbosity_steer),
+            on_off(self.policy.auto_continue),
+            self.policy.auto_continue_max_turns,
             if self.project_config_applied {
                 "生效"
             } else {
@@ -492,7 +509,9 @@ impl AppConfig {
                 "max_tool_output_bytes": 32768,
                 "bash_timeout_secs": 30,
                 "compression_enabled": true,
-                "verbosity_steer": false
+                "verbosity_steer": false,
+                "auto_continue": false,
+                "auto_continue_max_turns": 96
             },
             "ui": { "theme": "dark" }
         }))

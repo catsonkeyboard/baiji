@@ -15,6 +15,9 @@ pub struct Outcome {
     pub cancelled: bool,
     /// 被确认策略 / hook 拒绝的工具调用数
     pub denied_tools: usize,
+    /// 本次 run 的 LLM 轮次数（自动接力的预算计量）
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub turns: u32,
 }
 
 impl Outcome {
@@ -36,7 +39,7 @@ impl Outcome {
 /// - 工具开始/失败与运行错误打印到 stderr（不污染 stdout 的答案流）
 /// - `cancel`：Ctrl-C 触发后优雅收尾（终止正在跑的命令、落盘已完成的轮次）
 pub async fn run_once(
-    mut harness: AgentHarness,
+    harness: &mut AgentHarness,
     input: &str,
     quiet: bool,
     cancel: CancellationToken,
@@ -46,11 +49,15 @@ pub async fn run_once(
     let printer = tokio::spawn(async move {
         use std::io::Write as _;
         let mut denied = 0usize;
+        let mut turns = 0u32;
         while let Some(event) = rx.recv().await {
             if let AgentEvent::ToolFinished { output, .. } = &event
                 && output.starts_with("[Denied")
             {
                 denied += 1;
+            }
+            if matches!(event, AgentEvent::TurnStarted { .. }) {
+                turns += 1;
             }
             if quiet {
                 continue;
@@ -84,14 +91,14 @@ pub async fn run_once(
                 _ => {}
             }
         }
-        denied
+        (denied, turns)
     });
 
     let result = harness
         .run(input, &tx, &cancel, &SteeringQueue::new())
         .await;
     drop(tx);
-    let denied_tools = printer.await.unwrap_or(0);
+    let (denied_tools, turns) = printer.await.unwrap_or((0, 0));
 
     if !quiet && result.is_ok() {
         // 流式答案收尾换行
@@ -106,7 +113,42 @@ pub async fn run_once(
         answer: result?,
         cancelled: cancel.is_cancelled(),
         denied_tools,
+        turns,
     })
+}
+
+/// 自动接力执行（`--continue-until-done`）：run 结束后若 todo 仍有未完成项
+/// 且轮次未超上限，以固定输入继续，直到完成 / 触上限 / 被取消。
+/// Ctrl-C 一旦触发即停止接力（优雅收尾当前 run）。
+pub async fn run_auto(
+    harness: &mut AgentHarness,
+    input: &str,
+    quiet: bool,
+    cancel: CancellationToken,
+    max_turns: u32,
+) -> Result<Outcome> {
+    let mut turns_total = 0u32;
+    let mut current = input.to_string();
+    let mut last;
+    loop {
+        last = run_once(harness, &current, quiet, cancel.clone()).await?;
+        turns_total += last.turns;
+        if !baiji_harness::should_auto_continue(
+            true,
+            max_turns,
+            harness.has_open_todos(),
+            turns_total,
+            !last.cancelled,
+        ) {
+            break;
+        }
+        if !quiet {
+            eprintln!("[auto-continue {turns_total}/{max_turns} turns] todo 仍有未完成项，继续");
+        }
+        current = baiji_harness::AUTO_CONTINUE_PROMPT.to_string();
+    }
+    last.turns = turns_total;
+    Ok(last)
 }
 
 /// 打印会话列表（--sessions）。直接读存储，不创建新会话。
@@ -142,8 +184,8 @@ mod tests {
     use async_trait::async_trait;
     use baiji_agent::{AgentRuntime, ToolRegistry};
     use baiji_ai::{ChatRequest, ChatResponse, Protocol, Provider, StreamChunk};
-    use futures::stream::BoxStream;
     use futures::StreamExt as _;
+    use futures::stream::BoxStream;
     use std::sync::Arc;
 
     struct EchoProvider;
@@ -182,9 +224,9 @@ mod tests {
         let session_id = {
             let runtime =
                 Arc::new(AgentRuntime::new(Arc::new(EchoProvider)).with_tools(ToolRegistry::new()));
-            let harness = AgentHarness::new(runtime, &sessions_dir).unwrap();
+            let mut harness = AgentHarness::new(runtime, &sessions_dir).unwrap();
             let id = harness.session().meta.id.clone();
-            let outcome = run_once(harness, "你好", true, CancellationToken::new())
+            let outcome = run_once(&mut harness, "你好", true, CancellationToken::new())
                 .await
                 .unwrap();
             assert_eq!(outcome.answer, "答案");
@@ -193,7 +235,9 @@ mod tests {
         };
 
         // 会话恰好一个（headless 列表/恢复不产生多余会话文件）
-        let metas = baiji_harness::JsonlStore::new(&sessions_dir).list().unwrap();
+        let metas = baiji_harness::JsonlStore::new(&sessions_dir)
+            .list()
+            .unwrap();
         assert_eq!(metas.len(), 1);
 
         // 可恢复（--session 路径），历史完整
@@ -203,14 +247,223 @@ mod tests {
         assert_eq!(reloaded.session().messages.len(), 2);
     }
 
+    /// 脚本化 todo Provider：奇数次调用发工具调用（按轮次 add/update），
+    /// 偶数次调用直接回答——驱动自动接力循环走完
+    struct TodoScriptProvider {
+        /// 永远只加不完成（上限测试用）
+        never_done: bool,
+        calls: std::sync::atomic::AtomicU32,
+    }
+
+    impl TodoScriptProvider {
+        fn tool_calls(&self, n: u32) -> Vec<StreamChunk> {
+            let (id, args) = if self.never_done || n > 1 {
+                let i = (n + 1) / 2;
+                (
+                    format!("t{n}"),
+                    format!("{{\"action\":\"add\",\"content\":\"task {i}\"}}"),
+                )
+            } else {
+                (
+                    "t1".to_string(),
+                    "{\"action\":\"add\",\"content\":\"task 1\"}{\"action\":\"add\",\"content\":\"task 2\"}{\"action\":\"add\",\"content\":\"task 3\"}"
+                        .to_string(),
+                )
+            };
+            // 首个 add 之后跟两个 add（一次三个工具调用的简化：逐个发出）
+            if n == 1 {
+                vec![
+                    StreamChunk::ToolCallStart {
+                        id: "a1".into(),
+                        name: "todo".into(),
+                    },
+                    StreamChunk::ToolCallArguments {
+                        id: "a1".into(),
+                        arguments: "{\"action\":\"add\",\"content\":\"task 1\"}".into(),
+                    },
+                    StreamChunk::ToolCallStart {
+                        id: "a2".into(),
+                        name: "todo".into(),
+                    },
+                    StreamChunk::ToolCallArguments {
+                        id: "a2".into(),
+                        arguments: "{\"action\":\"add\",\"content\":\"task 2\"}".into(),
+                    },
+                    StreamChunk::ToolCallStart {
+                        id: "a3".into(),
+                        name: "todo".into(),
+                    },
+                    StreamChunk::ToolCallArguments {
+                        id: "a3".into(),
+                        arguments: "{\"action\":\"add\",\"content\":\"task 3\"}".into(),
+                    },
+                    StreamChunk::Done,
+                ]
+            } else if self.never_done {
+                vec![
+                    StreamChunk::ToolCallStart {
+                        id: id.clone(),
+                        name: "todo".into(),
+                    },
+                    StreamChunk::ToolCallArguments {
+                        id,
+                        arguments: args,
+                    },
+                    StreamChunk::Done,
+                ]
+            } else {
+                // 接力轮：完成一个任务（id = 轮次序号）
+                let done_id = (n - 1) / 2;
+                vec![
+                    StreamChunk::ToolCallStart {
+                        id: id.clone(),
+                        name: "todo".into(),
+                    },
+                    StreamChunk::ToolCallArguments {
+                        id,
+                        arguments: format!(
+                            "{{\"action\":\"update\",\"id\":{done_id},\"status\":\"done\"}}"
+                        ),
+                    },
+                    StreamChunk::Done,
+                ]
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for TodoScriptProvider {
+        async fn chat(&self, _: ChatRequest) -> anyhow::Result<ChatResponse> {
+            unreachable!()
+        }
+        async fn chat_stream(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<BoxStream<'static, anyhow::Result<StreamChunk>>> {
+            use std::sync::atomic::Ordering;
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let chunks: Vec<anyhow::Result<StreamChunk>> = if n % 2 == 1 {
+                self.tool_calls(n).into_iter().map(Ok).collect()
+            } else {
+                vec![
+                    Ok(StreamChunk::Content("step done".into())),
+                    Ok(StreamChunk::Done),
+                ]
+            };
+            Ok(futures::stream::iter(chunks).boxed())
+        }
+        fn protocol(&self) -> Protocol {
+            Protocol::OpenAIChat
+        }
+        fn model(&self) -> &str {
+            "mock"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    fn todo_harness(
+        provider: Arc<TodoScriptProvider>,
+        sessions_dir: &std::path::Path,
+    ) -> (AgentHarness, std::sync::Arc<baiji_harness::TodoStore>) {
+        let todos = std::sync::Arc::new(baiji_harness::TodoStore::new());
+        let mut registry = ToolRegistry::new();
+        registry.register(std::sync::Arc::new(baiji_harness::TodoTool::new(
+            todos.clone(),
+        )));
+        let runtime = Arc::new(AgentRuntime::new(provider).with_tools(registry));
+        let mut harness = AgentHarness::new(runtime, sessions_dir).unwrap();
+        harness.set_todos(todos.clone());
+        (harness, todos)
+    }
+
+    #[tokio::test]
+    async fn test_run_auto_completes_all_todos() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut harness, todos) = todo_harness(
+            std::sync::Arc::new(TodoScriptProvider {
+                never_done: false,
+                calls: std::sync::atomic::AtomicU32::new(0),
+            }),
+            dir.path(),
+        );
+
+        let outcome = run_auto(
+            &mut harness,
+            "做个三步任务",
+            true,
+            CancellationToken::new(),
+            20,
+        )
+        .await
+        .unwrap();
+
+        // 4 次 run(初始 + 3 次接力)× 每次 2 轮 = 8 轮
+        assert_eq!(outcome.turns, 8, "expected 4 runs x 2 turns");
+        assert!(!outcome.cancelled);
+        assert_eq!(outcome.exit_code(), 0);
+        // 全部完成
+        assert!(!todos.has_open());
+        let items = todos.items();
+        assert_eq!(items.len(), 3);
+        assert!(
+            items
+                .iter()
+                .all(|t| t.status == baiji_harness::TodoStatus::Done)
+        );
+        // 接力输入进入历史（3 次）
+        let relay_count = harness
+            .session()
+            .messages
+            .iter()
+            .filter(|m| m.content == baiji_harness::AUTO_CONTINUE_PROMPT)
+            .count();
+        assert_eq!(relay_count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_run_auto_stops_at_turn_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut harness, todos) = todo_harness(
+            std::sync::Arc::new(TodoScriptProvider {
+                never_done: true,
+                calls: std::sync::atomic::AtomicU32::new(0),
+            }),
+            dir.path(),
+        );
+
+        let outcome = run_auto(&mut harness, "无限任务", true, CancellationToken::new(), 4)
+            .await
+            .unwrap();
+
+        // 2 次 run × 2 轮 = 4 轮触顶停止；todo 仍有未完成项
+        assert_eq!(outcome.turns, 4);
+        assert!(todos.has_open());
+        let relay_count = harness
+            .session()
+            .messages
+            .iter()
+            .filter(|m| m.content == baiji_harness::AUTO_CONTINUE_PROMPT)
+            .count();
+        assert_eq!(relay_count, 1, "only one relay before the cap");
+    }
+
     #[test]
     fn test_exit_codes() {
         let ok = Outcome::default();
         assert_eq!(ok.exit_code(), 0);
-        let denied = Outcome { denied_tools: 1, ..Default::default() };
+        let denied = Outcome {
+            denied_tools: 1,
+            ..Default::default()
+        };
         assert_eq!(denied.exit_code(), 2);
         // 中断优先
-        let cancelled = Outcome { cancelled: true, denied_tools: 1, ..Default::default() };
+        let cancelled = Outcome {
+            cancelled: true,
+            denied_tools: 1,
+            ..Default::default()
+        };
         assert_eq!(cancelled.exit_code(), 130);
     }
 }

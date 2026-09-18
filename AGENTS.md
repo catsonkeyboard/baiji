@@ -7,7 +7,7 @@ A terminal AI coding agent built on a multi-crate Rust workspace: async streamin
 ```bash
 cargo build                # Build the whole workspace
 cargo run                  # Run the TUI app (default)
-cargo test --workspace     # Run all tests (300 total)
+cargo test --workspace     # Run all tests (304 total)
 baiji -e "msg" --yes      # Headless one-shot run (streams to stdout)
 baiji --sessions          # List sessions (no API key needed)
 cargo test -p baiji-agent  # Test a single crate
@@ -80,6 +80,7 @@ Dependency direction: telemetry ← ai ← agent ← tools ← harness ← {tui,
 - `llm_compaction: true` switches context compaction to provider-generated summaries (falls back to the deterministic summary on API error).
 - `max_turns` caps LLM turns per run (default 24).
 - `compaction`: `enabled: false` disables both context-reduction tiers (tool-result stubbing + summary; the in-run anti-overflow trim stays); `max_estimated_tokens` overrides the window-derived budget (70% of the context window minus the output reserve, floor 16k); `keep_recent_turns` (default 6) is the intact-turn window. The in-run anti-overflow trim (`elide_old_tool_results`, triggered at 85% of the window) is reversible too when a spill closure is injected: elided content goes to the ctx store with a `ctx:<handle>` marker (main.rs wires `baiji_tools::spill_to_store` via `AgentRuntime::with_spill` — a closure, because a direct agent→tools dependency would cycle).
+- `auto_continue: true` enables auto-continue (T4): when a run finishes normally with open todos and the turn budget is not exhausted, the next run starts automatically with the fixed `baiji_harness::AUTO_CONTINUE_PROMPT` input (visible in history). The budget (`auto_continue_max_turns`, default 96) counts per user-initiated chain (reset on manual submit); Esc interrupts the chain. headless opt-in: `baiji -e "..." --continue-until-done`.
 - `retry`: transient-error retries with exponential backoff (`base_delay_ms × 2^attempt`, capped at `max_delay_ms`; server `Retry-After` honored but also capped). Defaults 2 / 500ms / 30s.
 - `ui.theme`: `"dark"` (default) or `"light"` palettes.
 - MCP: place a `mcporter.json` in the project root; tools are discovered via `npx -y mcporter` at startup (requires Node). Tool names use `server.tool`.

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 pub use confirm::{ConfirmDialog, InteractiveApprover};
-pub use settings::RuntimeSettings;
+pub use settings::{AutoContinueConfig, RuntimeSettings};
 pub use theme::Theme;
 
 /// 启动 TUI 主循环。
@@ -34,6 +34,7 @@ pub async fn run(
     config_path: std::path::PathBuf,
     settings: RuntimeSettings,
     settings_summary: String,
+    auto_continue: AutoContinueConfig,
 ) -> Result<()> {
     app::App::new(
         harness,
@@ -42,6 +43,7 @@ pub async fn run(
         config_path,
         settings,
         settings_summary,
+        auto_continue,
     )
     .run()
     .await

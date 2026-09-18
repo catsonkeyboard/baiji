@@ -377,7 +377,19 @@ async fn main() -> Result<()> {
             }
         });
 
-        let outcome = headless::run_once(harness, &input, false, cancel).await?;
+        let outcome = if options.continue_until_done {
+            info!("headless auto-continue enabled (cap {} turns)", app_config.policy.auto_continue_max_turns);
+            headless::run_auto(
+                &mut harness,
+                &input,
+                false,
+                cancel,
+                app_config.policy.auto_continue_max_turns,
+            )
+            .await?
+        } else {
+            headless::run_once(&mut harness, &input, false, cancel).await?
+        };
         info!("headless run completed (exit code {})", outcome.exit_code());
         let code = outcome.exit_code();
         if code != 0 {
@@ -406,9 +418,26 @@ async fn main() -> Result<()> {
 
     let harness = Arc::new(tokio::sync::Mutex::new(harness));
     let settings_summary = app_config.runtime_summary();
-    if let Err(e) =
-        baiji_tui::run(harness, theme, confirm_rx, config_path, tui_settings, settings_summary)
-            .await
+    let auto_continue = baiji_tui::AutoContinueConfig {
+        enabled: app_config.policy.auto_continue,
+        max_turns: app_config.policy.auto_continue_max_turns,
+    };
+    if app_config.policy.auto_continue {
+        info!(
+            "auto-continue enabled (cap {} turns; Esc stops the chain)",
+            app_config.policy.auto_continue_max_turns
+        );
+    }
+    if let Err(e) = baiji_tui::run(
+        harness,
+        theme,
+        confirm_rx,
+        config_path,
+        tui_settings,
+        settings_summary,
+        auto_continue,
+    )
+    .await
     {
         error!("TUI error: {e}");
         return Err(e);
