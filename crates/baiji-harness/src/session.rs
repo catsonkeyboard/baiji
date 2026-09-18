@@ -3,6 +3,8 @@
 use baiji_ai::Message;
 use serde::{Deserialize, Serialize};
 
+use crate::todo::TodoItem;
+
 /// 会话元信息（JSONL 首条 Started 记录）
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionMeta {
@@ -22,6 +24,8 @@ pub struct SessionMeta {
 pub struct Session {
     pub meta: SessionMeta,
     pub messages: Vec<Message>,
+    /// 任务清单（Record::Todo 重放的最终状态；运行期内存态由 harness 维护）
+    pub todos: Vec<TodoItem>,
 }
 
 impl Session {
@@ -34,6 +38,7 @@ impl Session {
                 title: None,
             },
             messages: Vec::new(),
+            todos: Vec::new(),
         }
     }
 
@@ -89,7 +94,10 @@ impl SessionTree {
 
     /// 根会话（无 parent）
     pub fn roots(&self) -> Vec<&SessionMeta> {
-        self.metas.iter().filter(|m| m.parent_id.is_none()).collect()
+        self.metas
+            .iter()
+            .filter(|m| m.parent_id.is_none())
+            .collect()
     }
 
     /// 某会话的直接子会话
