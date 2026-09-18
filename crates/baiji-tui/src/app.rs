@@ -201,28 +201,90 @@ pub fn split_slash(input: &str) -> Option<(&str, &str)> {
 
 /// 会话选择器状态
 pub struct SessionPicker {
+    /// 全部会话（过滤的源头）
+    all: Vec<SessionMeta>,
+    /// 项目过滤键（None = 不过滤显示全部）
+    filter: Option<String>,
     /// 树形顺序：根会话最新在前，分叉出的子会话紧跟其父
     pub items: Vec<SessionMeta>,
     /// 与 items 一一对应的缩进深度
     pub depths: Vec<usize>,
     pub selected: usize,
+    /// 当前会话 id（过滤后重定位选中用）
+    current_id: String,
 }
 
 impl SessionPicker {
-    /// 按分叉关系排成树，默认选中当前会话
+    /// 按分叉关系排成树，默认选中当前会话。
+    /// `project` 有值时初始只显示该项目的会话（当前会话无项目则显示全部）
     pub fn from_metas(metas: Vec<SessionMeta>, current_id: &str) -> Self {
-        let tree = baiji_harness::SessionTree::from_metas(metas);
+        let current_project = metas
+            .iter()
+            .find(|m| m.id == current_id)
+            .and_then(|m| m.project.clone());
+        // 当前会话有项目时初始只显示该项目（无项目 = 旧会话，显示全部）
+        let filter = current_project.clone().filter(|key| {
+            metas
+                .iter()
+                .any(|m| m.project.as_deref() == Some(key.as_str()))
+        });
+        let mut picker = Self {
+            all: metas,
+            filter,
+            items: Vec::new(),
+            depths: Vec::new(),
+            selected: 0,
+            current_id: current_id.to_string(),
+        };
+        picker.rebuild();
+        picker
+    }
+
+    /// 用当前过滤条件重建可见列表
+    fn rebuild(&mut self) {
+        let visible: Vec<SessionMeta> = self
+            .all
+            .iter()
+            .filter(|m| {
+                self.filter
+                    .as_ref()
+                    .is_none_or(|key| m.project.as_deref() == Some(key.as_str()))
+            })
+            .cloned()
+            .collect();
+        let tree = baiji_harness::SessionTree::from_metas(visible);
         let (depths, items): (Vec<usize>, Vec<SessionMeta>) = tree
             .flattened()
             .into_iter()
             .map(|(depth, meta)| (depth, meta.clone()))
             .unzip();
-        let selected = items.iter().position(|m| m.id == current_id).unwrap_or(0);
-        Self {
-            items,
-            depths,
-            selected,
+        self.selected = items
+            .iter()
+            .position(|m| m.id == self.current_id)
+            .unwrap_or(0);
+        self.items = items;
+        self.depths = depths;
+    }
+
+    /// a 键：本项目 ↔ 全部切换
+    pub fn toggle_project_filter(&mut self) {
+        if self.filter.is_some() {
+            self.filter = None;
+        } else {
+            // 取当前会话（或首个有项目的会话）的项目作为过滤键
+            self.filter = self
+                .all
+                .iter()
+                .find(|m| m.id == self.current_id)
+                .and_then(|m| m.project.clone())
+                .or_else(|| self.all.iter().find_map(|m| m.project.clone()));
         }
+        self.rebuild();
+    }
+
+    /// 是否处于项目过滤态（标题栏提示用）
+    pub fn filtering_by_project(&self) -> bool {
+        self.filter.is_some()
     }
 
     pub fn selected_meta(&self) -> Option<&SessionMeta> {
@@ -239,7 +301,8 @@ impl SessionPicker {
         }
     }
 
-    /// 选择器展示行：树形缩进 + id · 标题（当前会话打标）
+    /// 选择器展示行：树形缩进 + id · 标题（当前会话打标；
+    /// 全部视图下其它项目的会话附项目标注）
     pub fn display_rows(&self, current_id: &str) -> Vec<String> {
         self.items
             .iter()
@@ -252,7 +315,16 @@ impl SessionPicker {
                 } else {
                     String::new()
                 };
-                format!("{mark}{branch}{} · {}", meta.id, title)
+                // 项目过滤关闭时，为非当前项目的会话附标注
+                let project_tag = if self.filter.is_none() {
+                    match &meta.project {
+                        Some(project) => format!(" · ⌂{project}"),
+                        None => " · ⌂?".to_string(),
+                    }
+                } else {
+                    String::new()
+                };
+                format!("{mark}{branch}{} · {}{project_tag}", meta.id, title)
             })
             .collect()
     }
@@ -1051,6 +1123,7 @@ impl App {
             KeyCode::Esc => {
                 self.picker = None;
             }
+            KeyCode::Char('a') => picker.toggle_project_filter(),
             KeyCode::Up | KeyCode::Char('k') => picker.move_up(),
             KeyCode::Down | KeyCode::Char('j') => picker.move_down(),
             KeyCode::Enter => {
@@ -1764,12 +1837,56 @@ mod tests {
     }
 
     #[test]
+    fn test_picker_project_filter_toggle_and_tags() {
+        let mk = |id: &str, project: Option<&str>| SessionMeta {
+            id: id.to_string(),
+            parent_id: None,
+            created_at: format!("2026-09-17T00:00:0{id}:00Z"),
+            title: Some(format!("t-{id}")),
+            project: project.map(str::to_string),
+        };
+        // 三个项目:alpha(当前)、beta、旧会话(无项目)
+        let metas = vec![
+            mk("cur", Some("alpha-1111")),
+            mk("other", Some("beta-2222")),
+            mk("legacy", None),
+        ];
+
+        // 当前会话有项目 → 初始只显示本项目
+        let picker = SessionPicker::from_metas(metas.clone(), "cur");
+        let ids: Vec<&str> = picker.items.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["cur"], "project view shows only current project");
+        assert!(picker.filtering_by_project());
+        assert_eq!(picker.selected, 0);
+
+        // a 切换到全部:跨项目附 ⌂ 标注
+        let mut picker = SessionPicker::from_metas(metas.clone(), "cur");
+        picker.toggle_project_filter();
+        let ids: Vec<&str> = picker.items.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids.len(), 3, "all view");
+        assert!(!picker.filtering_by_project());
+        let rows = picker.display_rows("cur");
+        assert!(rows.iter().any(|r| r.contains("⌂beta-2222")), "{rows:?}");
+        assert!(
+            rows.iter().any(|r| r.contains("⌂?")),
+            "legacy tagged: {rows:?}"
+        );
+        assert!(picker.selected < picker.items.len());
+
+        // 当前会话为旧会话(无项目) → 初始显示全部
+        let picker = SessionPicker::from_metas(metas, "legacy");
+        assert!(!picker.filtering_by_project());
+        assert_eq!(picker.items.len(), 3);
+    }
+
+    #[test]
     fn test_picker_navigation_and_rows() {
         let mk = |id: &str, parent: Option<&str>| SessionMeta {
             id: id.to_string(),
             parent_id: parent.map(String::from),
             created_at: format!("2026-09-17T00:0{id}:00Z"),
             title: Some(format!("title-{id}")),
+            project: None,
         };
         let mut picker =
             SessionPicker::from_metas(vec![mk("3", None), mk("2", Some("1")), mk("1", None)], "2");

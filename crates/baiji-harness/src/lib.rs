@@ -19,7 +19,7 @@ pub mod todo;
 pub use compaction::{CompactionPolicy, compact, compact_with_llm, estimate_tokens};
 pub use memory::{MemoryEntry, MemoryKind, MemoryStore, MemoryTool, memory_section, project_key};
 pub use persist::{JsonlStore, Record};
-pub use session::{Session, SessionMeta, SessionTree, new_session_id};
+pub use session::{Session, SessionMeta, SessionTree, group_by_project, new_session_id};
 pub use skills::{Skill, SkillTool, filter_skills, load_skills};
 pub use stub::stub_tool_results;
 pub use templates::render;
@@ -119,10 +119,20 @@ struct UsageAnchor {
 }
 
 impl AgentHarness {
-    /// 创建新会话
+    /// 创建新会话（不归属项目——测试与兼容路径）
     pub fn new(runtime: Arc<AgentRuntime>, store_dir: impl Into<PathBuf>) -> Result<Self> {
+        Self::new_with_project(runtime, store_dir, None)
+    }
+
+    /// 创建归属到项目的会话（project = project_key(workdir)，main 装配用）
+    pub fn new_with_project(
+        runtime: Arc<AgentRuntime>,
+        store_dir: impl Into<PathBuf>,
+        project: Option<String>,
+    ) -> Result<Self> {
         let store = JsonlStore::new(store_dir);
-        let session = Session::new(None);
+        let mut session = Session::new(None);
+        session.meta.project = project;
         store.append(
             &session.meta.id,
             &Record::Started {
@@ -208,6 +218,7 @@ impl AgentHarness {
 
         let mut child = Session::new(Some(self.session.meta.id.clone()));
         child.messages = messages[..keep].to_vec();
+        child.meta.project = self.session.meta.project.clone(); // 分叉继承项目
         // 任务清单随分叉继承（父会话不受影响）
         child.todos = self.session.todos.clone();
         // 标题随 Started 一起写入（分叉时历史已知）
@@ -239,6 +250,11 @@ impl AgentHarness {
 
     pub fn session(&self) -> &Session {
         &self.session
+    }
+
+    /// 当前会话归属的项目（旧会话为 None）
+    pub fn current_project(&self) -> Option<String> {
+        self.session.meta.project.clone()
     }
 
     /// 热切换 Provider（TUI 配置变更时，下一次 LLM 调用生效）
@@ -1233,6 +1249,33 @@ mod tests {
     }
 
     // ===== 任务清单（todo）=====
+
+    #[tokio::test]
+    async fn test_new_session_records_project_and_branch_inherits() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("sessions");
+        let runtime = Arc::new(AgentRuntime::new(Arc::new(EchoProvider)));
+
+        // 归属项目的会话:Started 落盘带 project,load 恢复
+        let mut harness = AgentHarness::new_with_project(
+            runtime.clone(),
+            store_dir.clone(),
+            Some("demo-ab12cd34".into()),
+        )
+        .unwrap();
+        assert_eq!(harness.current_project().as_deref(), Some("demo-ab12cd34"));
+        let id = harness.session().meta.id.clone();
+        let reloaded = AgentHarness::load(runtime.clone(), store_dir.clone(), &id).unwrap();
+        assert_eq!(
+            reloaded.current_project().as_deref(),
+            Some("demo-ab12cd34"),
+            "project must survive reload (resume)"
+        );
+
+        // 分叉继承项目
+        harness.branch().unwrap();
+        assert_eq!(harness.current_project().as_deref(), Some("demo-ab12cd34"));
+    }
 
     #[tokio::test]
     async fn test_todo_mutations_persisted_and_restored() {

@@ -17,6 +17,37 @@ pub struct SessionMeta {
     /// 标题（取首条用户消息摘要）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// 所属项目（project_key = 目录名 + 路径哈希；旧会话为 None）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+}
+
+/// 按项目分组：Some(key) 组按组内最新会话时间降序；None（旧会话，未记录
+/// 项目）固定在最后。组内保持传入顺序（调用方自行排树）。
+pub fn group_by_project(metas: Vec<SessionMeta>) -> Vec<(Option<String>, Vec<SessionMeta>)> {
+    let mut groups: Vec<(Option<String>, Vec<SessionMeta>)> = Vec::new();
+    for meta in metas {
+        match groups.iter_mut().find(|(key, _)| *key == meta.project) {
+            Some((_, list)) => list.push(meta),
+            None => groups.push((meta.project.clone(), vec![meta])),
+        }
+    }
+    // None 组最后，其余按组内最新 created_at 降序（RFC3339 同格式，字典序即时间序）
+    groups.sort_by(|a, b| match (a.0.as_ref(), b.0.as_ref()) {
+        (None, _) => std::cmp::Ordering::Greater,
+        (_, None) => std::cmp::Ordering::Less,
+        _ => latest_of(&b.1).cmp(&latest_of(&a.1)),
+    });
+    groups
+}
+
+fn latest_of(metas: &[SessionMeta]) -> String {
+    metas
+        .iter()
+        .map(|m| m.created_at.as_str())
+        .max()
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// 会话 = 元信息 + 对话历史（不含 runtime 注入的 system prompt）
@@ -36,6 +67,7 @@ impl Session {
                 parent_id,
                 created_at: chrono::Utc::now().to_rfc3339(),
                 title: None,
+                project: None,
             },
             messages: Vec::new(),
             todos: Vec::new(),
@@ -167,6 +199,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_group_by_project_orders_and_pins_legacy() {
+        let meta = |id: &str, project: Option<&str>, created: &str| SessionMeta {
+            id: id.into(),
+            parent_id: None,
+            created_at: created.into(),
+            title: None,
+            project: project.map(str::to_string),
+        };
+        let metas = vec![
+            meta("legacy1", None, "2026-01-05T10:00:00+00:00"),
+            meta("a-old", Some("alpha-1111"), "2026-01-01T10:00:00+00:00"),
+            meta("legacy2", None, "2026-03-01T10:00:00+00:00"),
+            meta("beta-new", Some("beta-2222"), "2026-04-01T10:00:00+00:00"),
+            meta("a-new", Some("alpha-1111"), "2026-02-01T10:00:00+00:00"),
+        ];
+        let groups = group_by_project(metas);
+        let keys: Vec<Option<String>> = groups.iter().map(|(k, _)| k.clone()).collect();
+        // 最新活动的组在前(beta 4月 > alpha 2月);旧会话(None)即使更新也固定最后
+        assert_eq!(
+            keys,
+            vec![Some("beta-2222".into()), Some("alpha-1111".into()), None]
+        );
+        assert_eq!(groups[1].1.len(), 2); // 组内保持传入顺序
+        assert_eq!(groups[2].1.len(), 2);
+    }
+
+    #[test]
     fn test_session_id_unique_and_shaped() {
         let a = new_session_id();
         let b = new_session_id();
@@ -192,18 +251,21 @@ mod tests {
             parent_id: None,
             created_at: "t".into(),
             title: None,
+            project: None,
         };
         let child = SessionMeta {
             id: "s2".into(),
             parent_id: Some("s1".into()),
             created_at: "t".into(),
             title: None,
+            project: None,
         };
         let grand = SessionMeta {
             id: "s3".into(),
             parent_id: Some("s2".into()),
             created_at: "t".into(),
             title: None,
+            project: None,
         };
         let tree = SessionTree::from_metas(vec![root, child.clone(), grand]);
 
@@ -227,6 +289,7 @@ mod tests {
             parent_id: parent.map(String::from),
             created_at: at.into(),
             title: None,
+            project: None,
         };
         let tree = SessionTree::from_metas(vec![
             meta("old", None, "2026-01-01"),

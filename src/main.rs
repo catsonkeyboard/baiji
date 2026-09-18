@@ -227,9 +227,9 @@ async fn main() -> Result<()> {
 
     // ---- 用户命令钩子（config `hooks` 段；BAIJI_HOOKS=off 总闸已在配置层处理） ----
     if !app_config.hooks.is_empty() {
-        hooks.register(std::sync::Arc::new(baiji_extensions::CommandHooks::from_config(
-            app_config.hooks.clone(),
-        )));
+        hooks.register(std::sync::Arc::new(
+            baiji_extensions::CommandHooks::from_config(app_config.hooks.clone()),
+        ));
         info!(
             "registered {} user command hook(s) (exit 2 on tool_call blocks; BAIJI_HOOKS=off disables)",
             app_config.hooks.count()
@@ -335,7 +335,11 @@ async fn main() -> Result<()> {
             info!("resuming session {session_id}");
             AgentHarness::load(runtime, baiji_dir.join("sessions"), session_id)?
         }
-        _ => AgentHarness::new(runtime, baiji_dir.join("sessions"))?,
+        _ => AgentHarness::new_with_project(
+            runtime,
+            baiji_dir.join("sessions"),
+            Some(baiji_harness::project_key(&workdir)),
+        )?,
     };
 
     // 压缩阈值随模型上下文窗口而定（不再固定 48k）；

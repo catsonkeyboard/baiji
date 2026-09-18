@@ -498,6 +498,41 @@ mod tests {
     }
 
     #[test]
+    fn test_project_roundtrips_and_legacy_defaults_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JsonlStore::new(dir.path());
+
+        // 新会话:Started 携带 project
+        let mut meta = Session::new(None).meta;
+        meta.project = Some("myproj-ab12cd34".into());
+        store
+            .append(&meta.id, &Record::Started { meta: meta.clone() })
+            .unwrap();
+        let loaded = store.load(&meta.id).unwrap();
+        assert_eq!(loaded.meta.project.as_deref(), Some("myproj-ab12cd34"));
+
+        // 旧文件:Started 无 project 字段 → None
+        let legacy = Session::new(None);
+        let raw = serde_json::json!({
+            "record": "started",
+            "meta": {
+                "id": legacy.meta.id,
+                "created_at": "2026-01-01T00:00:00+00:00"
+            }
+        });
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(store.file_path(&legacy.meta.id))
+            .unwrap();
+        use std::io::Write as _;
+        writeln!(file, "{raw}").unwrap();
+        drop(file);
+        let loaded = store.load(&legacy.meta.id).unwrap();
+        assert_eq!(loaded.meta.project, None);
+    }
+
+    #[test]
     fn test_todo_record_last_wins() {
         let dir = tempfile::tempdir().unwrap();
         let store = JsonlStore::new(dir.path());
