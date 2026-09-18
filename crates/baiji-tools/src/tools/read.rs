@@ -9,10 +9,12 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use baiji_agent::{estimate_text_tokens, AgentTool, ToolOutput};
+use baiji_agent::{AgentTool, ToolOutput, estimate_text_tokens};
 use serde_json::Value;
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 use tokio::fs;
 
 use crate::env::ExecutionEnv;
@@ -23,14 +25,103 @@ const MAX_SIGNATURES: usize = 200;
 const MAX_MAP_ENTRIES: usize = 300;
 /// density 下限（防止把文件压到没法看）
 const MIN_DENSITY: f32 = 0.05;
+/// 缓存重读的下限：更小的输出重发本来就便宜，stub + expand 往返反而贵
+const MIN_CACHE_BYTES: usize = 2048;
+/// 缓存条目上限（条目极小，超过整体清空防病态增长）
+const MAX_CACHE_ENTRIES: usize = 512;
+
+/// 一次已交付的读取：文件指纹 + 恢复句柄（重读命中时替换为短引用）
+struct CachedRead {
+    mtime: SystemTime,
+    size: u64,
+    /// 上次交付文本的 ctx 句柄（expand 可逐字取回）
+    handle: String,
+    delivered_bytes: u64,
+    delivered_tokens: u64,
+}
 
 pub struct ReadTool {
     env: Arc<ExecutionEnv>,
+    /// 缓存重读：(路径, 请求指纹) → 上次交付的指纹与恢复句柄。
+    /// 进程内状态：TUI 长跑会话全程有效。同参数重读且 (mtime,size)
+    /// 未变 → 返回 `[unchanged]` 短引用而非重发全文。
+    cache: Mutex<HashMap<(PathBuf, String), CachedRead>>,
 }
 
 impl ReadTool {
     pub fn new(env: Arc<ExecutionEnv>) -> Self {
-        Self { env }
+        Self {
+            env,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 命中且文件未变（mtime+size 校验）→ 返回可恢复的短引用 stub。
+    /// None = 未命中/已变/太小/无 ctx store（fail-open：正常重读）。
+    fn cache_stub(
+        &self,
+        resolved: &Path,
+        key: &str,
+        mtime: SystemTime,
+        size: u64,
+    ) -> Option<ToolOutput> {
+        // 无 ctx store 无法 spill → 不启用缓存（fail-open：正常重读）
+        self.env.ctx_store()?;
+        let cache = self.cache.lock().unwrap();
+        let entry = cache.get(&(resolved.to_path_buf(), key.to_string()))?;
+        if entry.mtime != mtime
+            || entry.size != size
+            || (entry.delivered_bytes as usize) < MIN_CACHE_BYTES
+        {
+            return None;
+        }
+        Some(
+            ToolOutput::ok(format!(
+                "[unchanged: '{}' ({key}) was read earlier in this session and has not been \
+                 modified since (verified mtime+size). Previous output ({} bytes): ctx:{} — \
+                 call the expand tool with this handle to view it again.]",
+                resolved.display(),
+                entry.delivered_bytes,
+                entry.handle
+            ))
+            .with_original_bytes(entry.delivered_bytes)
+            // 反事实口径：重发上次交付文本需要的 token
+            .with_original_tokens(entry.delivered_tokens),
+        )
+    }
+
+    /// 交付成功后记录。输出足够大才值得（阈值与 stub 相同）；spill 失败不记录。
+    fn cache_store(
+        &self,
+        resolved: &Path,
+        key: &str,
+        mtime: SystemTime,
+        size: u64,
+        delivered: &str,
+    ) {
+        let Some(dir) = self.env.ctx_store() else {
+            return;
+        };
+        if delivered.len() < MIN_CACHE_BYTES {
+            return;
+        }
+        let Some(handle) = crate::env::spill_to_store(dir, delivered) else {
+            return;
+        };
+        let mut cache = self.cache.lock().unwrap();
+        if cache.len() >= MAX_CACHE_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(
+            (resolved.to_path_buf(), key.to_string()),
+            CachedRead {
+                mtime,
+                size,
+                handle,
+                delivered_bytes: delivered.len() as u64,
+                delivered_tokens: estimate_text_tokens(delivered) as u64,
+            },
+        );
     }
 
     async fn read_full(
@@ -40,7 +131,7 @@ impl ReadTool {
         limit: Option<usize>,
         density: Option<f32>,
     ) -> ToolOutput {
-        match fs::metadata(resolved).await {
+        let meta = match fs::metadata(resolved).await {
             Ok(meta) if meta.len() > self.env.max_file_size => {
                 return ToolOutput::err(format!(
                     "[Error] file '{}' is too large ({} bytes, max {}). \
@@ -48,12 +139,20 @@ impl ReadTool {
                     resolved.display(),
                     meta.len(),
                     self.env.max_file_size
-                ))
+                ));
             }
+            Ok(meta) => meta,
             Err(e) => {
-                return ToolOutput::err(format!("[Error] reading '{}': {e}", resolved.display()))
+                return ToolOutput::err(format!("[Error] reading '{}': {e}", resolved.display()));
             }
-            _ => {}
+        };
+        // 文件指纹（mtime 不可得则不参与缓存）
+        let stamp = meta.modified().ok().map(|t| (t, meta.len()));
+        let key = format!("full:{offset}:{limit:?}:{density:?}");
+        if let Some((mtime, size)) = stamp
+            && let Some(stub) = self.cache_stub(resolved, &key, mtime, size)
+        {
+            return stub;
         }
 
         let content = match fs::read_to_string(resolved).await {
@@ -62,7 +161,7 @@ impl ReadTool {
                 return ToolOutput::err(format!(
                     "[Error] reading '{}' (binary or unreadable): {e}",
                     resolved.display()
-                ))
+                ));
             }
         };
 
@@ -89,7 +188,7 @@ impl ReadTool {
                 slice.len()
             );
             let body = format!("{header}\n{view}");
-            return self.deliver(body, slice);
+            return self.deliver_cached(body, slice, resolved, &key, stamp);
         }
 
         // 预算降级：预计超限且未显式指定 density → 自动按预算比例熵选行
@@ -107,7 +206,7 @@ impl ReadTool {
                 self.env.max_output_bytes
             );
             let body = format!("{header}\n{view}");
-            return self.deliver(body, slice);
+            return self.deliver_cached(body, slice, resolved, &key, stamp);
         }
 
         let numbered = slice
@@ -116,16 +215,29 @@ impl ReadTool {
             .map(|(i, line)| format!("{}\t{}", start + i + 1, line))
             .collect::<Vec<_>>()
             .join("\n");
-        self.deliver(numbered, slice)
+        self.deliver_cached(numbered, slice, resolved, &key, stamp)
+    }
+
+    /// 输出落账（截断保护 + 台账，字节与 token 双口径）+ 缓存记录
+    fn deliver_cached(
+        &self,
+        text: String,
+        slice: &[&str],
+        resolved: &Path,
+        key: &str,
+        stamp: Option<(SystemTime, u64)>,
+    ) -> ToolOutput {
+        let out = self.deliver(text, slice);
+        if let Some((mtime, size)) = stamp {
+            self.cache_store(resolved, key, mtime, size, &out.content);
+        }
+        out
     }
 
     /// 输出落账（截断保护 + 台账，字节与 token 双口径）
     fn deliver(&self, text: String, slice: &[&str]) -> ToolOutput {
         let original_estimate: u64 = slice.iter().map(|l| l.len() + 8).sum::<usize>() as u64;
-        let token_estimate: u64 = slice
-            .iter()
-            .map(|l| estimate_text_tokens(l) as u64)
-            .sum();
+        let token_estimate: u64 = slice.iter().map(|l| estimate_text_tokens(l) as u64).sum();
         let (delivered, truncated_at, truncated_tokens) = self.env.truncate_with_meta(&text);
         let original = truncated_at.unwrap_or(original_estimate);
         let original_tokens = truncated_tokens.unwrap_or(token_estimate);
@@ -141,7 +253,8 @@ impl ReadTool {
     /// 符号大纲：正则匹配常见语言的声明行（Rust/TS/JS/Go/Python/Java/C 系）
     fn read_signatures(&self, resolved: &std::path::Path, content: &str) -> ToolOutput {
         // AST 优先（带精确行区间），未知语言/解析失败自动回退正则
-        let symbols = crate::signatures::outline(content, crate::signatures::Lang::detect(resolved));
+        let symbols =
+            crate::signatures::outline(content, crate::signatures::Lang::detect(resolved));
         let symbols: Vec<crate::signatures::Symbol> =
             symbols.into_iter().take(MAX_SIGNATURES).collect();
 
@@ -166,7 +279,11 @@ impl ReadTool {
                 } else {
                     format!("{} {}", s.kind, s.name)
                 };
-                format!("{span:<width$}  {label}  {}", s.signature, width = span_width)
+                format!(
+                    "{span:<width$}  {label}  {}",
+                    s.signature,
+                    width = span_width
+                )
             })
             .collect();
         let header = format!(
@@ -233,11 +350,7 @@ pub fn density_view(lines: &[&str], start_index: usize, keep_ratio: f32) -> (Str
     // 按熵降序选前 keep 行（total_cmp 全序 + 索引决胜，保证确定性与排序一致性）
     let entropies: Vec<f64> = lines.iter().map(|l| line_entropy(l)).collect();
     let mut ranked: Vec<usize> = (0..total).collect();
-    ranked.sort_by(|&a, &b| {
-        entropies[b]
-            .total_cmp(&entropies[a])
-            .then(a.cmp(&b))
-    });
+    ranked.sort_by(|&a, &b| entropies[b].total_cmp(&entropies[a]).then(a.cmp(&b)));
     ranked.truncate(keep);
     ranked.sort_unstable();
 
@@ -245,8 +358,16 @@ pub fn density_view(lines: &[&str], start_index: usize, keep_ratio: f32) -> (Str
     let mut prev: Option<usize> = None;
     for &i in &ranked {
         match prev {
-            Some(p) if i > p + 1 => out.push(format!("[L{}-L{} skipped]", start_index + p + 2, start_index + i)),
-            None if i > 0 => out.push(format!("[L{}-L{} skipped]", start_index + 1, start_index + i)),
+            Some(p) if i > p + 1 => out.push(format!(
+                "[L{}-L{} skipped]",
+                start_index + p + 2,
+                start_index + i
+            )),
+            None if i > 0 => out.push(format!(
+                "[L{}-L{} skipped]",
+                start_index + 1,
+                start_index + i
+            )),
             _ => {}
         }
         out.push(format!("{}\t{}", start_index + i + 1, lines[i]));
@@ -254,7 +375,11 @@ pub fn density_view(lines: &[&str], start_index: usize, keep_ratio: f32) -> (Str
     }
     if let Some(p) = prev {
         if p + 1 < total {
-            out.push(format!("[L{}-L{} skipped]", start_index + p + 2, start_index + total));
+            out.push(format!(
+                "[L{}-L{} skipped]",
+                start_index + p + 2,
+                start_index + total
+            ));
         }
     }
     (out.join("\n"), keep)
@@ -295,14 +420,21 @@ pub(crate) fn is_signature_line(line: &str) -> bool {
             || t.starts_with("pub const")
             || t.starts_with("pub static");
     }
-    if t.starts_with("struct ") || t.starts_with("enum ") || t.starts_with("trait ")
-        || t.starts_with("impl ") || t.starts_with("mod ") || t.starts_with("macro_rules!")
+    if t.starts_with("struct ")
+        || t.starts_with("enum ")
+        || t.starts_with("trait ")
+        || t.starts_with("impl ")
+        || t.starts_with("mod ")
+        || t.starts_with("macro_rules!")
     {
         return true;
     }
     // TS/JS
-    if t.starts_with("export ") || t.starts_with("function ") || t.starts_with("class ")
-        || t.starts_with("interface ") || t.starts_with("type ")
+    if t.starts_with("export ")
+        || t.starts_with("function ")
+        || t.starts_with("class ")
+        || t.starts_with("interface ")
+        || t.starts_with("type ")
     {
         return t.contains("function")
             || t.contains("class")
@@ -312,7 +444,8 @@ pub(crate) fn is_signature_line(line: &str) -> bool {
             || t.ends_with('{');
     }
     // Go
-    if t.starts_with("func ") || t.starts_with("type ") && t.contains(" struct")
+    if t.starts_with("func ")
+        || t.starts_with("type ") && t.contains(" struct")
         || t.starts_with("type ") && t.contains(" interface")
     {
         return true;
@@ -346,7 +479,12 @@ fn walk_map(
         return;
     };
     let mut items: Vec<_> = entries.flatten().collect();
-    items.sort_by_key(|e| (e.file_type().map(|t| t.is_file()).unwrap_or(true), e.file_name()));
+    items.sort_by_key(|e| {
+        (
+            e.file_type().map(|t| t.is_file()).unwrap_or(true),
+            e.file_name(),
+        )
+    });
     for entry in items {
         if out.len() >= MAX_MAP_ENTRIES {
             return;
@@ -361,7 +499,10 @@ fn walk_map(
         }
         if path.is_dir() {
             if name.starts_with('.')
-                || matches!(name.as_str(), "target" | "node_modules" | "__pycache__" | ".venv")
+                || matches!(
+                    name.as_str(),
+                    "target" | "node_modules" | "__pycache__" | ".venv"
+                )
             {
                 continue;
             }
@@ -385,6 +526,8 @@ impl AgentTool for ReadTool {
          numbers — best first look), 'map' (compact directory tree), 'full' (numbered lines, \
          default). 'density' (0.05-1.0) keeps the highest-entropy lines in full mode. \
          Workflow: signatures first, then read the exact line range with offset/limit. \
+         Re-reading an unmodified file with identical arguments returns a short '[unchanged]' \
+         stub with a ctx: handle (use expand to view the previous output). \
          Truncated output can be recovered via the expand tool."
     }
 
@@ -439,23 +582,35 @@ impl AgentTool for ReadTool {
                         resolved.display()
                     )));
                 }
-                match fs::metadata(&resolved).await {
+                let meta = match fs::metadata(&resolved).await {
                     Ok(meta) if meta.len() > self.env.max_file_size => {
                         return Ok(ToolOutput::err(format!(
                             "[Error] file too large ({} bytes) — use grep to locate regions",
                             meta.len()
                         )));
                     }
+                    Ok(meta) => meta,
                     Err(e) => {
                         return Ok(ToolOutput::err(format!(
                             "[Error] reading '{}': {e}",
                             resolved.display()
-                        )))
+                        )));
                     }
-                    _ => {}
+                };
+                let stamp = meta.modified().ok().map(|t| (t, meta.len()));
+                if let Some((mtime, size)) = stamp
+                    && let Some(stub) = self.cache_stub(&resolved, "signatures", mtime, size)
+                {
+                    return Ok(stub);
                 }
                 match fs::read_to_string(&resolved).await {
-                    Ok(content) => Ok(self.read_signatures(&resolved, &content)),
+                    Ok(content) => {
+                        let out = self.read_signatures(&resolved, &content);
+                        if let Some((mtime, size)) = stamp {
+                            self.cache_store(&resolved, "signatures", mtime, size, &out.content);
+                        }
+                        Ok(out)
+                    }
                     Err(e) => Ok(ToolOutput::err(format!(
                         "[Error] reading '{}': {e}",
                         resolved.display()
@@ -524,7 +679,11 @@ mod tests {
         assert!(out.content.contains("impl Config"));
         assert!(out.content.contains("fn new"));
         // 行区间完整（impl 块区间）
-        assert!(out.content.contains("L8-10"), "impl spans to its closing brace: {}", out.content);
+        assert!(
+            out.content.contains("L8-10"),
+            "impl spans to its closing brace: {}",
+            out.content
+        );
         // 注释行不是符号
         assert!(!out.content.contains("header comment"));
     }
@@ -643,16 +802,16 @@ mod tests {
     fn test_density_view_selects_and_marks_gaps() {
         // 10 行：交替空行与代码行
         let lines: Vec<&str> = vec![
-            "",                          // L1 熵 0 → 被丢
-            "fn alpha() -> Config {",   // L2 保留
-            "",                          // L3 丢
+            "",                           // L1 熵 0 → 被丢
+            "fn alpha() -> Config {",     // L2 保留
+            "",                           // L3 丢
             "let x = compute(a, b, c)?;", // L4 保留
-            "",                          // L5 丢
-            "}",                         // L6 短但多样 → 可能保留
-            "// note",                   // L7 中等
-            "",                          // L8 丢
-            "pub async fn beta() {}",    // L9 保留
-            "",                          // L10 丢
+            "",                           // L5 丢
+            "}",                          // L6 短但多样 → 可能保留
+            "// note",                    // L7 中等
+            "",                           // L8 丢
+            "pub async fn beta() {}",     // L9 保留
+            "",                           // L10 丢
         ];
 
         let (view, kept) = density_view(&lines, 0, 0.4);
@@ -669,9 +828,15 @@ mod tests {
 
     #[test]
     fn test_density_view_deterministic() {
-        let lines: Vec<&str> = (0..20).map(|i| {
-            if i % 2 == 0 { "let v = value_function(x)?" } else { "" }
-        }).collect();
+        let lines: Vec<&str> = (0..20)
+            .map(|i| {
+                if i % 2 == 0 {
+                    "let v = value_function(x)?"
+                } else {
+                    ""
+                }
+            })
+            .collect();
         let (a, _) = density_view(&lines, 0, 0.3);
         let (b, _) = density_view(&lines, 0, 0.3);
         assert_eq!(a, b, "same input must produce same output");
@@ -750,5 +915,172 @@ mod tests {
             "expected CCR handle, got: {}",
             out.content.lines().last().unwrap()
         );
+    }
+
+    // ===== 缓存重读 =====
+
+    fn cached_env(dir: &tempfile::TempDir) -> Arc<ExecutionEnv> {
+        Arc::new(ExecutionEnv::new(dir.path()).with_ctx_store(dir.path().join("ctx")))
+    }
+
+    async fn big_file(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+        let content = (0..100)
+            .map(|i| format!("line {i:03}: let value_{i} = compute(input_{i}, factor)?;\n"))
+            .collect::<String>();
+        let file = dir.path().join(name);
+        fs::write(&file, content).await.unwrap();
+        file
+    }
+
+    #[tokio::test]
+    async fn test_cached_reread_returns_stub_with_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = cached_env(&dir);
+        let tool = ReadTool::new(env.clone());
+        big_file(&dir, "a.rs").await;
+
+        let first = tool
+            .execute(serde_json::json!({"path": "a.rs"}))
+            .await
+            .unwrap();
+        assert!(!first.content.contains("[unchanged:"));
+        assert!(first.content.len() >= MIN_CACHE_BYTES);
+
+        // 同参数重读：短引用 stub（带句柄 + 台账）
+        let second = tool
+            .execute(serde_json::json!({"path": "a.rs"}))
+            .await
+            .unwrap();
+        assert!(second.content.contains("[unchanged:"), "{}", second.content);
+        assert!(second.content.contains("ctx:"));
+        assert!(second.original_bytes.is_some());
+        assert_eq!(second.original_bytes, Some(first.content.len() as u64));
+        assert!(second.bytes_saved() > 0);
+        assert!(second.content.len() < first.content.len() / 10);
+
+        // 上次交付可逐字取回（expand 底层路径）
+        let handle = &second.content[second.content.find("ctx:").unwrap() + 4..][..16];
+        assert_eq!(env.retrieve(handle).unwrap(), first.content);
+    }
+
+    #[tokio::test]
+    async fn test_cache_invalidated_by_modification() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ReadTool::new(cached_env(&dir));
+        let file = big_file(&dir, "b.rs").await;
+
+        let first = tool
+            .execute(serde_json::json!({"path": "b.rs"}))
+            .await
+            .unwrap();
+        assert!(!first.content.contains("[unchanged:"));
+
+        // 修改（尺寸不同 → mtime+size 双保险失效）
+        let bigger: String = (0..150)
+            .map(|i| format!("line {i:03}: let value_{i} = compute(input_{i}, factor, extra)?;\n"))
+            .collect::<String>();
+        fs::write(&file, bigger).await.unwrap();
+
+        let reread = tool
+            .execute(serde_json::json!({"path": "b.rs"}))
+            .await
+            .unwrap();
+        assert!(
+            !reread.content.contains("[unchanged:"),
+            "must re-read after change"
+        );
+        assert!(reread.content.contains("line 149"));
+    }
+
+    #[tokio::test]
+    async fn test_cache_distinguishes_request_params() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ReadTool::new(cached_env(&dir));
+        big_file(&dir, "c.rs").await;
+
+        let _ = tool
+            .execute(serde_json::json!({"path": "c.rs"}))
+            .await
+            .unwrap();
+        // 不同参数是不同请求：完整读取，不命中缓存（limit=100 保证输出过缓存阈值）
+        let paged = tool
+            .execute(serde_json::json!({"path": "c.rs", "offset": 1, "limit": 100}))
+            .await
+            .unwrap();
+        assert!(!paged.content.contains("[unchanged:"));
+        assert!(paged.content.contains("10\tline 009"));
+        // 再来一次同样的分页 → 命中
+        let paged_again = tool
+            .execute(serde_json::json!({"path": "c.rs", "offset": 1, "limit": 100}))
+            .await
+            .unwrap();
+        assert!(
+            paged_again.content.contains("[unchanged:"),
+            "{}",
+            paged_again.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_small_files_never_stubbed() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ReadTool::new(cached_env(&dir));
+        fs::write(dir.path().join("small.txt"), "tiny content\n")
+            .await
+            .unwrap();
+
+        for _ in 0..2 {
+            let out = tool
+                .execute(serde_json::json!({"path": "small.txt"}))
+                .await
+                .unwrap();
+            assert_eq!(out.content, "1\ttiny content");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cache_requires_ctx_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ReadTool::new(Arc::new(ExecutionEnv::new(dir.path()))); // 无 ctx store
+        big_file(&dir, "d.rs").await;
+
+        let _ = tool
+            .execute(serde_json::json!({"path": "d.rs"}))
+            .await
+            .unwrap();
+        let second = tool
+            .execute(serde_json::json!({"path": "d.rs"}))
+            .await
+            .unwrap();
+        assert!(!second.content.contains("[unchanged:"));
+    }
+
+    #[tokio::test]
+    async fn test_signatures_reread_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ReadTool::new(cached_env(&dir));
+        // 足够多符号让大纲输出超过阈值
+        let code: String = (0..80)
+            .map(|i| format!("pub fn handler_{i}(input_{i}: u32, factor_{i}: u32) -> u32 {{ input_{i} + factor_{i} }}\n"))
+            .collect::<String>();
+        fs::write(dir.path().join("many.rs"), code).await.unwrap();
+
+        let first = tool
+            .execute(serde_json::json!({"path": "many.rs", "mode": "signatures"}))
+            .await
+            .unwrap();
+        assert!(!first.content.contains("[unchanged:"));
+        assert!(
+            first.content.len() >= MIN_CACHE_BYTES,
+            "{}",
+            first.content.len()
+        );
+
+        let second = tool
+            .execute(serde_json::json!({"path": "many.rs", "mode": "signatures"}))
+            .await
+            .unwrap();
+        assert!(second.content.contains("[unchanged:"), "{}", second.content);
+        assert!(second.original_bytes.is_some());
     }
 }
