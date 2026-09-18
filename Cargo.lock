@@ -169,6 +169,7 @@ dependencies = [
  "baiji-agent",
  "baiji-ai",
  "baiji-telemetry",
+ "baiji-tools",
  "chrono",
  "futures",
  "serde",

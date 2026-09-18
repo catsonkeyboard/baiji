@@ -12,12 +12,14 @@ pub mod memory;
 pub mod persist;
 pub mod session;
 pub mod skills;
+pub mod stub;
 pub mod templates;
 
 pub use compaction::{CompactionPolicy, compact, compact_with_llm, estimate_tokens};
 pub use memory::{MemoryEntry, MemoryKind, MemoryStore, MemoryTool, memory_section, project_key};
 pub use persist::{JsonlStore, Record};
 pub use session::{Session, SessionMeta, SessionTree, new_session_id};
+pub use stub::stub_tool_results;
 pub use skills::{Skill, SkillTool, load_skills};
 pub use templates::render;
 pub use templates::{PromptTemplate, load_templates};
@@ -70,6 +72,8 @@ pub struct AgentHarness {
     llm_compaction: bool,
     /// 跨会话项目记忆（None = 未启用）
     memory: Option<(Arc<MemoryStore>, String)>,
+    /// ctx store 目录（None = 禁用历史 tool result 的 stub 化）
+    ctx_store: Option<PathBuf>,
     telemetry: Arc<dyn baiji_telemetry::Telemetry>,
 }
 
@@ -95,6 +99,7 @@ impl AgentHarness {
             last_context_tokens: None,
             llm_compaction: false,
             memory: None,
+            ctx_store: None,
             telemetry: Arc::new(NoopTelemetry),
         })
     }
@@ -118,6 +123,7 @@ impl AgentHarness {
             last_context_tokens: None,
             llm_compaction: false,
             memory: None,
+            ctx_store: None,
             telemetry: Arc::new(NoopTelemetry),
         })
     }
@@ -223,6 +229,11 @@ impl AgentHarness {
     /// 启用跨会话项目记忆：有效条目注入系统提示
     pub fn set_memory(&mut self, store: Arc<MemoryStore>, project: impl Into<String>) {
         self.memory = Some((store, project.into()));
+    }
+
+    /// 启用历史 tool result 的 stub 化（与 expand 工具共用同一 ctx store）
+    pub fn set_ctx_store(&mut self, dir: impl Into<PathBuf>) {
+        self.ctx_store = Some(dir.into());
     }
 
     /// 列出存储中的全部会话（供 UI 选择器）
@@ -333,6 +344,18 @@ impl AgentHarness {
             }
             _ => self.compaction.clone(),
         };
+        // 2a. 先尝试 stub 化：保留窗口外的大体积 tool result 换成 ctx 句柄引用
+        //     （可逆、零 LLM 成本）。用常规预算判断；观察值强制的摘要场景不受影响
+        let (stubbed, stub_saved) = stub::stub_tool_results(
+            &mut self.session.messages,
+            self.ctx_store.as_deref(),
+            &self.compaction,
+        );
+        if stubbed > 0 {
+            info!(
+                "stubbed {stubbed} old tool result(s), ~{stub_saved} tokens saved (reversible via expand)"
+            );
+        }
         let compacted = if self.llm_compaction {
             compact_with_llm(
                 self.runtime.provider().as_ref(),
@@ -873,6 +896,69 @@ mod tests {
 
         // 回退到确定性摘要
         assert!(summary.contains("Turn 1:"), "fallback summary: {summary}");
+    }
+
+    #[tokio::test]
+    async fn test_run_stubs_instead_of_summarizing_when_store_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("sessions");
+        let ctx_store = dir.path().join("ctx");
+
+        let runtime = Arc::new(AgentRuntime::new(Arc::new(EchoProvider)));
+        let mut harness = AgentHarness::new(runtime, store_dir.clone()).unwrap();
+        harness.set_compaction_policy(CompactionPolicy {
+            max_estimated_tokens: 2_000,
+            keep_recent_turns: 2,
+        });
+        harness.set_ctx_store(ctx_store);
+
+        // 预置大历史：8 轮，每轮带 1.2KB 工具结果（约 2.6k token > 2k 预算）
+        for i in 0..8 {
+            harness.session.messages.push(Message::user(format!("question {i}")));
+            harness
+                .session
+                .messages
+                .push(Message::assistant(format!("answer {i}")));
+            harness.session.messages.push(Message {
+                role: baiji_ai::Role::Tool,
+                content: String::new(),
+                tool_calls: None,
+                tool_results: Some(vec![baiji_ai::ToolResult {
+                    tool_call_id: format!("t{i}"),
+                    content: "x".repeat(1200),
+                }]),
+                reasoning: None,
+            });
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        harness
+            .run("go", &tx, &CancellationToken::new(), &SteeringQueue::new())
+            .await
+            .unwrap();
+        drop(tx);
+        while (rx.try_recv()).is_ok() {}
+
+        // 旧轮次的大结果被 stub 化（带句柄），最近轮次原样
+        let contents: Vec<String> = harness
+            .session
+            .messages
+            .iter()
+            .filter_map(|m| m.tool_results.clone())
+            .flat_map(|rs| rs.into_iter().map(|r| r.content))
+            .collect();
+        assert!(
+            contents
+                .iter()
+                .any(|c| c.starts_with(stub::STUB_PREFIX)),
+            "expected stubbed results"
+        );
+        assert_eq!(contents.last().unwrap(), &"x".repeat(1200));
+
+        // stub 已把估算拉回预算内 → 无 Summary 记录（历史可逆，而非折叠）
+        let file = store_dir.join(format!("{}.jsonl", harness.session().meta.id));
+        let jsonl = std::fs::read_to_string(&file).unwrap();
+        assert!(!jsonl.contains("\"summary\""), "{jsonl}");
     }
 
     // ===== 上下文节省台账（Context IR）=====

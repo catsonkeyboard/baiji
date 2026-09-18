@@ -12,7 +12,7 @@ pub mod signatures;
 pub mod tools;
 pub mod walk;
 
-pub use env::ExecutionEnv;
+pub use env::{spill_to_store, ExecutionEnv};
 
 use baiji_agent::AgentTool;
 use std::sync::Arc;

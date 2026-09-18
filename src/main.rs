@@ -274,6 +274,9 @@ async fn main() -> Result<()> {
     // 压缩阈值随模型上下文窗口而定（不再固定 48k）
     harness.set_context_window(limits.context_length);
 
+    // 历史 tool result stub 化与 expand 工具共用同一 ctx store
+    harness.set_ctx_store(baiji_dir.join("ctx-store"));
+
     // LLM 压缩摘要（可选）
     if app_config.llm_compaction.unwrap_or(false) {
         info!("LLM compaction enabled");
