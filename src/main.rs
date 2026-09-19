@@ -496,6 +496,12 @@ async fn main() -> Result<()> {
             .map(|u| u.theme.clone())
             .unwrap_or_else(|| "dark".to_string()),
     );
+    let ui_lang = app_config
+        .ui
+        .as_ref()
+        .map(|u| u.language.clone())
+        .and_then(|l| baiji_tui::Lang::parse(&l))
+        .unwrap_or_default();
     let tui_settings = baiji_tui::RuntimeSettings {
         vendor: resolved.vendor.id.to_string(),
         endpoint: app_config.endpoint.clone(),
@@ -530,6 +536,7 @@ async fn main() -> Result<()> {
         settings_summary,
         auto_continue,
         Some(job_registry),
+        ui_lang,
     )
     .await
     {

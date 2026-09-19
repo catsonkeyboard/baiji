@@ -9,6 +9,7 @@
 
 mod app;
 mod confirm;
+mod i18n;
 mod settings;
 mod theme;
 mod ui;
@@ -19,6 +20,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 pub use confirm::{ConfirmDialog, InteractiveApprover};
+pub use i18n::{Lang, Strings};
 pub use settings::{AutoContinueConfig, RuntimeSettings};
 pub use theme::Theme;
 
@@ -28,6 +30,7 @@ pub use theme::Theme;
 /// - `config_path`：配置文件路径（/config 向导写回）
 /// - `settings`：当前生效设置镜像（/model、向导、状态栏使用）
 /// - `jobs`：后台任务注册表（/tasks、/kill；未启用时传 None）
+/// - `lang`：界面语言（ui.language；默认英文）
 pub async fn run(
     harness: Arc<tokio::sync::Mutex<AgentHarness>>,
     theme: Theme,
@@ -37,6 +40,7 @@ pub async fn run(
     settings_summary: String,
     auto_continue: AutoContinueConfig,
     jobs: Option<Arc<baiji_tools::tools::jobs::JobRegistry>>,
+    lang: Lang,
 ) -> Result<()> {
     app::App::new(
         harness,
@@ -47,6 +51,7 @@ pub async fn run(
         settings_summary,
         auto_continue,
         jobs,
+        lang,
     )
     .run()
     .await

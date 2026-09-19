@@ -307,19 +307,11 @@ fn draw_welcome(frame: &mut Frame, app: &App, area: Rect) {
 
     let mut lines: Vec<Line> = LOGO.iter().map(|row| Line::styled(*row, accent)).collect();
     lines.push(Line::from(""));
-    lines.push(Line::styled(
-        "terminal AI coding agent · 终端 AI 编程助手",
-        dim,
-    ));
+    let strings = app.strings();
+    lines.push(Line::styled(strings.welcome_tagline, dim));
     lines.push(Line::from(""));
-    lines.push(Line::styled(
-        "Enter 发送 · 运行中输入为 steering · Esc 取消 · Ctrl+C 退出",
-        dim,
-    ));
-    lines.push(Line::styled(
-        "Ctrl+O 会话 · /help 帮助 · /config 配置 · PgUp/PgDn 滚动",
-        dim,
-    ));
+    lines.push(Line::styled(strings.welcome_hint1, dim));
+    lines.push(Line::styled(strings.welcome_hint2, dim));
 
     let block = Block::new().padding(Padding::horizontal(2));
     let inner = block.inner(area);
@@ -385,7 +377,10 @@ fn draw_todo_panel(frame: &mut Frame, app: &App, chat: Rect) {
         ]));
     }
     if extra > 0 {
-        lines.push(Line::styled(format!("… 还有 {extra} 项"), dim));
+        lines.push(Line::styled(
+            crate::i18n::fill(app.strings().todo_overflow_tpl, &[&extra]),
+            dim,
+        ));
     }
 
     frame.render_widget(Clear, area);
@@ -420,15 +415,15 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         .title_bottom(Line::styled(format!(" {} ", app.hint()), dim).right_aligned());
     if running {
         block = block.title_top(Line::styled(
-            " Esc 取消 · 输入即 steering ",
+            app.strings().input_running_title,
             Style::default().fg(theme.accent),
         ));
     } else if app.plan_mode() {
         // 计划模式静态指示：非运行态才占用顶边（运行态已有 steering 提示）
         let tip = if app.awaiting_plan() {
-            " ⏸ 计划待批准：空回车=开始执行 · 输入=继续改计划 "
+            app.strings().input_plan_await_title
         } else {
-            " ⏸ 计划模式（只读） · /plan off 退出 "
+            app.strings().input_plan_title
         };
         block = block.title_top(Line::styled(tip, Style::default().fg(theme.accent)));
     }
@@ -440,7 +435,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
             .add_modifier(Modifier::BOLD),
     )];
     if app.input().is_empty() {
-        spans.push(Span::styled("输入消息，/ 开头为命令…".to_string(), dim));
+        spans.push(Span::styled(app.strings().input_placeholder, dim));
     }
     let app_input = app.input().to_string();
     spans.push(Span::raw(app_input.clone()));
@@ -512,7 +507,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(theme.accent),
         )
     } else {
-        Line::styled("就绪".to_string(), dim)
+        Line::styled(app.strings().status_ready, dim)
     };
     let right = match app.slash_ghost() {
         Some((_, usage)) => Line::styled(usage.to_string(), dim),
@@ -543,7 +538,7 @@ fn draw_confirm(frame: &mut Frame, app: &App, area: Rect) {
         .add_modifier(Modifier::BOLD);
 
     let mut lines = vec![Line::styled(
-        format!("⚠ 执行工具 {}", pending.tool_name),
+        crate::i18n::fill(app.strings().confirm_warn_tpl, &[&pending.tool_name]),
         warn,
     )];
     if hidden > 0 {
@@ -551,22 +546,22 @@ fn draw_confirm(frame: &mut Frame, app: &App, area: Rect) {
         let shown = body_height.saturating_sub(1);
         lines.extend(wrapped.iter().take(shown).cloned().map(Line::raw));
         lines.push(Line::styled(
-            format!(
-                "… 还有 {} 行未显示（窗口太小）；不确定请按 n 拒绝",
-                wrapped.len() - shown
+            crate::i18n::fill(
+                app.strings().confirm_hidden_tpl,
+                &[&(wrapped.len() - shown)],
             ),
             warn,
         ));
     } else {
         lines.extend(wrapped.into_iter().map(Line::raw));
     }
-    lines.push(Line::styled("y=允许  a=本次全部允许  n=拒绝", warn));
+    lines.push(Line::styled(app.strings().confirm_keys, warn));
 
     let widget = Paragraph::new(lines).block(
         Block::new()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .title(" 确认执行? ")
+            .title(" Confirm execution? ")
             .border_style(Style::default().fg(theme.error)),
     );
     frame.render_widget(Clear, popup);
@@ -652,7 +647,7 @@ fn draw_subagents(frame: &mut Frame, app: &App, rows: Vec<String>) {
             Block::new()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .title(" Subagents (↑↓ 选择 · r 热重载 · Esc 关闭) ")
+                .title(" Subagents (↑↓ select · r reload · Esc close) ")
                 .border_style(Style::default().fg(theme.accent)),
         )
         .highlight_style(
@@ -699,7 +694,7 @@ fn draw_picker(frame: &mut Frame, app: &App, rows: Vec<String>) {
             Block::new()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .title(" 会话 (Enter=切换 b=分叉 Esc=关闭) ")
+                .title(" Sessions (Enter=switch b=fork Esc=close) ")
                 .border_style(Style::default().fg(theme.accent)),
         )
         .highlight_style(
