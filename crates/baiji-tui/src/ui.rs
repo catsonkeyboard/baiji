@@ -436,22 +436,59 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     )];
     if app.input().is_empty() {
         spans.push(Span::styled("输入消息，/ 开头为命令…".to_string(), dim));
-    } else {
-        spans.push(Span::raw(app.input().to_string()));
     }
-    spans.push(Span::raw("▏"));
-    if let Some(ghost) = ghost_remainder(app) {
-        spans.push(Span::styled(ghost, dim));
+    let app_input = app.input().to_string();
+    spans.push(Span::raw(app_input.clone()));
+    spans.push(Span::raw(app_input.clone()));
+    // ghost 显示时不再画 ▏ 光标符——补全与已输入文本的颜色边界即光标位置
+    //（避免"输入与补全之间隔了一个字符"的观感）；无补全时 ▏ 指示光标
+    match input_ghost(app, &app_input, area.width.saturating_sub(6) as usize) {
+        Some(ghost) => spans.push(Span::styled(ghost, dim)),
+        None => spans.push(Span::raw("▏")),
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
 }
 
+/// 输入框灰色补全文本：
+/// - 裸 `/`：全部命令清单（静态 + 外部 agent），宽度内尽量多列、超限 …
+/// - `/前缀`：首个匹配命令的余下部分（紧跟已输入文本，无分隔）
+fn input_ghost(app: &App, input: &str, budget: usize) -> Option<String> {
+    if !input.starts_with('/') {
+        return None;
+    }
+    if input == "/" {
+        let names = app.command_names();
+        if names.is_empty() || budget < 8 {
+            return None;
+        }
+        let mut line = String::new();
+        let mut used = 0usize;
+        for name in names {
+            let extra = if line.is_empty() {
+                name.len()
+            } else {
+                name.len() + 1
+            };
+            if used + extra > budget.saturating_sub(1) {
+                line.push_str(" …");
+                break;
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(&name);
+            used += extra;
+        }
+        return (!line.is_empty()).then_some(line);
+    }
+    ghost_remainder(app, input)
+}
+
 /// ghost 补全的可见部分：完整 "/name " 去掉已输入前缀（大小写不敏感比较，
 /// 命令名是 ASCII，按字节切片安全）
-fn ghost_remainder(app: &App) -> Option<String> {
+fn ghost_remainder(app: &App, typed: &str) -> Option<String> {
     let (name, _) = app.slash_ghost()?;
-    let typed = app.input();
     let full = format!("/{name} ");
     if full.to_lowercase().starts_with(&typed.to_lowercase()) {
         Some(full[typed.len()..].to_string())

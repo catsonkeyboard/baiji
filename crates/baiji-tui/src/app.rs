@@ -2193,17 +2193,30 @@ impl App {
         self.wizard.is_some()
     }
 
+    /// 全部命令（静态注册表 + 外部 agent 动态命令）：裸 `/` 的清单展示用
+    pub(crate) fn command_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = SLASH_COMMANDS.iter().map(|(n, _)| n.to_string()).collect();
+        names.extend(self.settings.external_agents.iter().map(|a| a.name.clone()));
+        names
+    }
+
     /// 输入框灰色补全（供渲染与 Tab 接受）：(命令名, 用法)。
-    /// 动态命令（外部 coding agent /codex /claude /pi…）优先匹配，
-    /// 静态注册表兜底；向导输入框不属于命令语义——打开时不出补全
+    /// 裸 `/` 也给首个命令（Tab 锚点 + 清单展示后的补全目标）；
+    /// 动态命令（外部 coding agent）优先匹配，静态注册表兜底；
+    /// 参数区（含空格）与非斜杠输入不出补全；向导打开时抑制
     pub(crate) fn slash_ghost(&self) -> Option<(String, String)> {
         if self.wizard.is_some() {
             return None;
         }
         let input = self.input.as_str();
         let rest = input.strip_prefix('/')?;
-        if rest.is_empty() || rest.contains(' ') {
+        if rest.contains(' ') {
             return None;
+        }
+        if rest.is_empty() {
+            // 裸 "/"：首个命令作为 Tab 目标（完整清单由输入框 ghost 灰字展示）
+            let (name, usage) = SLASH_COMMANDS.first()?;
+            return Some((name.to_string(), usage.to_string()));
         }
         let lower = rest.to_ascii_lowercase();
         if let Some(agent) = self
@@ -2695,15 +2708,23 @@ mod tests {
             "/quit requests exit"
         );
 
-        // 输入框灰色补全（ghost）：命令输入态在光标后展示余下部分，
-        // 状态栏右侧临时显示用法；Tab 接受补全
+        // 输入框灰色补全（ghost）：补全紧跟已输入文本（颜色边界即光标，
+        // 不再有 ▏ 分隔），状态栏右侧临时显示用法；Tab 接受补全
         app.input = "/mo".to_string();
         terminal.clear().unwrap();
         terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
         let rows = screen(&terminal);
+        let input_row = rows
+            .iter()
+            .find(|r| r.contains("> /mo"))
+            .expect("input row");
         assert!(
-            rows.iter().any(|r| r.contains("/mo▏del ")),
-            "ghost completion visible after the cursor"
+            input_row.contains("/model "),
+            "ghost continues the typed text with no separator: {input_row}"
+        );
+        assert!(
+            !input_row.contains('▏'),
+            "no cursor artifact while ghosting"
         );
         assert!(
             rows.iter()
@@ -2718,6 +2739,32 @@ mod tests {
             app.input = input.to_string();
             terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
         }
+
+        // 裸 "/"：展示全部命令清单（灰字，宽度内尽量多列）+ Tab 补全首个
+        app.input = "/".to_string();
+        terminal.clear().unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let rows = screen(&terminal);
+        let bare_row = rows
+            .iter()
+            .find(|r| r.contains("> /"))
+            .expect("bare slash row");
+        assert!(
+            bare_row.contains("btw") && bare_row.contains("compact"),
+            "bare slash lists the commands: {bare_row}"
+        );
+        assert!(
+            bare_row.contains('…'),
+            "list is width-capped with an ellipsis"
+        );
+        assert!(!bare_row.contains('▏'));
+        app.handle_key(KeyEvent::new(K::Tab, M::NONE), &ui_tx).await;
+        assert_eq!(
+            app.input(),
+            "/btw ",
+            "Tab from bare slash completes the first command"
+        );
+        app.input.clear();
 
         // 向导打开（overlay 渲染路径）
         app.input.clear();
