@@ -142,6 +142,8 @@ async fn main() -> Result<()> {
     if !app_config.policy.compression_enabled {
         env = env.without_compression();
     }
+    // 外部 coding agent 工具共用同一执行环境（env 随后移入 builtin_tools）
+    let agent_env = Arc::new(env.clone());
 
     let mut tools = ToolRegistry::new();
     // 注册表同 bash(生产)/jobs(消费) 共享，TUI 的 /tasks、/kill 也用它
@@ -222,6 +224,22 @@ async fn main() -> Result<()> {
             .with_provider_config(provider_config.clone()),
     ));
     info!("subagent task tool registered (read-only tools, max 20 turns, roles dispatchable)");
+
+    // ---- 外部 coding agent 工具（codex/claude/pi 等；external_agents 配置）----
+    // 名称非法或与已有工具冲突的条目跳过并告警；env 与内置工具同源
+    let external_agent_specs = app_config.external_agents.clone().unwrap_or_default();
+    let external_count =
+        baiji_tools::register_external_agents(&mut tools, &agent_env, &external_agent_specs);
+    if external_count > 0 {
+        info!(
+            "external coding agents registered ({external_count}): {}",
+            external_agent_specs
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     // ---- 插件 ----
     let mut hooks = HookRegistry::new();
@@ -487,6 +505,7 @@ async fn main() -> Result<()> {
             .thinking
             .as_deref()
             .and_then(baiji_ai::ThinkingLevel::parse),
+        external_agents: external_agent_specs,
     };
     let config_path = config::AppConfig::default_path()?;
 

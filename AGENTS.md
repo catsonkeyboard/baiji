@@ -7,7 +7,7 @@ A terminal AI coding agent built on a multi-crate Rust workspace: async streamin
 ```bash
 cargo build                # Build the whole workspace
 cargo run                  # Run the TUI app (default)
-cargo test --workspace     # Run all tests (358 total)
+cargo test --workspace     # Run all tests (364 total)
 baiji -e "msg" --yes      # Headless one-shot run (streams to stdout)
 baiji -e "msg" --plan     # Read-only planning run (plan mode)
 baiji --sessions          # List sessions (no API key needed)
@@ -62,6 +62,11 @@ Dependency direction: telemetry ← ai ← agent ← tools ← harness ← {tui,
     "base_delay_ms": 500,
     "max_delay_ms": 30000
   },
+  "external_agents": [
+    {"name": "codex", "command": "codex exec {prompt}", "timeout_secs": 300},
+    {"name": "claude", "command": "claude -p {prompt}", "timeout_secs": 300},
+    {"name": "pi", "command": "pi -p {prompt}", "timeout_secs": 300}
+  ],
   "policy": {
     "allowed_paths": [],
     "require_confirmation_tools": ["bash", "write", "edit"],
@@ -169,6 +174,8 @@ run()
 **tree-sitter index** (`signatures.rs` / `index.rs`): AST symbol extraction for Rust/Python/JS/TS/Go (`Symbol { name, kind, line_start, line_end, signature }`, ≤500/file; regex fallback for other languages or parse failures). `CodeIndex` scans on demand (≤2000 files, same skip rules as grep) building a symbol table + import edges per file. Tools built on it: `search` (BM25 over symbol+filename docs — identifiers split on camelCase/snake_case/abbreviations; results are `path:L start-end` anchors feeding read offset/limit) and `imports` (outgoing edges of a file / incoming importers = change impact).
 
 `ExecutionEnv`: workdir, `allowed_roots` path whitelist with lexical `..` normalization (no fs canonicalization — works for not-yet-existing paths), byte-boundary-safe output truncation, `max_file_size` 1MB, bash timeout 30s default.
+
+**External coding agent tools** (`tools/external_agent.rs`): the global `external_agents` config registers each entry as a same-named tool AND slash command (template ships codex/claude/pi presets: `codex exec {prompt}`, `claude -p {prompt}`, `pi -p {prompt}`). `{prompt}` is shell-quoted and substituted (no placeholder = appended as the last argument); execution reuses bash's process-group kill and capped capture, output gets ANSI-strip + byte truncation only (agent answers are prose — no lossy domain compression), timeout per entry (`timeout_secs`, default 300, cap 3600). Non-zero exit/timeout are `is_error` results. Registration validates names (non-empty, no whitespace) and skips conflicts with existing tools. Security: these agents run shell and edit the workspace — `external_agents` is global-only (project scope dropped by the whitelist), they are NOT in the plan-mode or subagent read-only whitelists, and can be HITL-gated by adding their names to `require_confirmation_tools`. The TUI exposes them as dynamic slash commands (`/codex <task>` …): ghost completion + Tab work, dispatch runs in a background task rendering via the Agent event stream (`● codex(...)` / `⎿ output`), Esc kills the process group, output stays local (not in session history).
 
 **CCR (reversible truncation)**: when output exceeds `max_output_bytes` or a lossy domain compression applies, and the ctx store is enabled (default: `~/.baiji/ctx-store/`), the full content is spilled to a SHA-256 content-addressed file and the marker carries `ctx:<handle16>`; the `expand` tool retrieves it (with offset/limit paging). Truncation is never information loss. Store lifecycle: handle files older than the TTL (default 7 days, `with_ctx_store_ttl`) are pruned on store init (once per process); only 16-hex handle-named files are ever removed.
 

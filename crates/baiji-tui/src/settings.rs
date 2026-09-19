@@ -20,6 +20,8 @@ pub struct RuntimeSettings {
     pub api_key: String,
     /// 思考级别（None = 不启用）
     pub thinking: Option<baiji_ai::ThinkingLevel>,
+    /// 外部 coding agent（动态斜杠命令 /codex /claude /pi …）
+    pub external_agents: Vec<baiji_tools::tools::external_agent::ExternalAgentSpec>,
 }
 
 /// 自动接力配置（T4）：run 结束且 todo 未完成时自动继续
@@ -68,6 +70,13 @@ pub fn load(config_path: &Path) -> Result<RuntimeSettings> {
         thinking: value["thinking"]
             .as_str()
             .and_then(baiji_ai::ThinkingLevel::parse),
+        external_agents: serde_json::from_value(
+            value
+                .get("external_agents")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([])),
+        )
+        .unwrap_or_default(),
     })
 }
 
@@ -241,6 +250,7 @@ mod tests {
             model: Some("glm-4.7".to_string()),
             api_key: "sk-live".to_string(),
             thinking: None,
+            external_agents: Vec::new(),
         };
         save(&path, &updated, KeyUpdate::Keep).unwrap();
 
@@ -292,6 +302,7 @@ mod tests {
             model: Some("glm-4.7".to_string()),
             api_key: "sk-test".to_string(),
             thinking: None,
+            external_agents: Vec::new(),
         };
         let provider = build_provider(&settings).unwrap();
         assert_eq!(provider.protocol(), baiji_ai::Protocol::OpenAIChat);
@@ -301,6 +312,7 @@ mod tests {
         let bad = RuntimeSettings {
             api_key: String::new(),
             thinking: None,
+            external_agents: Vec::new(),
             ..settings.clone()
         };
         assert!(build_provider(&bad).is_err());
@@ -319,6 +331,7 @@ mod tests {
             model: Some("glm-4.7".to_string()),
             api_key: String::new(),
             thinking: None,
+            external_agents: Vec::new(),
         };
         assert_eq!(status_hint(&settings), "智谱 GLM · glm-4.7");
         let settings = RuntimeSettings {

@@ -987,6 +987,7 @@ impl App {
             model: None,
             api_key: self.wizard_key(wizard),
             thinking: self.settings.thinking,
+            external_agents: self.settings.external_agents.clone(),
         };
         let Some(tx) = &self.models_tx else { return };
         let tx = tx.clone();
@@ -1041,8 +1042,9 @@ impl App {
             endpoint: wizard.endpoint.filter(|e| e != "api"),
             model: wizard.model,
             api_key,
-            // 向导不动思考级别：沿用当前值（save 会一并落盘）
+            // 向导不动思考级别与外部 agent：沿用当前值（save 会一并落盘）
             thinking: self.settings.thinking,
+            external_agents: self.settings.external_agents.clone(),
         };
 
         if let Err(e) = settings::save(&self.config_path, &new_settings, key_update) {
@@ -1138,8 +1140,20 @@ impl App {
             }
             "status" => {
                 let s = &self.settings;
+                let external = if s.external_agents.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "\n外部 agent: {}",
+                        s.external_agents
+                            .iter()
+                            .map(|a| format!("/{}", a.name))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    )
+                };
                 self.lines.push(ChatLine::System(format!(
-                    "vendor: {} · endpoint: {} · model: {} · thinking: {} · session: {}\n计划模式: {} · {}",
+                    "vendor: {} · endpoint: {} · model: {} · thinking: {} · session: {}\n计划模式: {} · {}{external}",
                     s.vendor,
                     s.endpoint.as_deref().unwrap_or("api"),
                     s.model.as_deref().unwrap_or("自动发现"),
@@ -1452,10 +1466,34 @@ impl App {
                 "旁路提问尚未实现（规划中：不写入当前会话历史的一次性问答）".to_string(),
             )),
             other => {
-                let list: Vec<String> = SLASH_COMMANDS
+                // 外部 coding agent 动态命令：/codex <任务> /claude <任务> …
+                if let Some(spec) = self
+                    .settings
+                    .external_agents
+                    .iter()
+                    .find(|a| a.name == other)
+                    .cloned()
+                {
+                    let prompt = args.trim().to_string();
+                    if prompt.is_empty() {
+                        self.lines.push(ChatLine::System(format!(
+                            "用法：/{} <任务描述>（委托给外部 {} agent CLI）",
+                            spec.name, spec.name
+                        )));
+                    } else {
+                        self.lines
+                            .push(ChatLine::user(format!("/{} {prompt}", spec.name)));
+                        self.spawn_external_agent(spec, prompt, ui_tx.clone());
+                    }
+                    return false;
+                }
+                let mut list: Vec<String> = SLASH_COMMANDS
                     .iter()
                     .map(|(name, _)| format!("/{name}"))
                     .collect();
+                for agent in &self.settings.external_agents {
+                    list.push(format!("/{}", agent.name));
+                }
                 self.lines.push(ChatLine::System(format!(
                     "未知命令 /{other}（可用: {} · Tab 可补全）",
                     list.join(" ")
@@ -1837,6 +1875,59 @@ impl App {
         self.scroll = usize::MAX; // 哨兵值，渲染时钳制
     }
 
+    /// 外部 coding agent 运行（后台任务）：复用 Agent 事件流渲染进度——
+    /// ToolStarted/ToolFinished 画 ●/⎿ 行，RunCompleted 复位运行态；
+    /// Esc 经共享 cancel 令牌击杀进程组。输出不进会话历史（本地展示）
+    fn spawn_external_agent(
+        &mut self,
+        spec: baiji_tools::tools::external_agent::ExternalAgentSpec,
+        prompt: String,
+        ui_tx: UnboundedSender<UiEvent>,
+    ) {
+        self.agent_running = true;
+        self.run_interrupted = false;
+        let cancel = CancellationToken::new();
+        self.cancel = cancel.clone();
+        let workdir = self.workdir.clone();
+
+        tokio::spawn(async move {
+            let _ = ui_tx.send(UiEvent::Agent(AgentEvent::ToolStarted {
+                id: spec.name.clone(),
+                name: spec.name.clone(),
+                args: serde_json::json!({"prompt": prompt}),
+            }));
+            let (output, is_error) = tokio::select! {
+                _ = cancel.cancelled() => (
+                    "[已取消] 外部 agent 被用户中断".to_string(),
+                    true,
+                ),
+                result = baiji_tools::tools::external_agent::run_external(
+                    &spec, &prompt, &workdir,
+                ) => match result {
+                    Ok(text) => {
+                        let is_error = text.starts_with("[external agent exited with")
+                            || text.starts_with("[Timeout]");
+                        (text, is_error)
+                    }
+                    Err(text) => (text, true),
+                },
+            };
+            let _ = ui_tx.send(UiEvent::Agent(AgentEvent::ToolFinished {
+                id: spec.name.clone(),
+                name: spec.name.clone(),
+                output,
+                is_error,
+                duration_ms: 0,
+                original_bytes: None,
+                original_tokens: None,
+            }));
+            // 复位运行态（空答案不产生额外聊天行）
+            let _ = ui_tx.send(UiEvent::Agent(AgentEvent::RunCompleted {
+                answer: String::new(),
+            }));
+        });
+    }
+
     /// 启动一次 agent 运行（后台任务），事件转发回 UI 通道
     fn spawn_run(&mut self, text: String, ui_tx: UnboundedSender<UiEvent>) {
         self.agent_running = true;
@@ -2103,12 +2194,33 @@ impl App {
     }
 
     /// 输入框灰色补全（供渲染与 Tab 接受）：(命令名, 用法)。
-    /// 向导输入框不属于命令语义——打开时不出补全
-    pub(crate) fn slash_ghost(&self) -> Option<(&'static str, &'static str)> {
+    /// 动态命令（外部 coding agent /codex /claude /pi…）优先匹配，
+    /// 静态注册表兜底；向导输入框不属于命令语义——打开时不出补全
+    pub(crate) fn slash_ghost(&self) -> Option<(String, String)> {
         if self.wizard.is_some() {
             return None;
         }
-        ghost_completion(&self.input)
+        let input = self.input.as_str();
+        let rest = input.strip_prefix('/')?;
+        if rest.is_empty() || rest.contains(' ') {
+            return None;
+        }
+        let lower = rest.to_ascii_lowercase();
+        if let Some(agent) = self
+            .settings
+            .external_agents
+            .iter()
+            .find(|a| a.name.to_lowercase().starts_with(&lower))
+        {
+            return Some((
+                agent.name.clone(),
+                format!(
+                    "委托任务给外部 {} agent：/{} <任务描述>",
+                    agent.name, agent.name
+                ),
+            ));
+        }
+        ghost_completion(input).map(|(n, u)| (n.to_string(), u.to_string()))
     }
 
     /// 向导标题（按步骤）
@@ -2270,6 +2382,13 @@ mod tests {
                 model: Some("glm-4.7".to_string()),
                 api_key: "k".to_string(),
                 thinking: None,
+                // 假外部 agent：验证动态命令 ghost 与分发（printf 立即返回）
+                external_agents: vec![baiji_tools::tools::external_agent::ExternalAgentSpec {
+                    name: "fakeagent".to_string(),
+                    command: "printf 'ans:%s' {prompt}".to_string(),
+                    description: String::new(),
+                    timeout_secs: 10,
+                }],
             },
             "max_turns: 24 · compaction: on (auto)".to_string(),
             AutoContinueConfig::default(),
@@ -2515,6 +2634,42 @@ mod tests {
         // Esc 关闭
         app.handle_key(KeyEvent::new(K::Esc, M::NONE), &ui_tx).await;
         assert!(app.subagents_rows().is_none(), "panel closes");
+
+        // 外部 coding agent 动态命令：ghost 提示 → Tab 补全 → 分发执行
+        app.input = "/fak".to_string();
+        let ghost = app.slash_ghost().expect("dynamic agent ghost");
+        assert_eq!(ghost.0, "fakeagent");
+        assert!(ghost.1.contains("外部"), "{}", ghost.1);
+        app.handle_key(KeyEvent::new(K::Tab, M::NONE), &ui_tx).await;
+        assert_eq!(
+            app.input(),
+            "/fakeagent ",
+            "Tab completes the dynamic command"
+        );
+        // 分发：独立通道收事件（ToolStarted / ToolFinished / RunCompleted）
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        app.handle_slash("fakeagent", "hello", &tx2).await;
+        assert!(app.agent_running, "external run marks the running state");
+        let mut finished = String::new();
+        let mut seen = 0;
+        while seen < 3 {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), rx2.recv())
+                .await
+                .expect("event within timeout")
+                .expect("channel open");
+            if let UiEvent::Agent(AgentEvent::ToolFinished { output, .. }) = ev {
+                finished = output;
+            }
+            seen += 1;
+        }
+        assert!(finished.contains("ans:hello"), "{finished}");
+        assert!(
+            app.lines
+                .iter()
+                .any(|l| matches!(l, ChatLine::User(s) if s.contains("/fakeagent hello"))),
+            "the prompt is echoed into the chat"
+        );
+        app.agent_running = false; // RunCompleted 由事件循环处理，这里手动复位
 
         // /todos 与 /quit 命令分发（Enter 路径）
         let ui_tx = tokio::sync::mpsc::unbounded_channel().0;

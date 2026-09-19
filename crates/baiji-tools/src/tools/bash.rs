@@ -17,18 +17,18 @@ const MAX_TIMEOUT_MS: u64 = 300_000;
 const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 /// 主进程退出后等待管道读空的宽限期。后台子进程（`server &`）会一直持有管道，
 /// 不能等 EOF，否则调用会挂到超时
-const PIPE_DRAIN_GRACE: Duration = Duration::from_millis(300);
+pub(crate) const PIPE_DRAIN_GRACE: Duration = Duration::from_millis(300);
 
 /// 有上限的流捕获：持续读取（避免子进程因管道写满而阻塞），只保留前 `MAX_CAPTURE_BYTES`
 #[derive(Default)]
-struct Captured {
+pub(crate) struct Captured {
     data: Vec<u8>,
     total: usize,
 }
 
 type SharedCapture = Arc<std::sync::Mutex<Captured>>;
 
-fn spawn_capture<R>(reader: Option<R>) -> (SharedCapture, tokio::task::JoinHandle<()>)
+pub(crate) fn spawn_capture<R>(reader: Option<R>) -> (SharedCapture, tokio::task::JoinHandle<()>)
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -54,7 +54,7 @@ where
 }
 
 /// 等读取任务在宽限期内结束；超时则放弃（后台进程仍持有管道），取已读到的内容
-async fn finish_capture(
+pub(crate) async fn finish_capture(
     shared: SharedCapture,
     mut handle: tokio::task::JoinHandle<()>,
     grace: Duration,
@@ -77,10 +77,14 @@ async fn finish_capture(
 /// 进程组击杀守卫：超时、或 future 被丢弃（取消）时 SIGKILL 整个进程组，
 /// 连同 `npm test` 这类命令派生的孙进程一起清理。正常退出后 disarm——
 /// 用户有意放到后台的进程不受影响。
-struct GroupKillGuard(Option<u32>);
+pub(crate) struct GroupKillGuard(Option<u32>);
 
 impl GroupKillGuard {
-    fn disarm(&mut self) {
+    pub(crate) fn new(pgid: Option<u32>) -> Self {
+        Self(pgid)
+    }
+
+    pub(crate) fn disarm(&mut self) {
         self.0 = None;
     }
 }
