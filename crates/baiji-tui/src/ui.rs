@@ -444,7 +444,6 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     }
     let app_input = app.input().to_string();
     spans.push(Span::raw(app_input.clone()));
-    spans.push(Span::raw(app_input.clone()));
     // ghost 显示时不再画 ▏ 光标符——补全与已输入文本的颜色边界即光标位置
     //（避免"输入与补全之间隔了一个字符"的观感）；无补全时 ▏ 指示光标
     match input_ghost(app, &app_input, area.width.saturating_sub(6) as usize) {

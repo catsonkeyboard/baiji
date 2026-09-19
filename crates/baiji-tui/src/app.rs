@@ -2775,6 +2775,19 @@ mod tests {
         );
         app.input.clear();
 
+        // 输入单字符渲染恰好一次（回归：输入框曾把已输入文本重复渲染两遍）
+        app.input = "s".to_string();
+        terminal.clear().unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let rows = screen(&terminal);
+        let row = rows.iter().find(|r| r.contains("> s")).expect("input row");
+        assert_eq!(
+            row.matches('s').count(),
+            1,
+            "typed char rendered exactly once: {row}"
+        );
+        app.input.clear();
+
         // 向导打开（overlay 渲染路径）
         app.input.clear();
         app.wizard = Some(ConfigWizard::new("glm", None));
