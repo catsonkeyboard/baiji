@@ -124,7 +124,8 @@ async fn main() -> Result<()> {
     );
     let model_name = provider_config.model.clone();
     let api_key = provider_config.api_key.clone();
-    let provider = baiji_ai::build_provider(provider_config)?;
+    // clone 留底：子代理角色的 model 字段按此原料构建独立 provider
+    let provider = baiji_ai::build_provider(provider_config.clone())?;
     info!("model: {}", model_name);
 
     // ---- 执行环境与工具 ----
@@ -201,8 +202,12 @@ async fn main() -> Result<()> {
         Err(e) => warn!("MCP discovery failed: {e}"),
     }
 
-    // ---- 子代理 task 工具（T8）：只读工具子集 + 独立上下文 ----
-    // 中间输出不进主对话；Provider 在此快照（热切换不传播，重启生效）
+    // ---- 子代理 task 工具（T8）：只读工具子集 + 独立上下文 + 可定义角色 ----
+    // 中间输出不进主对话；角色（agents/*.md）经共享注册表分发，/subagents r 热重载
+    let agent_dirs = vec![baiji_dir.join("agents"), workdir.join(".baiji/agents")];
+    let subagent_registry = Arc::new(baiji_agent::SubagentRegistry::new(agent_dirs));
+    let role_count = subagent_registry.load();
+    info!("subagent roles loaded: {role_count}");
     let sub_tools: Vec<Arc<dyn baiji_agent::AgentTool>> = tools
         .tools()
         .iter()
@@ -210,9 +215,13 @@ async fn main() -> Result<()> {
         .cloned()
         .collect();
     tools.register(Arc::new(
-        baiji_agent::SubagentTool::new(provider.clone(), sub_tools).with_max_turns(12),
+        baiji_agent::SubagentTool::new(provider.clone(), sub_tools)
+            .with_max_turns(12)
+            .with_roles(subagent_registry.clone())
+            // 角色 model 字段生效的原料（无则角色回落父级 provider）
+            .with_provider_config(provider_config.clone()),
     ));
-    info!("subagent task tool registered (read-only tools, max 12 turns)");
+    info!("subagent task tool registered (read-only tools, max 12 turns, roles dispatchable)");
 
     // ---- 插件 ----
     let mut hooks = HookRegistry::new();
@@ -371,6 +380,9 @@ async fn main() -> Result<()> {
 
     // 任务清单（与已注册的 TodoTool 共享存储）
     harness.set_todos(todo_store);
+
+    // 子代理角色（与已注册的 task 工具共享注册表：分发 + 系统提示段）
+    harness.set_subagents(subagent_registry);
 
     // LLM 压缩摘要（可选）
     if app_config.llm_compaction.unwrap_or(false) {

@@ -46,6 +46,30 @@ tools are blocked and not shown to you. Explore the codebase with read-only tool
 Do not guess missing information — ask the user instead. The user approves the plan before \
 any execution happens; until then never attempt to change anything.";
 
+/// 系统提示的 Subagents 段：列出可分发角色（progressive disclosure——
+/// 正文/工具集/模型等细节在 task 工具执行时按名生效）
+fn subagents_section(roles: &[baiji_agent::AgentRole]) -> Option<String> {
+    if roles.is_empty() {
+        return None;
+    }
+    let lines: Vec<String> = roles
+        .iter()
+        .map(|r| {
+            if r.description.is_empty() {
+                format!("- {}", r.name)
+            } else {
+                format!("- {}: {}", r.name, r.description)
+            }
+        })
+        .collect();
+    Some(format!(
+        "## Subagents\nDispatch self-contained subtasks with the `task` tool (pass `agent` = role name \
+         to use that role's own prompt/tools/model/budget). Issue multiple `task` calls in one \
+         turn to run subagents in parallel.\n{}",
+        lines.join("\n")
+    ))
+}
+
 /// 自动接力判定（TUI / headless 共用）：
 /// 自主模式开 && todo 有未完成项 && 本次 run 正常完成（未被取消/失败）
 /// && 累计轮次未超上限。上限按"一次用户输入触发的接力链"计，
@@ -113,6 +137,8 @@ pub struct AgentHarness {
     ctx_store: Option<PathBuf>,
     /// 会话级任务清单（与 TodoTool 共享；None = 未启用 todo 工具）
     todos: Option<Arc<TodoStore>>,
+    /// 可定义子代理角色注册表（None = 未启用 agent 文件/角色分发）
+    subagents: Option<Arc<baiji_agent::SubagentRegistry>>,
     /// usage 锚点：最近一次厂商上报的真实上下文占用 + 当时的消息数。
     /// 压缩触发估算 = usage + 锚点后新增消息的字符估算（参考 pi 的
     /// estimateContextTokens——不可见的系统提示/工具定义/tokenizer 差异
@@ -169,6 +195,7 @@ impl AgentHarness {
             memory: None,
             ctx_store: None,
             todos: None,
+            subagents: None,
             usage_anchor: None,
             history_version: 0,
             telemetry: Arc::new(NoopTelemetry),
@@ -196,6 +223,7 @@ impl AgentHarness {
             memory: None,
             ctx_store: None,
             todos: None,
+            subagents: None,
             usage_anchor: None,
             history_version: 0,
             telemetry: Arc::new(NoopTelemetry),
@@ -450,6 +478,32 @@ impl AgentHarness {
         self.runtime.plan_mode()
     }
 
+    /// 启用可定义子代理角色（task 工具分发与系统提示 Subagents 段共享同一注册表）
+    pub fn set_subagents(&mut self, registry: Arc<baiji_agent::SubagentRegistry>) {
+        self.subagents = Some(registry);
+    }
+
+    /// 当前角色快照（TUI /subagents 面板展示）
+    pub fn subagent_roles(&self) -> Vec<baiji_agent::AgentRole> {
+        self.subagents
+            .as_ref()
+            .map(|r| r.roles())
+            .unwrap_or_default()
+    }
+
+    /// 从磁盘热重载角色（编辑 agent 文件后免重启生效），返回角色数
+    pub fn subagents_reload(&self) -> usize {
+        self.subagents.as_ref().map(|r| r.load()).unwrap_or(0)
+    }
+
+    /// 角色目录（管理界面展示）
+    pub fn subagent_dirs(&self) -> Vec<PathBuf> {
+        self.subagents
+            .as_ref()
+            .map(|r| r.dirs().to_vec())
+            .unwrap_or_default()
+    }
+
     /// 当前思考级别
     pub fn thinking_level(&self) -> Option<baiji_ai::ThinkingLevel> {
         self.runtime.thinking()
@@ -499,6 +553,17 @@ impl AgentHarness {
         if let Some(todos) = &self.todos
             && let Some(section) = todo_section(&todos.items())
         {
+            prompt.push_str("\n\n");
+            prompt.push_str(&section);
+        }
+        // 可定义子代理角色清单（progressive disclosure：模型按 agent 名分发）
+        if let Some(section) = subagents_section(
+            &self
+                .subagents
+                .as_ref()
+                .map(|r| r.roles())
+                .unwrap_or_default(),
+        ) {
             prompt.push_str("\n\n");
             prompt.push_str(&section);
         }
@@ -1640,7 +1705,12 @@ mod tests {
         for i in 0..4 {
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             harness
-                .run(&format!("q{i}"), &tx, &CancellationToken::new(), &SteeringQueue::new())
+                .run(
+                    &format!("q{i}"),
+                    &tx,
+                    &CancellationToken::new(),
+                    &SteeringQueue::new(),
+                )
                 .await
                 .unwrap();
         }
@@ -1655,7 +1725,41 @@ mod tests {
 
         // 落盘可重放：重载后首条同样是摘要
         let loaded = JsonlStore::new(store_dir).load(&old_id).unwrap();
-        assert!(loaded.messages[0].content.starts_with("[Conversation Summary]"));
+        assert!(
+            loaded.messages[0]
+                .content
+                .starts_with("[Conversation Summary]")
+        );
+    }
+
+    #[test]
+    fn test_subagents_section_accessors_and_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents_dir = dir.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("reviewer.md"),
+            "---\nname: reviewer\ndescription: finds issues\n---\nYou review code.",
+        )
+        .unwrap();
+
+        let runtime = Arc::new(AgentRuntime::new(Arc::new(EchoProvider)));
+        let mut harness = AgentHarness::new(runtime, dir.path().join("sessions")).unwrap();
+        // 未启用：无段落、访问器为空
+        assert!(harness.subagent_roles().is_empty());
+        assert!(!harness.system_prompt().contains("## Subagents"));
+
+        let registry = Arc::new(baiji_agent::SubagentRegistry::new(vec![agents_dir.clone()]));
+        assert_eq!(registry.load(), 1);
+        harness.set_subagents(registry);
+
+        let prompt = harness.system_prompt();
+        assert!(prompt.contains("## Subagents"), "{prompt}");
+        assert!(prompt.contains("- reviewer: finds issues"), "{prompt}");
+        assert!(prompt.contains("in parallel"), "{prompt}");
+        assert_eq!(harness.subagent_roles().len(), 1);
+        assert_eq!(harness.subagents_reload(), 1);
+        assert_eq!(harness.subagent_dirs(), vec![agents_dir]);
     }
 
     #[tokio::test]
