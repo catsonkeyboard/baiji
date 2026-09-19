@@ -47,7 +47,7 @@ pub fn status_hint(settings: &RuntimeSettings) -> String {
     let name = vendor
         .map(|v| v.display_name)
         .unwrap_or_else(|| settings.vendor.as_str());
-    let model = settings.model.as_deref().unwrap_or("自动发现");
+    let model = settings.model.as_deref().unwrap_or("auto");
     format!("{name} · {model}")
 }
 
@@ -338,6 +338,6 @@ mod tests {
             model: None,
             ..settings
         };
-        assert!(status_hint(&settings).contains("自动发现"));
+        assert!(status_hint(&settings).contains("auto"));
     }
 }

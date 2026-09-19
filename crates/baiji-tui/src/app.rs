@@ -155,52 +155,114 @@ fn read_git_branch(dir: &std::path::Path) -> Option<String> {
     None
 }
 
-/// 斜杠命令注册表：(名称, 用法说明)。字典序——ghost 补全取首个前缀匹配
-pub const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("btw", "旁路提问：一次性问答，不写入当前会话历史（规划中）"),
-    ("compact", "手动压缩当前会话上下文（旧结果 stub 化 + 摘要）"),
+/// 斜杠命令注册表：(名称, 英文用法, 中文用法)。字典序——ghost 补全取首个前缀匹配
+pub const SLASH_COMMANDS: &[(&str, &str, &str)] = &[
+    (
+        "btw",
+        "Side-channel one-off question, not written to session history (planned)",
+        "旁路提问：一次性问答，不写入当前会话历史（规划中）",
+    ),
+    (
+        "compact",
+        "Manually compact the session context (stub old results + summary)",
+        "手动压缩当前会话上下文（旧结果 stub 化 + 摘要）",
+    ),
     (
         "config",
+        "Open the config wizard: vendor → endpoint → API key → model (hot-applied)",
         "打开配置向导：选厂商 → 端点 → API Key → 模型（热生效）",
     ),
     (
         "fork",
+        "Fork the session: /fork inherits all history; /fork <n> rewinds n turns",
         "分叉会话：/fork 继承全部历史；/fork <n> 回到 n 轮之前重来（原会话保留）",
     ),
-    ("help", "显示命令帮助"),
-    ("kill", "停止后台任务：/kill <id>（列表见 /tasks）"),
-    ("model", "切换模型：/model <名称>，或不带参数打开模型选择器"),
-    ("new", "开新会话（当前会话完整保留在磁盘）"),
+    ("help", "Show command help", "显示命令帮助"),
+    (
+        "kill",
+        "Stop a background job: /kill <id> (list via /tasks)",
+        "停止后台任务：/kill <id>（列表见 /tasks）",
+    ),
+    (
+        "model",
+        "Switch model: /model <name>, or no argument opens the picker",
+        "切换模型：/model <名称>，或不带参数打开模型选择器",
+    ),
+    (
+        "new",
+        "Start a new session (the current one is kept on disk)",
+        "开新会话（当前会话完整保留在磁盘）",
+    ),
     (
         "plan",
+        "Plan mode: /plan toggles read-only planning; /plan <goal> starts planning; Enter approves",
         "计划模式：/plan 切换只读规划态；/plan <目标> 开始规划；计划给出后 Enter 批准执行",
     ),
-    ("quit", "退出 baiji"),
-    ("resume", "恢复其它会话（打开会话选择器）"),
-    ("session", "显示当前会话信息与统计"),
-    ("status", "查看当前 vendor / endpoint / model / session"),
+    ("quit", "Exit baiji", "退出 baiji"),
+    (
+        "resume",
+        "Resume another session (opens the session picker)",
+        "恢复其它会话（打开会话选择器）",
+    ),
+    (
+        "session",
+        "Show current session info and stats",
+        "显示当前会话信息与统计",
+    ),
+    (
+        "status",
+        "Show current vendor / endpoint / model / session",
+        "查看当前 vendor / endpoint / model / session",
+    ),
     (
         "subagents",
+        "Manage subagent roles: inspect / hot-reload (agents/*.md)",
         "管理子代理角色：查看/热重载（agents/*.md 定义的角色）",
     ),
-    ("tasks", "查看后台任务列表"),
+    ("tasks", "List background jobs", "查看后台任务列表"),
     (
         "thinking",
+        "Set the thinking level: /thinking <minimal|low|medium|high|off>, hot-applied",
         "设置思考级别：/thinking <minimal|low|medium|high|off>，热生效",
     ),
-    ("todos", "显示当前任务清单"),
-    ("usage", "显示用量统计：上下文 / 压缩节省 / 工具调用"),
+    ("todos", "Show the current todo list", "显示当前任务清单"),
+    (
+        "usage",
+        "Usage stats: context / compression savings / tool calls",
+        "显示用量统计：上下文 / 压缩节省 / 工具调用",
+    ),
 ];
 
-/// 输入以 `/` 开头时的命令提示（按前缀过滤）。
+/// 按语言取 (名称, 用法) 列表
+pub fn slash_commands(lang: crate::i18n::Lang) -> Vec<(&'static str, &'static str)> {
+    SLASH_COMMANDS
+        .iter()
+        .map(|(n, en, zh)| {
+            (
+                *n,
+                if lang == crate::i18n::Lang::Zh {
+                    *zh
+                } else {
+                    *en
+                },
+            )
+        })
+        .collect()
+}
+
+/// 输入以 `/` 开头时的命令提示（按前缀过滤，按语言取用法）。
 /// 返回 None = 非斜杠输入；Some(vec) = 匹配的命令（可能为空 = 无匹配）。
-pub fn slash_hints(input: &str) -> Option<Vec<(&'static str, &'static str)>> {
+pub fn slash_hints(
+    input: &str,
+    lang: crate::i18n::Lang,
+) -> Option<Vec<(&'static str, &'static str)>> {
     let rest = input.strip_prefix('/')?.trim_start();
+    let commands = slash_commands(lang);
     // 空格后进入参数区：不再列命令，但保留精确命令的用法提示
     if rest.contains(' ') {
         let name = rest.split(' ').next().unwrap_or("");
         return Some(
-            SLASH_COMMANDS
+            commands
                 .iter()
                 .find(|(n, _)| *n == name)
                 .map(|(n, u)| vec![(*n, *u)])
@@ -209,7 +271,7 @@ pub fn slash_hints(input: &str) -> Option<Vec<(&'static str, &'static str)>> {
     }
     let lower = rest.to_ascii_lowercase();
     Some(
-        SLASH_COMMANDS
+        commands
             .iter()
             .filter(|(n, _)| n.starts_with(lower.as_str()))
             .copied()
@@ -233,12 +295,15 @@ pub fn split_slash(input: &str) -> Option<(&str, &str)> {
 
 /// 输入框灰色补全（fish-style ghost）：命令输入态（`/` 开头、未进参数区）时
 /// 取首个前缀匹配。Tab 键接受补全
-pub fn ghost_completion(input: &str) -> Option<(&'static str, &'static str)> {
+pub fn ghost_completion(
+    input: &str,
+    lang: crate::i18n::Lang,
+) -> Option<(&'static str, &'static str)> {
     let rest = input.strip_prefix('/')?;
     if rest.is_empty() || rest.contains(' ') {
         return None;
     }
-    slash_hints(input)?.first().copied()
+    slash_hints(input, lang)?.first().copied()
 }
 
 /// 会话选择器状态
@@ -346,13 +411,13 @@ impl SessionPicker {
 
     /// 选择器展示行：树形缩进 + id · 标题（当前会话打标；
     /// 全部视图下其它项目的会话附项目标注）
-    pub fn display_rows(&self, current_id: &str) -> Vec<String> {
+    pub fn display_rows(&self, current_id: &str, no_title: &str) -> Vec<String> {
         self.items
             .iter()
             .zip(&self.depths)
             .map(|(meta, depth)| {
                 let mark = if meta.id == current_id { "▸ " } else { "  " };
-                let title = meta.title.as_deref().unwrap_or("(无标题)");
+                let title = meta.title.as_deref().unwrap_or(no_title);
                 let branch = if *depth > 0 {
                     format!("{}└ ", "  ".repeat(depth - 1))
                 } else {
@@ -477,6 +542,8 @@ pub struct App {
     jobs: Option<Arc<baiji_tools::tools::jobs::JobRegistry>>,
     /// 本次会话累计工具调用次数（/usage；跨 run 累计）
     tools_total: u64,
+    /// 界面文案（按 ui.language 选择；默认英文）
+    strings: crate::i18n::Strings,
     /// 计划模式展示镜像（真值在 runtime；每帧渲染免锁）
     plan_mode: bool,
     /// 计划已给出、等待用户 Enter 批准执行（Enter=退出计划模式并执行）
@@ -494,6 +561,7 @@ impl App {
         settings_summary: String,
         auto: AutoContinueConfig,
         jobs: Option<Arc<baiji_tools::tools::jobs::JobRegistry>>,
+        lang: crate::i18n::Lang,
     ) -> Self {
         let session_id = harness
             .try_lock()
@@ -547,6 +615,7 @@ impl App {
             git_branch,
             frame: 0,
             jobs,
+            strings: crate::i18n::Strings::for_lang(lang),
             plan_mode,
             awaiting_plan: false,
         }
@@ -719,11 +788,13 @@ impl App {
             KeyCode::Esc => {
                 if self.agent_running {
                     self.cancel.cancel();
-                    self.lines.push(ChatLine::System("已请求取消…".to_string()));
+                    self.lines.push(ChatLine::System(
+                        self.strings.run_cancel_requested.to_string(),
+                    ));
                 } else if self.awaiting_plan {
                     self.awaiting_plan = false;
                     self.lines.push(ChatLine::System(
-                        "已取消执行确认（仍处于计划模式）".to_string(),
+                        self.strings.plan_confirm_cancelled.to_string(),
                     ));
                 } else {
                     return true;
@@ -754,8 +825,10 @@ impl App {
                 if self.agent_running {
                     // 运行中：作为 steering 注入
                     self.steering.push(&text);
-                    self.lines
-                        .push(ChatLine::System(format!("（steering）{text}")));
+                    self.lines.push(ChatLine::System(crate::i18n::fill(
+                        self.strings.steering_prefix_tpl,
+                        &[&text],
+                    )));
                 } else {
                     self.lines.push(ChatLine::user(&text));
                     self.auto_turns = 0; // 用户手动输入 = 新的接力链
@@ -825,9 +898,9 @@ impl App {
                 .unwrap_or_default();
             self.dismiss_pending(decision.clone());
             let note = match decision {
-                ConfirmationDecision::Allow => "已允许",
-                ConfirmationDecision::AllowAll => "已允许（本次运行内不再询问）",
-                ConfirmationDecision::Deny(_) => "已拒绝",
+                ConfirmationDecision::Allow => "allowed",
+                ConfirmationDecision::AllowAll => "allowed (no more prompts this run)",
+                ConfirmationDecision::Deny(_) => "denied",
             };
             self.lines
                 .push(ChatLine::System(format!("⚠ {name}: {note}")));
@@ -1048,8 +1121,10 @@ impl App {
         };
 
         if let Err(e) = settings::save(&self.config_path, &new_settings, key_update) {
-            self.lines
-                .push(ChatLine::System(format!("✗ 配置保存失败: {e}")));
+            self.lines.push(ChatLine::System(crate::i18n::fill(
+                &self.strings.cmd_config_save_fail_tpl,
+                &[&e],
+            )));
             self.scroll_to_bottom();
             return;
         }
@@ -1065,17 +1140,17 @@ impl App {
                 }
                 self.status_hint = hint;
                 let endpoint = new_settings.endpoint.as_deref().unwrap_or("api");
-                self.lines.push(ChatLine::System(format!(
-                    "✓ 配置已生效：{} · endpoint={} · model={}（已写入配置文件）",
-                    new_settings.vendor,
-                    endpoint,
-                    new_settings.model.as_deref().unwrap_or("?")
+                let model_label = new_settings.model.clone().unwrap_or_else(|| "?".into());
+                self.lines.push(ChatLine::System(crate::i18n::fill(
+                    &self.strings.cmd_applied_tpl,
+                    &[&new_settings.vendor, &endpoint.to_string(), &model_label],
                 )));
                 self.settings = new_settings;
             }
             Err(e) => {
-                self.lines.push(ChatLine::System(format!(
-                    "✗ 切换失败（配置已保存，重启后生效）: {e}"
+                self.lines.push(ChatLine::System(crate::i18n::fill(
+                    &self.strings.cmd_swap_fail_tpl,
+                    &[&e],
                 )));
                 self.settings = new_settings;
             }
@@ -1095,13 +1170,13 @@ impl App {
         match cmd {
             "quit" => return true,
             "help" => {
-                let list: Vec<String> = SLASH_COMMANDS
+                let list: Vec<String> = slash_commands(self.strings.lang)
                     .iter()
                     .map(|(name, _)| format!("/{name}"))
                     .collect();
-                self.lines.push(ChatLine::System(format!(
-                    "命令（输入 / 后输入框灰色提示补全，Tab 接受）：{}",
-                    list.join(" · ")
+                self.lines.push(ChatLine::System(crate::i18n::fill(
+                    &self.strings.cmd_help_tpl,
+                    &[&list.join(" · ")],
                 )));
                 if !self.templates.is_empty() {
                     let list: Vec<String> = self
@@ -1115,25 +1190,25 @@ impl App {
                             }
                         })
                         .collect();
-                    self.lines.push(ChatLine::System(format!(
-                        "prompt 模板：{}",
-                        list.join(" · ")
+                    self.lines.push(ChatLine::System(crate::i18n::fill(
+                        &self.strings.cmd_templates_tpl,
+                        &[&list.join(" · ")],
                     )));
                 }
             }
             "fork" => {
                 if self.agent_running {
                     self.lines.push(ChatLine::System(
-                        "运行中无法分叉，先按 Esc 取消".to_string(),
+                        self.strings.cmd_blocked_running.to_string(),
                     ));
                 } else {
                     match args.trim() {
                         "" => self.fork_session(0).await,
                         n => match n.parse::<usize>() {
                             Ok(turns) => self.fork_session(turns).await,
-                            Err(_) => self.lines.push(ChatLine::System(
-                                "用法：/fork 或 /fork <回退轮数>".to_string(),
-                            )),
+                            Err(_) => self
+                                .lines
+                                .push(ChatLine::System(self.strings.cmd_fork_usage.to_string())),
                         },
                     }
                 }
@@ -1144,7 +1219,7 @@ impl App {
                     String::new()
                 } else {
                     format!(
-                        "\n外部 agent: {}",
+                        "\nexternal agents: {}",
                         s.external_agents
                             .iter()
                             .map(|a| format!("/{}", a.name))
@@ -1153,20 +1228,20 @@ impl App {
                     )
                 };
                 self.lines.push(ChatLine::System(format!(
-                    "vendor: {} · endpoint: {} · model: {} · thinking: {} · session: {}\n计划模式: {} · {}{external}",
+                    "vendor: {} · endpoint: {} · model: {} · thinking: {} · session: {}\nplan mode: {} · {}{external}",
                     s.vendor,
                     s.endpoint.as_deref().unwrap_or("api"),
-                    s.model.as_deref().unwrap_or("自动发现"),
+                    s.model.as_deref().unwrap_or("auto"),
                     s.thinking.map(|l| l.effort()).unwrap_or("off"),
                     self.session_id,
-                    if self.plan_mode { "开启（只读）" } else { "关闭" },
+                    if self.plan_mode { self.strings.plan_on_label } else { self.strings.plan_off_label },
                     self.settings_summary
                 )));
             }
             "config" => {
                 if self.agent_running {
                     self.lines.push(ChatLine::System(
-                        "运行中不可修改配置，请先等待或 Esc 取消".to_string(),
+                        self.strings.cmd_blocked_config.to_string(),
                     ));
                     return false;
                 }
@@ -1176,7 +1251,7 @@ impl App {
             "model" => {
                 if self.agent_running {
                     self.lines.push(ChatLine::System(
-                        "运行中不可修改配置，请先等待或 Esc 取消".to_string(),
+                        self.strings.cmd_blocked_config.to_string(),
                     ));
                     return false;
                 }
@@ -1209,9 +1284,8 @@ impl App {
             }
             "resume" => {
                 if self.agent_running {
-                    self.lines.push(ChatLine::System(
-                        "运行中无法切换会话，先按 Esc 取消".to_string(),
-                    ));
+                    self.lines
+                        .push(ChatLine::System(self.strings.busy_picker.to_string()));
                 } else {
                     self.open_picker().await;
                 }
@@ -1219,7 +1293,7 @@ impl App {
             "new" => {
                 if self.agent_running {
                     self.lines.push(ChatLine::System(
-                        "运行中无法开新会话，先按 Esc 取消".to_string(),
+                        self.strings.cmd_blocked_running.to_string(),
                     ));
                 } else {
                     let result = self.harness.lock().await.start_new_session();
@@ -1232,13 +1306,16 @@ impl App {
                             self.bytes_saved = 0;
                             self.tokens_saved = 0;
                             self.tools_total = 0;
-                            self.lines.push(ChatLine::System(format!(
-                                "已开新会话 {id}（原会话保留，Ctrl+O 可切回）"
+                            self.lines.push(ChatLine::System(crate::i18n::fill(
+                                &self.strings.cmd_new_done_tpl,
+                                &[&id],
                             )));
                         }
                         Err(e) => {
-                            self.lines
-                                .push(ChatLine::System(format!("✗ 开新会话失败: {e}")));
+                            self.lines.push(ChatLine::System(crate::i18n::fill(
+                                &self.strings.cmd_new_fail_tpl,
+                                &[&e],
+                            )));
                         }
                     }
                 }
@@ -1258,22 +1335,28 @@ impl App {
                 });
                 match info {
                     Some((id, parent, created, title, project, msgs, todos)) => {
-                        self.lines.push(ChatLine::System(format!(
-                            "session {id}\n创建: {created}\n标题: {}\n项目: {}\n分叉自: {}\n消息: {msgs} 条 · todo: {todos} 条",
-                            title.as_deref().unwrap_or("（无）"),
-                            project.as_deref().unwrap_or("（无）"),
-                            parent.as_deref().unwrap_or("（根会话）"),
+                        self.lines.push(ChatLine::System(crate::i18n::fill(
+                            &self.strings.cmd_session_info_tpl,
+                            &[
+                                &id,
+                                &created,
+                                &title.unwrap_or_else(|| "-".into()),
+                                &project.unwrap_or_else(|| "-".into()),
+                                &parent.unwrap_or_else(|| "-".into()),
+                                &msgs.to_string(),
+                                &todos.to_string(),
+                            ],
                         )));
                     }
                     None => self
                         .lines
-                        .push(ChatLine::System("会话忙（运行中），稍后再试".to_string())),
+                        .push(ChatLine::System(self.strings.cmd_busy.to_string())),
                 }
             }
             "compact" => {
                 if self.agent_running {
                     self.lines.push(ChatLine::System(
-                        "运行中无法压缩，先按 Esc 取消".to_string(),
+                        self.strings.cmd_blocked_running.to_string(),
                     ));
                 } else {
                     let mut harness = self.harness.lock().await;
@@ -1282,15 +1365,23 @@ impl App {
                     drop(harness);
                     self.rebuild_lines(&messages);
                     match summary {
-                        Some(s) => self.lines.push(ChatLine::System(format!(
-                            "压缩完成：摘要 {} 字符 · stub 化 {stubbed} 条旧工具结果（可用 expand 取回）",
-                            s.chars().count()
-                        ))),
-                        None if stubbed > 0 => self.lines.push(ChatLine::System(format!(
-                            "压缩完成：stub 化 {stubbed} 条旧工具结果（无需摘要）"
-                        ))),
+                        Some(s) => {
+                            let chars = s.chars().count().to_string();
+                            let stubbed = stubbed.to_string();
+                            self.lines.push(ChatLine::System(crate::i18n::fill(
+                                &self.strings.cmd_compact_done_tpl,
+                                &[&chars, &stubbed],
+                            )))
+                        }
+                        None if stubbed > 0 => {
+                            let stubbed = stubbed.to_string();
+                            self.lines.push(ChatLine::System(crate::i18n::fill(
+                                &self.strings.cmd_compact_stubbed_tpl,
+                                &[&stubbed],
+                            )))
+                        }
                         None => self.lines.push(ChatLine::System(
-                            "历史太短，没有可压缩的内容".to_string(),
+                            self.strings.cmd_compact_nothing.to_string(),
                         )),
                     }
                 }
@@ -1298,16 +1389,17 @@ impl App {
             "todos" => {
                 let items = self.todo_items();
                 if items.is_empty() {
-                    self.lines.push(ChatLine::System(
-                        "当前没有任务清单（模型可用 todo 工具创建）".to_string(),
-                    ));
+                    self.lines
+                        .push(ChatLine::System(self.strings.cmd_todos_empty.to_string()));
                 } else {
                     let rows: Vec<String> = items
                         .iter()
                         .map(|t| format!("{} {}", t.status.marker(), t.content))
                         .collect();
-                    self.lines
-                        .push(ChatLine::System(format!("任务清单：\n{}", rows.join("\n"))));
+                    self.lines.push(ChatLine::System(crate::i18n::fill(
+                        &self.strings.cmd_todos_tpl,
+                        &[&rows.join("\n")],
+                    )));
                 }
             }
             "usage" => {
@@ -1318,35 +1410,41 @@ impl App {
                     .unwrap_or(0);
                 let saved = if self.bytes_saved > 0 {
                     format!(
-                        "{}（约 {} tok）",
+                        "{} (~{} tok)",
                         format_bytes(self.bytes_saved),
                         self.tokens_saved
                     )
                 } else {
                     "0B".to_string()
                 };
-                self.lines.push(ChatLine::System(format!(
-                    "上下文: {} tokens · 工具调用: {} 次\n压缩节省: {saved} · 自动接力: {}/{}\n历史消息: {messages} 条 · 模型: {}",
-                    if self.context_tokens > 0 {
-                        self.context_tokens.to_string()
-                    } else {
-                        "尚无数据".to_string()
-                    },
-                    self.tools_total,
-                    self.auto_turns,
-                    self.auto.max_turns,
-                    self.settings.model.as_deref().unwrap_or("自动发现"),
+                let ctx = if self.context_tokens > 0 {
+                    self.context_tokens.to_string()
+                } else {
+                    self.strings.cmd_no_data.to_string()
+                };
+                let model = self.settings.model.clone().unwrap_or_else(|| "auto".into());
+                self.lines.push(ChatLine::System(crate::i18n::fill(
+                    &self.strings.cmd_usage_tpl,
+                    &[
+                        &ctx,
+                        &self.tools_total.to_string(),
+                        &saved,
+                        &self.auto_turns.to_string(),
+                        &self.auto.max_turns.to_string(),
+                        &messages.to_string(),
+                        &model,
+                    ],
                 )));
             }
             "tasks" => match self.jobs.as_ref() {
                 None => self.lines.push(ChatLine::System(
-                    "后台任务未启用（未接入 JobRegistry）".to_string(),
+                    self.strings.cmd_tasks_disabled.to_string(),
                 )),
                 Some(registry) => {
                     let snapshot = registry.snapshot();
                     if snapshot.is_empty() {
                         self.lines
-                            .push(ChatLine::System("没有后台任务".to_string()));
+                            .push(ChatLine::System(self.strings.cmd_tasks_empty.to_string()));
                     } else {
                         let rows: Vec<String> = snapshot
                             .iter()
@@ -1354,32 +1452,38 @@ impl App {
                                 format!(" #{id} [{}] {command}（{log}）", state.label())
                             })
                             .collect();
-                        self.lines
-                            .push(ChatLine::System(format!("后台任务：\n{}", rows.join("\n"))));
+                        self.lines.push(ChatLine::System(crate::i18n::fill(
+                            &self.strings.cmd_tasks_tpl,
+                            &[&rows.join("\n")],
+                        )));
                     }
                 }
             },
             "kill" => {
                 let Some(registry) = self.jobs.as_ref() else {
                     self.lines.push(ChatLine::System(
-                        "后台任务未启用（未接入 JobRegistry）".to_string(),
+                        self.strings.cmd_tasks_disabled.to_string(),
                     ));
                     return false;
                 };
                 match args.trim().parse::<u32>() {
                     Ok(id) => {
+                        let id_s = id.to_string();
                         if registry.stop(id) {
-                            self.lines
-                                .push(ChatLine::System(format!("已停止后台任务 #{id}")));
+                            self.lines.push(ChatLine::System(crate::i18n::fill(
+                                &self.strings.cmd_kill_done_tpl,
+                                &[&id_s],
+                            )));
                         } else {
-                            self.lines.push(ChatLine::System(format!(
-                                "未找到运行中的任务 #{id}（/tasks 查看列表）"
+                            self.lines.push(ChatLine::System(crate::i18n::fill(
+                                &self.strings.cmd_kill_missing_tpl,
+                                &[&id_s],
                             )));
                         }
                     }
-                    Err(_) => self.lines.push(ChatLine::System(
-                        "用法：/kill <id>（id 见 /tasks）".to_string(),
-                    )),
+                    Err(_) => self
+                        .lines
+                        .push(ChatLine::System(self.strings.cmd_kill_usage.to_string())),
                 }
             }
             // 思考级别：/thinking <minimal|low|medium|high|off>，热生效（下一次请求）
@@ -1392,8 +1496,9 @@ impl App {
                         .thinking
                         .map(|l| l.effort().to_string())
                         .unwrap_or_else(|| "off".to_string());
-                    self.lines.push(ChatLine::System(format!(
-                        "当前思考级别: {current}\n用法：/thinking <minimal|low|medium|high>，或 /thinking off 关闭\nAnthropic 端点映射 thinking.budget_tokens，OpenAI 系映射 reasoning_effort / reasoning.effort"
+                    self.lines.push(ChatLine::System(crate::i18n::fill(
+                        &self.strings.cmd_thinking_status_tpl,
+                        &[&current],
                     )));
                 } else {
                     let level = if arg == "off" || arg == "none" {
@@ -1403,7 +1508,7 @@ impl App {
                             Some(level) => Some(level),
                             None => {
                                 self.lines.push(ChatLine::System(
-                                    "用法：/thinking <minimal|low|medium|high|off>".to_string(),
+                                    self.strings.cmd_thinking_usage.to_string(),
                                 ));
                                 return false;
                             }
@@ -1413,15 +1518,18 @@ impl App {
                     if let Err(e) =
                         settings::save(&self.config_path, &self.settings, settings::KeyUpdate::Keep)
                     {
-                        self.lines
-                            .push(ChatLine::System(format!("✗ 配置保存失败: {e}")));
+                        self.lines.push(ChatLine::System(crate::i18n::fill(
+                            &self.strings.cmd_config_save_fail_tpl,
+                            &[&e],
+                        )));
                     } else {
                         let shown = level
                             .map(|l| l.effort().to_string())
                             .unwrap_or_else(|| "off".to_string());
                         self.harness.lock().await.set_thinking(level);
-                        self.lines.push(ChatLine::System(format!(
-                            "思考级别已设为 {shown}（下一次请求生效，已写入配置）"
+                        self.lines.push(ChatLine::System(crate::i18n::fill(
+                            &self.strings.cmd_thinking_set_tpl,
+                            &[&shown],
                         )));
                     }
                 }
@@ -1441,9 +1549,11 @@ impl App {
                         if self.agent_running {
                             // 运行中：目标作为 steering 注入当前 run
                             // （写工具立即被计划模式门控拒绝，本轮即可转入规划）
-                            self.steering.push(goal);
-                            self.lines
-                                .push(ChatLine::System(format!("（steering·规划）{goal}")));
+                            self.steering.push(goal.clone());
+                            self.lines.push(ChatLine::System(crate::i18n::fill(
+                                &self.strings.plan_steering_tpl,
+                                &[&goal],
+                            )));
                         } else {
                             self.lines.push(ChatLine::user(goal));
                             self.auto_turns = 0;
@@ -1455,16 +1565,15 @@ impl App {
             // 子代理角色管理面板：查看角色（agent 文件定义）+ r 热重载
             "subagents" => {
                 if self.agent_running {
-                    self.lines.push(ChatLine::System(
-                        "运行中无法打开子代理面板，先按 Esc 取消".to_string(),
-                    ));
+                    self.lines
+                        .push(ChatLine::System(self.strings.busy_subagents.to_string()));
                 } else {
                     self.subagents_panel = Some(SubagentsPanel { selected: 0 });
                 }
             }
-            "btw" => self.lines.push(ChatLine::System(
-                "旁路提问尚未实现（规划中：不写入当前会话历史的一次性问答）".to_string(),
-            )),
+            "btw" => self
+                .lines
+                .push(ChatLine::System(self.strings.cmd_btw_stub.to_string())),
             other => {
                 // 外部 coding agent 动态命令：/codex <任务> /claude <任务> …
                 if let Some(spec) = self
@@ -1476,9 +1585,9 @@ impl App {
                 {
                     let prompt = args.trim().to_string();
                     if prompt.is_empty() {
-                        self.lines.push(ChatLine::System(format!(
-                            "用法：/{} <任务描述>（委托给外部 {} agent CLI）",
-                            spec.name, spec.name
+                        self.lines.push(ChatLine::System(crate::i18n::fill(
+                            &self.strings.cmd_external_usage_tpl,
+                            &[&spec.name, &spec.name],
                         )));
                     } else {
                         self.lines
@@ -1487,16 +1596,16 @@ impl App {
                     }
                     return false;
                 }
-                let mut list: Vec<String> = SLASH_COMMANDS
+                let mut list: Vec<String> = slash_commands(self.strings.lang)
                     .iter()
                     .map(|(name, _)| format!("/{name}"))
                     .collect();
                 for agent in &self.settings.external_agents {
                     list.push(format!("/{}", agent.name));
                 }
-                self.lines.push(ChatLine::System(format!(
-                    "未知命令 /{other}（可用: {} · Tab 可补全）",
-                    list.join(" ")
+                self.lines.push(ChatLine::System(crate::i18n::fill(
+                    &self.strings.cmd_unknown_tpl,
+                    &[&other.to_string(), &list.join(" ")],
                 )));
             }
         }
@@ -1511,13 +1620,11 @@ impl App {
         self.awaiting_plan = false;
         self.harness.lock().await.set_plan_mode(on);
         if on {
-            self.lines.push(ChatLine::System(
-                "⏸ 计划模式已开启（只读）— 写/编辑/bash 被禁用；/plan off 退出".to_string(),
-            ));
+            self.lines
+                .push(ChatLine::System(self.strings.plan_on.to_string()));
         } else {
-            self.lines.push(ChatLine::System(
-                "▶ 计划模式已关闭，恢复完整工具".to_string(),
-            ));
+            self.lines
+                .push(ChatLine::System(self.strings.plan_off.to_string()));
         }
     }
 
@@ -1525,9 +1632,9 @@ impl App {
     async fn approve_plan(&mut self, ui_tx: UnboundedSender<UiEvent>) {
         self.awaiting_plan = false;
         self.set_plan_mode(false).await;
-        self.lines.push(ChatLine::System(format!(
-            "⏩ 执行计划：{plan}",
-            plan = baiji_harness::PLAN_EXECUTE_PROMPT
+        self.lines.push(ChatLine::System(crate::i18n::fill(
+            &self.strings.plan_execute_tpl,
+            &[&baiji_harness::PLAN_EXECUTE_PROMPT.to_string()],
         )));
         self.auto_turns = 0;
         self.spawn_run(baiji_harness::PLAN_EXECUTE_PROMPT.to_string(), ui_tx);
@@ -1546,7 +1653,7 @@ impl App {
         };
         if sessions.is_empty() {
             self.lines
-                .push(ChatLine::System("（暂无历史会话）".to_string()));
+                .push(ChatLine::System("(no previous sessions)".to_string()));
             return;
         }
         self.picker = Some(SessionPicker::from_metas(sessions, &self.session_id));
@@ -1566,14 +1673,15 @@ impl App {
                 // 热重载：编辑 agents/*.md 后免重启生效（task 分发与系统提示段共用注册表）
                 match self.harness.try_lock() {
                     Ok(harness) => {
-                        let count = harness.subagents_reload();
-                        self.lines.push(ChatLine::System(format!(
-                            "已重载子代理角色：{count} 个（下一次 task 调用生效）"
+                        let count = harness.subagents_reload().to_string();
+                        self.lines.push(ChatLine::System(crate::i18n::fill(
+                            &self.strings.subagents_reloaded_tpl,
+                            &[&count],
                         )));
                     }
-                    Err(_) => self.lines.push(ChatLine::System(
-                        "harness 忙，稍后再试（运行中不可重载）".to_string(),
-                    )),
+                    Err(_) => self
+                        .lines
+                        .push(ChatLine::System(self.strings.subagents_busy.to_string())),
                 }
             }
             KeyCode::Up => {
@@ -1636,14 +1744,17 @@ impl App {
             Ok(session) => {
                 self.rebuild_lines(&session.messages);
                 self.session_id = session.meta.id.clone();
-                let title = session.meta.title.as_deref().unwrap_or("");
-                self.lines.push(ChatLine::System(format!(
-                    "已切换会话 {session_id} · {title}"
+                let title = session.meta.title.clone().unwrap_or_default();
+                self.lines.push(ChatLine::System(crate::i18n::fill(
+                    &self.strings.cmd_session_switched_tpl,
+                    &[&self.session_id, &title],
                 )));
             }
             Err(e) => {
-                self.lines
-                    .push(ChatLine::System(format!("✗ 切换会话失败: {e}")));
+                self.lines.push(ChatLine::System(crate::i18n::fill(
+                    &self.strings.cmd_session_fail_tpl,
+                    &[&e],
+                )));
             }
         }
         self.scroll_to_bottom();
@@ -1667,19 +1778,21 @@ impl App {
                 self.rebuild_lines(&messages);
                 self.context_tokens = 0;
                 self.lines.push(ChatLine::System(if turns_back == 0 {
-                    format!("已从当前会话分叉 → {new_id}（历史已继承）")
+                    crate::i18n::fill(&self.strings.cmd_branch_done_tpl, &[&new_id])
                 } else {
-                    format!(
-                        "已分叉 → {new_id}（回退 {turns_back} 轮；原会话保留，可用会话选择器切回）"
+                    crate::i18n::fill(
+                        &self.strings.cmd_fork_done_tpl,
+                        &[&new_id, &turns_back.to_string()],
                     )
                 }));
                 if let Some(input) = dropped {
                     self.input = sanitize_paste(&input);
                 }
             }
-            Err(e) => self
-                .lines
-                .push(ChatLine::System(format!("✗ 分叉失败: {e}"))),
+            Err(e) => self.lines.push(ChatLine::System(crate::i18n::fill(
+                &self.strings.cmd_fork_fail_tpl,
+                &[&e],
+            ))),
         }
         self.scroll_to_bottom();
     }
@@ -1692,13 +1805,16 @@ impl App {
         match result {
             Ok(new_id) => {
                 self.session_id = new_id.clone();
-                self.lines.push(ChatLine::System(format!(
-                    "已从当前会话分叉 → {new_id}（历史已继承）"
+                self.lines.push(ChatLine::System(crate::i18n::fill(
+                    &self.strings.cmd_branch_done_tpl,
+                    &[&new_id],
                 )));
             }
             Err(e) => {
-                self.lines
-                    .push(ChatLine::System(format!("✗ 分叉失败: {e}")));
+                self.lines.push(ChatLine::System(crate::i18n::fill(
+                    &self.strings.cmd_fork_fail_tpl,
+                    &[&e],
+                )));
             }
         }
         self.scroll_to_bottom();
@@ -1729,8 +1845,9 @@ impl App {
                     }
                 }
                 Role::System => {
-                    self.lines
-                        .push(ChatLine::System("[历史摘要已注入]".to_string()));
+                    self.lines.push(ChatLine::System(
+                        "[conversation summary injected]".to_string(),
+                    ));
                 }
             }
         }
@@ -1811,23 +1928,25 @@ impl App {
                 // 计划模式跑完一轮：非空回答视为待批准的计划
                 if self.plan_mode && !answer.is_empty() {
                     self.awaiting_plan = true;
-                    self.lines.push(ChatLine::System(
-                        "⏸ 计划已给出 — 空回车退出计划模式并开始执行 · 或直接输入继续修改计划 · /plan off 仅退出".to_string(),
-                    ));
+                    self.lines
+                        .push(ChatLine::System(self.strings.plan_awaiting.to_string()));
                 }
                 self.maybe_auto_continue(ui_tx.clone());
             }
             AgentEvent::RunFailed { error } => {
                 self.streaming.clear();
                 self.thinking.clear();
-                self.lines
-                    .push(ChatLine::System(format!("✗ 出错: {error}")));
+                self.lines.push(ChatLine::System(crate::i18n::fill(
+                    &self.strings.run_error_tpl,
+                    &[&error],
+                )));
                 self.finish_run();
             }
             AgentEvent::Interrupted => {
                 self.streaming.clear();
                 self.thinking.clear();
-                self.lines.push(ChatLine::System("已取消".to_string()));
+                self.lines
+                    .push(ChatLine::System(self.strings.run_cancelled.to_string()));
                 self.run_interrupted = true; // 中断后本次接力链终止
                 self.finish_run();
             }
@@ -1857,15 +1976,18 @@ impl App {
             return;
         }
         if self.auto_turns >= self.auto.max_turns {
-            self.lines.push(ChatLine::System(format!(
-                "⏹ 自动接力停止：达到轮次上限 {}（todo 仍有未完成项，可手动继续）",
-                self.auto.max_turns
+            let max = self.auto.max_turns.to_string();
+            self.lines.push(ChatLine::System(crate::i18n::fill(
+                &self.strings.auto_stopped_tpl,
+                &[&max],
             )));
             return;
         }
-        self.lines.push(ChatLine::System(format!(
-            "⏩ 自动接力（轮次 {}/{}）：todo 未完成，继续任务（Esc 可停）",
-            self.auto_turns, self.auto.max_turns
+        let used = self.auto_turns.to_string();
+        let max = self.auto.max_turns.to_string();
+        self.lines.push(ChatLine::System(crate::i18n::fill(
+            &self.strings.auto_continue_tpl,
+            &[&used, &max],
         )));
         self.scroll_to_bottom();
         self.spawn_run(baiji_harness::AUTO_CONTINUE_PROMPT.to_string(), ui_tx);
@@ -1889,6 +2011,7 @@ impl App {
         let cancel = CancellationToken::new();
         self.cancel = cancel.clone();
         let workdir = self.workdir.clone();
+        let interrupted_msg = self.strings.external_interrupted.to_string();
 
         tokio::spawn(async move {
             let _ = ui_tx.send(UiEvent::Agent(AgentEvent::ToolStarted {
@@ -1898,7 +2021,7 @@ impl App {
             }));
             let (output, is_error) = tokio::select! {
                 _ = cancel.cancelled() => (
-                    "[已取消] 外部 agent 被用户中断".to_string(),
+                    interrupted_msg,
                     true,
                 ),
                 result = baiji_tools::tools::external_agent::run_external(
@@ -1968,7 +2091,7 @@ impl App {
         if self.agent_running {
             format!("Turn {} · {} tools", self.current_turn, self.tool_calls)
         } else {
-            "就绪".to_string()
+            self.strings.status_ready.to_string()
         }
     }
 
@@ -1976,26 +2099,34 @@ impl App {
     pub(crate) fn status_right(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
         if self.plan_mode {
-            parts.push(if self.awaiting_plan {
-                "计划·待执行".to_string()
-            } else {
-                "计划·只读".to_string()
-            });
+            parts.push(
+                if self.awaiting_plan {
+                    self.strings.status_plan_await
+                } else {
+                    self.strings.status_plan_readonly
+                }
+                .to_string(),
+            );
         }
         if self.context_tokens > 0 {
             parts.push(format!("ctx {:.1}k", self.context_tokens as f64 / 1000.0));
         }
         if self.bytes_saved > 0 {
-            parts.push(format!(
-                "省 {} (~{} tok)",
-                format_bytes(self.bytes_saved),
-                self.tokens_saved
+            parts.push(crate::i18n::fill(
+                self.strings.status_saved_tpl,
+                &[&format_bytes(self.bytes_saved), &self.tokens_saved],
             ));
         }
         if self.auto.enabled && self.auto_turns > 0 {
-            parts.push(format!("自动 {}/{}", self.auto_turns, self.auto.max_turns));
+            parts.push(crate::i18n::fill(
+                self.strings.status_auto_tpl,
+                &[&self.auto_turns, &self.auto.max_turns],
+            ));
         }
-        parts.push(format!("session {}", self.session_id));
+        parts.push(crate::i18n::fill(
+            self.strings.status_session_tpl,
+            &[&self.session_id],
+        ));
         parts.join(" · ")
     }
 
@@ -2042,6 +2173,11 @@ impl App {
 
     pub(crate) fn theme(&self) -> Theme {
         self.theme
+    }
+
+    /// 界面文案（渲染与命令输出共用）
+    pub(crate) fn strings(&self) -> &crate::i18n::Strings {
+        &self.strings
     }
 
     /// 头部/输入框右下角的设置提示（"智谱 GLM · glm-4.7"）
@@ -2098,7 +2234,7 @@ impl App {
     pub(crate) fn picker_rows(&self) -> Option<Vec<String>> {
         self.picker
             .as_ref()
-            .map(|p| p.display_rows(&self.session_id))
+            .map(|p| p.display_rows(&self.session_id, self.strings.picker_no_title))
     }
 
     pub(crate) fn pending_confirm(&self) -> Option<&PendingConfirm> {
@@ -2119,15 +2255,17 @@ impl App {
             rows.push(format!(
                 "{mark}{:<16} model:{:<10} think:{:<7} turns:{:<4} tools:{}",
                 role.name,
-                role.model.as_deref().unwrap_or("继承"),
+                role.model
+                    .as_deref()
+                    .unwrap_or(self.strings.subagents_inherit),
                 role.thinking.map(|t| t.effort()).unwrap_or("-"),
                 role.max_turns
                     .map(|t| t.to_string())
-                    .unwrap_or_else(|| "默认".into()),
+                    .unwrap_or_else(|| self.strings.subagents_default.into()),
                 role.tools
                     .as_ref()
                     .map(|t| t.len().to_string())
-                    .unwrap_or_else(|| "全部".into()),
+                    .unwrap_or_else(|| self.strings.subagents_all.into()),
             ));
             if i == panel.selected {
                 if !role.description.is_empty() {
@@ -2135,15 +2273,16 @@ impl App {
                 }
                 if !role.system_prompt.is_empty() {
                     let preview: String = role.system_prompt.chars().take(160).collect();
-                    rows.push(format!("    提示词: {}…", preview.trim_end()));
+                    rows.push(crate::i18n::fill(
+                        self.strings.subagents_prompt_preview_tpl,
+                        &[&preview.trim_end().to_string()],
+                    ));
                 }
             }
         }
         if roles.is_empty() {
-            rows.push("（尚无角色）在下列目录创建 <name>.md：frontmatter 声明".into());
-            rows.push(
-                "name/description/tools/model/thinking/max_turns，正文为该角色的系统提示".into(),
-            );
+            rows.push(self.strings.subagents_empty1.into());
+            rows.push(self.strings.subagents_empty2.into());
         }
         Some(rows)
     }
@@ -2157,14 +2296,17 @@ impl App {
             .map(|h| h.subagent_dirs())
             .unwrap_or_default();
         let joined = if dirs.is_empty() {
-            "（未启用）".to_string()
+            "(disabled)".to_string()
         } else {
             dirs.iter()
                 .map(|d| d.display().to_string())
                 .collect::<Vec<_>>()
                 .join(" · ")
         };
-        Some(format!("角色目录: {joined}（编辑后按 r 热重载）"))
+        Some(crate::i18n::fill(
+            self.strings.subagents_dirs_tpl,
+            &[&joined],
+        ))
     }
 
     /// 子代理面板选中项（渲染高亮用）
@@ -2183,7 +2325,10 @@ impl App {
 
     /// 全部命令（静态注册表 + 外部 agent 动态命令）：裸 `/` 的清单展示用
     pub(crate) fn command_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = SLASH_COMMANDS.iter().map(|(n, _)| n.to_string()).collect();
+        let mut names: Vec<String> = slash_commands(crate::i18n::Lang::En)
+            .iter()
+            .map(|(n, _)| n.to_string())
+            .collect();
         names.extend(self.settings.external_agents.iter().map(|a| a.name.clone()));
         names
     }
@@ -2203,7 +2348,7 @@ impl App {
         }
         if rest.is_empty() {
             // 裸 "/"：首个命令作为 Tab 目标（完整清单由输入框 ghost 灰字展示）
-            let (name, usage) = SLASH_COMMANDS.first()?;
+            let (name, usage) = slash_commands(self.strings.lang).first()?.to_owned();
             return Some((name.to_string(), usage.to_string()));
         }
         let lower = rest.to_ascii_lowercase();
@@ -2215,29 +2360,28 @@ impl App {
         {
             return Some((
                 agent.name.clone(),
-                format!(
-                    "委托任务给外部 {} agent：/{} <任务描述>",
-                    agent.name, agent.name
-                ),
+                crate::i18n::fill(self.strings.external_usage_tpl, &[&agent.name, &agent.name]),
             ));
         }
-        ghost_completion(input).map(|(n, u)| (n.to_string(), u.to_string()))
+        ghost_completion(input, self.strings.lang).map(|(n, u)| (n.to_string(), u.to_string()))
     }
 
     /// 向导标题（按步骤）
     pub(crate) fn wizard_title(&self) -> Option<String> {
         let wizard = self.wizard.as_ref()?;
         Some(match wizard.step {
-            WizardStep::Vendor => " 选择厂商 (Enter=选择 Esc=取消) ".to_string(),
-            WizardStep::Endpoint => format!(" 选择端点 · {} (Enter=选择 Esc=返回) ", wizard.vendor),
-            WizardStep::Key => format!(
-                " 输入 API Key（{} 提示；留空沿用现有）· 输入框回车确认 ",
-                baiji_ai::find_vendor(&wizard.vendor)
+            WizardStep::Vendor => self.strings.wizard_vendor_title.to_string(),
+            WizardStep::Endpoint => {
+                crate::i18n::fill(self.strings.wizard_endpoint_title_tpl, &[&wizard.vendor])
+            }
+            WizardStep::Key => crate::i18n::fill(
+                self.strings.wizard_key_title_tpl,
+                &[&baiji_ai::find_vendor(&wizard.vendor)
                     .map(|v| v.api_key_env)
-                    .unwrap_or("?")
+                    .unwrap_or("?")],
             ),
-            WizardStep::Model => " 选择模型 (Enter=使用 末项=手动输入 Esc=返回) ".to_string(),
-            WizardStep::ModelManual => " 手动输入模型名（输入框回车确认） ".to_string(),
+            WizardStep::Model => self.strings.wizard_model_title.to_string(),
+            WizardStep::ModelManual => self.strings.wizard_model_manual_title.to_string(),
         })
     }
 
@@ -2259,7 +2403,10 @@ impl App {
                         .iter()
                         .map(|name| {
                             if *name == "api" {
-                                format!("api — 默认端点（按量付费）· {}", preset.base_url)
+                                crate::i18n::fill(
+                                    self.strings.wizard_api_endpoint_tpl,
+                                    &[&preset.base_url],
+                                )
                             } else if let Some(v) = preset.variants.iter().find(|v| v.name == *name)
                             {
                                 format!("{} — {} · {}", v.name, v.note, v.base_url)
@@ -2273,20 +2420,23 @@ impl App {
             WizardStep::Model => {
                 let mut rows: Vec<String> = Vec::new();
                 if wizard.fetching {
-                    rows.push("（模型列表获取中…）".to_string());
+                    rows.push("(fetching model list…)".to_string());
                 } else if let Some(err) = &wizard.models_error {
-                    rows.push(format!("模型列表获取失败：{err}"));
-                    rows.push(
-                        "→ 请选末项「手动输入模型名…」直接指定（Coding Plan 端点常无列表接口）"
-                            .to_string(),
-                    );
+                    rows.push(crate::i18n::fill(
+                        self.strings.wizard_models_error_tpl,
+                        &[&err],
+                    ));
+                    rows.push(crate::i18n::fill(
+                        self.strings.wizard_fallback_hint_tpl,
+                        &[&self.strings.wizard_manual_entry.to_string()],
+                    ));
                 } else {
                     rows.extend(wizard.models.iter().map(|m| match &m.display_name {
                         Some(d) if d != &m.id => format!("{} — {}", m.id, d),
                         _ => m.id.clone(),
                     }));
                 }
-                rows.push("✏ 手动输入模型名…".to_string());
+                rows.push(self.strings.wizard_manual_entry.to_string());
                 Some(rows)
             }
             WizardStep::Key | WizardStep::ModelManual => None,
@@ -2301,13 +2451,13 @@ impl App {
     pub(crate) fn wizard_input_prompt(&self) -> Option<String> {
         let wizard = self.wizard.as_ref()?;
         match wizard.step {
-            WizardStep::Key => Some(format!(
-                "API Key（推荐环境变量 {}；直接粘贴回车，留空沿用现有）",
-                baiji_ai::find_vendor(&wizard.vendor)
+            WizardStep::Key => Some(crate::i18n::fill(
+                self.strings.wizard_key_prompt_tpl,
+                &[&baiji_ai::find_vendor(&wizard.vendor)
                     .map(|v| v.api_key_env)
-                    .unwrap_or("?")
+                    .unwrap_or("?")],
             )),
-            WizardStep::ModelManual => Some("模型名称（如 glm-4.7）".to_string()),
+            WizardStep::ModelManual => Some(self.strings.wizard_manual_prompt.to_string()),
             _ => None,
         }
     }
@@ -2394,6 +2544,8 @@ mod tests {
             "max_turns: 24 · compaction: on (auto)".to_string(),
             AutoContinueConfig::default(),
             None,
+            // 冒烟测试验证中文包（默认英文包另有单测）
+            crate::i18n::Lang::Zh,
         );
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
@@ -2845,37 +2997,50 @@ mod tests {
     #[test]
     fn test_slash_hints_filtering() {
         // "/" → 全部命令
-        let all = slash_hints("/").unwrap();
+        let all = slash_hints("/", crate::i18n::Lang::Zh).unwrap();
         assert_eq!(all.len(), SLASH_COMMANDS.len());
         // 前缀过滤
-        let hints = slash_hints("/m").unwrap();
+        let hints = slash_hints("/m", crate::i18n::Lang::Zh).unwrap();
         assert_eq!(hints.len(), 1);
         assert_eq!(hints[0].0, "model");
-        let hints = slash_hints("/MO").unwrap(); // 大小写不敏感
+        let hints = slash_hints("/MO", crate::i18n::Lang::Zh).unwrap(); // 大小写不敏感
         assert_eq!(hints[0].0, "model");
         // 完整命令仍显示（用于用法提示）
-        let hints = slash_hints("/model").unwrap();
+        let hints = slash_hints("/model", crate::i18n::Lang::Zh).unwrap();
         assert_eq!(hints.len(), 1);
         // 参数区：只保留精确命令的用法
-        let hints = slash_hints("/model glm-4.7").unwrap();
+        let hints = slash_hints("/model glm-4.7", crate::i18n::Lang::Zh).unwrap();
         assert_eq!(hints.len(), 1);
         assert!(hints[0].1.contains("切换模型"));
         // 无匹配 / 非斜杠
-        assert!(slash_hints("/xyz").unwrap().is_empty());
-        assert!(slash_hints("普通消息").is_none());
+        assert!(
+            slash_hints("/xyz", crate::i18n::Lang::Zh)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(slash_hints("普通消息", crate::i18n::Lang::Zh).is_none());
     }
 
     #[test]
     fn test_ghost_completion() {
         // 裸 "/"、非斜杠输入、参数区、无匹配：都不出补全
-        assert!(ghost_completion("/").is_none());
-        assert!(ghost_completion("普通消息").is_none());
-        assert!(ghost_completion("/model glm-4.7").is_none());
-        assert!(ghost_completion("/zzz").is_none());
+        assert!(ghost_completion("/", crate::i18n::Lang::Zh).is_none());
+        assert!(ghost_completion("普通消息", crate::i18n::Lang::Zh).is_none());
+        assert!(ghost_completion("/model glm-4.7", crate::i18n::Lang::Zh).is_none());
+        assert!(ghost_completion("/zzz", crate::i18n::Lang::Zh).is_none());
         // 首个前缀匹配（大小写不敏感；字典序）
-        assert_eq!(ghost_completion("/mo").unwrap().0, "model");
-        assert_eq!(ghost_completion("/MO").unwrap().0, "model");
-        assert_eq!(ghost_completion("/t").unwrap().0, "tasks");
+        assert_eq!(
+            ghost_completion("/mo", crate::i18n::Lang::Zh).unwrap().0,
+            "model"
+        );
+        assert_eq!(
+            ghost_completion("/MO", crate::i18n::Lang::Zh).unwrap().0,
+            "model"
+        );
+        assert_eq!(
+            ghost_completion("/t", crate::i18n::Lang::Zh).unwrap().0,
+            "tasks"
+        );
     }
 
     #[test]
@@ -2933,7 +3098,7 @@ mod tests {
         let ids: Vec<&str> = picker.items.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids.len(), 3, "all view");
         assert!(!picker.filtering_by_project());
-        let rows = picker.display_rows("cur");
+        let rows = picker.display_rows("cur", "(无标题)");
         assert!(rows.iter().any(|r| r.contains("⌂beta-2222")), "{rows:?}");
         assert!(
             rows.iter().any(|r| r.contains("⌂?")),
@@ -2962,7 +3127,7 @@ mod tests {
         let ids: Vec<&str> = picker.items.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["3", "1", "2"]);
         assert_eq!(picker.selected, 2, "current session preselected");
-        let rows = picker.display_rows("2");
+        let rows = picker.display_rows("2", "(无标题)");
         assert!(rows[2].starts_with("▸")); // 当前会话标记
         assert!(rows[2].contains("└ 2 · title-2")); // 分叉缩进
         picker.selected = 0;

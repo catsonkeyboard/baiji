@@ -241,10 +241,17 @@ impl Default for PolicyConfig {
 pub struct UiConfig {
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// 界面语言："en"（默认）/"zh"
+    #[serde(default = "default_language")]
+    pub language: String,
 }
 
 fn default_theme() -> String {
     "dark".to_string()
+}
+
+fn default_language() -> String {
+    "en".to_string()
 }
 
 /// 项目级配置可覆盖的顶层字段白名单
@@ -354,6 +361,7 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             theme: default_theme(),
+            language: default_language(),
         }
     }
 }
@@ -586,7 +594,7 @@ impl AppConfig {
                 "auto_continue": false,
                 "auto_continue_max_turns": 96
             },
-            "ui": { "theme": "dark" }
+            "ui": { "theme": "dark", "language": "en" }
         }))
         .unwrap()
             + "\n"
