@@ -21,7 +21,7 @@ pub use confirmation::{
 pub use event::AgentEvent;
 pub use hooks::{Hook, HookDecision, HookRegistry};
 pub use queue::SteeringQueue;
-pub use runtime::AgentRuntime;
+pub use runtime::{AgentRuntime, PLAN_MODE_ALLOWED_TOOLS};
 pub use subagent::{SubagentTool, SUBAGENT_ALLOWED_TOOLS};
 pub use tool::{AgentTool, ToolOutput, ToolRegistry, estimate_text_tokens};
 

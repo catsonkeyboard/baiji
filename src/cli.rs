@@ -13,6 +13,8 @@ pub struct CliOptions {
     pub list_sessions: bool,
     /// `--continue-until-done`：headless 自动接力（todo 未完成则继续，直到完成或轮次上限）
     pub continue_until_done: bool,
+    /// `--plan`：以计划模式（只读规划态）启动
+    pub plan: bool,
     /// `-h/--help`
     pub help: bool,
 }
@@ -26,6 +28,7 @@ baiji — 终端 AI coding agent
   baiji -e \"<消息>\" --session <id>
                                在指定历史会话上继续
   baiji --sessions             列出全部会话
+  baiji -e \"<消息>\" --plan     只读规划模式（给出计划，不改文件；亦可直接进 TUI）
   baiji -h | --help            本帮助
 
 选项:
@@ -34,6 +37,7 @@ baiji — 终端 AI coding agent
   -y, --yes            headless 模式自动放行需确认的工具（默认拒绝）
       --continue-until-done
                        自动接力：todo 未完成则继续，直到完成或轮次上限
+      --plan           计划模式启动：仅只读工具可用，用于先规划后执行
       --sessions       列出会话
   环境变量 BAIJI_TELEMETRY=file 时，把 span/event 追加写入 ~/.baiji/traces/";
 
@@ -47,6 +51,7 @@ pub fn parse(args: &[String]) -> CliOptions {
             "--sessions" | "--list-sessions" => opts.list_sessions = true,
             "-y" | "--yes" => opts.yes = true,
             "--continue-until-done" => opts.continue_until_done = true,
+            "--plan" => opts.plan = true,
             "-e" | "--exec" => {
                 if let Some(msg) = args.get(i + 1) {
                     opts.exec = Some(msg.clone());
@@ -123,6 +128,14 @@ mod tests {
         assert!(opts.continue_until_done);
         assert_eq!(opts.exec.as_deref(), Some("做个大任务"));
         assert!(!parse(&args(&["-e", "x"])).continue_until_done);
+    }
+
+    #[test]
+    fn test_parse_plan() {
+        let opts = parse(&args(&["-e", "先规划", "--plan"]));
+        assert!(opts.plan);
+        assert_eq!(opts.exec.as_deref(), Some("先规划"));
+        assert!(!parse(&args(&["-e", "x"])).plan);
     }
 
     #[test]

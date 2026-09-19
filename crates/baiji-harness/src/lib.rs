@@ -29,6 +29,23 @@ pub use todo::{TodoItem, TodoStatus, TodoStore, TodoTool, todo_section};
 /// 自动接力的固定输入（用户可见、进入会话历史——下一轮模型自然衔接）
 pub const AUTO_CONTINUE_PROMPT: &str = "继续，按 todo 清单推进任务";
 
+/// 自动接力输入之外的固定指令：计划批准后进入执行（TUI Enter 路径，
+/// 用户可见、进入会话历史——下一轮模型据此开始实施）
+pub const PLAN_EXECUTE_PROMPT: &str =
+    "计划已批准。退出只读规划态，按上面给出的计划开始实施；偏离计划前先说明原因。";
+
+/// 计划模式的系统提示段：状态不持久化，随开关每次运行时注入
+const PLAN_MODE_SECTION: &str = "\
+## Plan mode (read-only)
+You are planning, not executing. This session is read-only: file-modifying and side-effect \
+tools are blocked and not shown to you. Explore the codebase with read-only tools \
+(read/search/grep/task) and end your turn with a concrete implementation plan:
+- Goal, key design decisions (with tradeoffs and the choice made),
+- Ordered steps naming the exact files/functions to change,
+- How each step will be verified.
+Do not guess missing information — ask the user instead. The user approves the plan before \
+any execution happens; until then never attempt to change anything.";
+
 /// 自动接力判定（TUI / headless 共用）：
 /// 自主模式开 && todo 有未完成项 && 本次 run 正常完成（未被取消/失败）
 /// && 累计轮次未超上限。上限按"一次用户输入触发的接力链"计，
@@ -422,6 +439,17 @@ impl AgentHarness {
         self.runtime.set_thinking(thinking);
     }
 
+    /// 热切换计划模式（TUI /plan；runtime 门控 + 系统提示段随之生效）
+    pub fn set_plan_mode(&self, on: bool) {
+        self.runtime.set_plan_mode(on);
+        info!("plan mode {}", if on { "on (read-only)" } else { "off" });
+    }
+
+    /// 当前是否处于计划模式
+    pub fn plan_mode(&self) -> bool {
+        self.runtime.plan_mode()
+    }
+
     /// 当前思考级别
     pub fn thinking_level(&self) -> Option<baiji_ai::ThinkingLevel> {
         self.runtime.thinking()
@@ -473,6 +501,11 @@ impl AgentHarness {
         {
             prompt.push_str("\n\n");
             prompt.push_str(&section);
+        }
+        // 计划模式指令段（开关在 runtime 上，每次请求组装时读最新状态）
+        if self.runtime.plan_mode() {
+            prompt.push_str("\n\n");
+            prompt.push_str(PLAN_MODE_SECTION);
         }
         prompt
     }
@@ -1623,6 +1656,28 @@ mod tests {
         // 落盘可重放：重载后首条同样是摘要
         let loaded = JsonlStore::new(store_dir).load(&old_id).unwrap();
         assert!(loaded.messages[0].content.starts_with("[Conversation Summary]"));
+    }
+
+    #[tokio::test]
+    async fn test_plan_mode_toggle_and_prompt_injection() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(AgentRuntime::new(Arc::new(EchoProvider)));
+        let harness = AgentHarness::new(runtime, dir.path().join("sessions")).unwrap();
+        assert!(!harness.plan_mode(), "default off");
+        assert!(
+            !harness.system_prompt().contains("Plan mode"),
+            "no plan section when off"
+        );
+
+        harness.set_plan_mode(true);
+        assert!(harness.plan_mode());
+        let prompt = harness.system_prompt();
+        assert!(prompt.contains("## Plan mode (read-only)"), "{prompt}");
+        assert!(prompt.contains("read-only"), "{prompt}");
+
+        // 开关在 runtime 上——每次 run 组装请求时读最新状态（热切换即时生效）
+        harness.set_plan_mode(false);
+        assert!(!harness.system_prompt().contains("Plan mode"));
     }
 
     #[tokio::test]

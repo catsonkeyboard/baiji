@@ -323,6 +323,11 @@ async fn main() -> Result<()> {
         info!("verbosity steer enabled (constant conciseness suffix on the last user turn)");
         runtime_builder = runtime_builder.with_verbosity_steer(true);
     }
+    // 计划模式（`--plan`）：只读规划态，非白名单工具在 runtime 内被拒绝
+    if options.plan {
+        info!("plan mode enabled (read-only tool gate)");
+        runtime_builder = runtime_builder.with_plan_mode(true);
+    }
     // 运行中精简旧工具结果时的可逆 spill（与 expand 共用 ctx store；
     // 闭包注入避免 agent → tools 的依赖环）
     let ctx_store_dir = baiji_dir.join("ctx-store");
