@@ -67,6 +67,11 @@ pub struct AppConfig {
     pub retry: RetryConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui: Option<UiConfig>,
+    /// 外部 coding agent 工具（codex/claude/pi 等 CLI 的 headless 模式）。
+    /// 每个条目注册为同名工具 + 同名斜杠命令。全局专用——command 执行
+    /// 任意 shell，项目级配置该字段会被白名单丢弃
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_agents: Option<Vec<baiji_tools::tools::external_agent::ExternalAgentSpec>>,
     /// 项目级配置是否生效（加载时判定；不入 JSON）
     #[serde(skip)]
     pub project_config_applied: bool,
@@ -566,6 +571,11 @@ impl AppConfig {
                 "base_delay_ms": 500,
                 "max_delay_ms": 30000
             },
+            "external_agents": [
+                {"name": "codex", "command": "codex exec {prompt}", "timeout_secs": 300},
+                {"name": "claude", "command": "claude -p {prompt}", "timeout_secs": 300},
+                {"name": "pi", "command": "pi -p {prompt}", "timeout_secs": 300}
+            ],
             "policy": {
                 "allowed_paths": [],
                 "require_confirmation_tools": ["bash", "write", "edit"],
@@ -908,6 +918,19 @@ mod tests {
     }
 
     #[test]
+    fn test_external_agents_parse_global_only_and_template() {
+        // 模板自带 codex/claude/pi 三个预设（可删改）
+        let cfg: AppConfig = serde_json::from_str(&AppConfig::template()).unwrap();
+        let agents = cfg.external_agents.unwrap();
+        assert!(agents.iter().any(|a| a.name == "codex"));
+        assert!(agents.iter().any(|a| a.name == "claude"));
+        assert!(agents.iter().any(|a| a.name == "pi"));
+
+        // 全局专用：不在项目白名单内（command 执行任意 shell，防恶意仓库）
+        assert!(!PROJECT_ALLOWED_TOP.contains(&"external_agents"));
+    }
+
+    #[test]
     fn test_runtime_summary_mentions_key_settings() {
         let dir = tempfile::tempdir().unwrap();
         let global = dir.path().join("g.json");
@@ -931,6 +954,7 @@ mod tests {
             protocol: None,
             max_tokens: None,
             thinking: None,
+            external_agents: None,
             llm_compaction: None,
             max_turns: 24,
             skills: SkillsConfig::default(),
@@ -962,6 +986,7 @@ mod tests {
             protocol: None,
             max_tokens: None,
             thinking: None,
+            external_agents: None,
             llm_compaction: None,
             max_turns: 24,
             skills: SkillsConfig::default(),
@@ -983,6 +1008,7 @@ mod tests {
             protocol: Some("bogus".to_string()),
             max_tokens: None,
             thinking: None,
+            external_agents: None,
             llm_compaction: None,
             max_turns: 24,
             skills: SkillsConfig::default(),
@@ -1007,6 +1033,7 @@ mod tests {
             protocol: None,
             max_tokens: None,
             thinking: None,
+            external_agents: None,
             llm_compaction: None,
             max_turns: 24,
             skills: SkillsConfig::default(),
@@ -1033,6 +1060,7 @@ mod tests {
             protocol: None,
             max_tokens: None,
             thinking: None,
+            external_agents: None,
             llm_compaction: None,
             max_turns: 24,
             skills: SkillsConfig::default(),

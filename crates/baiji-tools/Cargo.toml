@@ -9,6 +9,7 @@ description = "Coding tools (read/write/edit/bash/grep/find/ls) + ExecutionEnv"
 [dependencies]
 baiji-agent = { workspace = true }
 tokio = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }

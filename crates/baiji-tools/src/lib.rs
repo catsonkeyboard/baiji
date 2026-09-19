@@ -13,6 +13,7 @@ pub mod tools;
 pub mod walk;
 
 pub use env::{ExecutionEnv, spill_to_store};
+pub use tools::external_agent::{ExternalAgentSpec, register_external_agents};
 
 use baiji_agent::AgentTool;
 use std::sync::Arc;
