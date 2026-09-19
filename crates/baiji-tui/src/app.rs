@@ -2018,22 +2018,10 @@ impl App {
         &self.streaming
     }
 
-    /// 思考内容的尾部（最多 `max_chars` 字符）：思考可能很长，只展示最新进展
-    pub(crate) fn thinking_tail(&self, max_chars: usize) -> Option<String> {
-        if self.thinking.trim().is_empty() {
-            return None;
-        }
-        let total = self.thinking.chars().count();
-        let tail: String = self
-            .thinking
-            .chars()
-            .skip(total.saturating_sub(max_chars))
-            .collect();
-        Some(if total > max_chars {
-            format!("…{tail}")
-        } else {
-            tail
-        })
+    /// 进行中的思考全文：与回答正文同一套贴底滚动渲染。
+    /// （旧实现只展示 400 字符尾部——前沿不断消失的"收缩"观感即源于此）
+    pub(crate) fn thinking(&self) -> &str {
+        &self.thinking
     }
 
     pub(crate) fn input(&self) -> &str {
@@ -2448,10 +2436,31 @@ mod tests {
             rows.iter().any(|r| r.replace(' ', "").contains("终点标记")),
             "bottom of a long CJK reply must be reachable"
         );
+        // 思考流同样贴底滚动（回归：旧 400 字符尾部窗口呈"前沿收缩"而非滚动）
+        // 保留一行历史：空会话画的是欢迎屏而非聊天区
+        app.lines = vec![ChatLine::user("go")];
+        app.thinking = format!("{}思考尾部标记", "推理".repeat(400));
+        app.scroll_to_bottom();
+        terminal.clear().unwrap(); // TestBackend 宽字符差分残留：断言前全量重绘
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert!(
+            screen(&terminal)
+                .iter()
+                .any(|r| r.replace(' ', "").contains("思考尾部标记")),
+            "long thinking must follow the bottom like the answer stream"
+        );
+        app.thinking.clear();
+        // 恢复后续断言用的代码块消息
+        app.lines = vec![
+            ChatLine::Assistant("fn main() {\n    hi();\n}".to_string()),
+            ChatLine::Assistant(format!("{}终点标记", "中文".repeat(400))),
+        ];
         app.scroll = 0;
+        terminal.clear().unwrap();
         terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
         let rows = screen(&terminal);
         let code_row = rows.iter().position(|r| r.contains("fn main() {")).unwrap();
+
         assert!(
             rows[code_row + 1].contains("    hi();"),
             "newlines preserved"
