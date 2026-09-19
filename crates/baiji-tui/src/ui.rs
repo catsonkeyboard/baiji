@@ -246,8 +246,10 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
             ),
         }
     }
-    // 进行中的思考（暗色斜体，仅展示尾部；答案开始输出后消失）
-    if let Some(thinking) = app.thinking_tail(400) {
+    // 进行中的思考（暗色斜体）：全文进入行流，与回答正文共用贴底滚动——
+    // 旧实现是 400 字符固定尾部窗口，前沿不断消失像"收缩"而非滚动
+    let thinking = app.thinking();
+    if !thinking.trim().is_empty() {
         if !rows.is_empty() {
             rows.push(Line::from(""));
         }
@@ -284,10 +286,13 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Paragraph::new(Text::from(window)).block(block), area);
 
     if max_scroll > 0 {
+        // 比例 thumb（viewport_content_length）：滚动进度可见——固定 1 格 thumb 看不出在滚
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight),
             area,
-            &mut ScrollbarState::new(max_scroll + 1).position(scroll),
+            &mut ScrollbarState::new(max_scroll + 1)
+                .position(scroll)
+                .viewport_content_length(visible.min(u16::MAX as usize)),
         );
     }
 }
