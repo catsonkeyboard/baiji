@@ -38,8 +38,10 @@ Complete the task with the tools available, then return a concise, self-containe
 the parent ONLY sees your final answer, all intermediate output is discarded. \
 Locate with search/grep first, read only the ranges you need, and cite file:line in the result.";
 
-/// 子代理单次运行的轮次上限（防失控；父级/角色可在构造时覆盖）
-const DEFAULT_MAX_TURNS: u32 = 12;
+/// 子代理单次运行的轮次上限（防失控；父级/角色可在构造时覆盖）。
+/// 研究型任务常需 10+ 次检索——12 轮太紧（跑满即失败），20 + 运行时的
+/// 倒计时收尾提醒让子代理几乎总能带回结果
+const DEFAULT_MAX_TURNS: u32 = 20;
 /// 回传答案的字符上限——超长说明任务应拆小，截断并提示
 const MAX_ANSWER_CHARS: usize = 16 * 1024;
 

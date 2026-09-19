@@ -45,19 +45,29 @@ impl AnthropicProvider {
     /// 多条 System 消息（如压缩摘要）以空行拼接为单个 system 字段。
     fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<AnthropicMessage>) {
         let mut system_parts: Vec<String> = Vec::new();
-        let mut anthropic_messages = Vec::new();
+        let mut anthropic_messages: Vec<AnthropicMessage> = Vec::new();
         let turn_start = crate::types::current_turn_start(messages);
 
         for (position, msg) in messages.iter().enumerate() {
             match msg.role {
                 Role::System => system_parts.push(msg.content.clone()),
-                // Anthropic 拒绝空/纯空白的 text block（400），必须跳过
+                // Anthropic 拒绝空/纯空白的 text block（400），必须跳过。
+                // 相邻 user 消息（如 tool_result 轮后跟收尾提醒文本）合并为
+                // 同一 user 轮次——[tool_result…, text] 是合法且语义等价的形态
                 Role::User => {
                     if !msg.content.trim().is_empty() {
-                        anthropic_messages.push(AnthropicMessage {
-                            role: "user".to_string(),
-                            content: vec![ContentBlock::text(&msg.content)],
-                        });
+                        match anthropic_messages.last_mut() {
+                            Some(last)
+                                if last.role == "user"
+                                    && last.content.first().is_some_and(|b| b.is_tool_result()) =>
+                            {
+                                last.content.push(ContentBlock::text(&msg.content));
+                            }
+                            _ => anthropic_messages.push(AnthropicMessage {
+                                role: "user".to_string(),
+                                content: vec![ContentBlock::text(&msg.content)],
+                            }),
+                        }
                     }
                 }
                 Role::Assistant => {
@@ -481,6 +491,11 @@ struct ContentBlock {
 }
 
 impl ContentBlock {
+    /// 是否为 tool_result 块（相邻 user 消息合并判定用）
+    fn is_tool_result(&self) -> bool {
+        self.block_type == "tool_result"
+    }
+
     fn thinking(text: &str, signature: Option<&str>) -> Self {
         Self {
             thinking: Some(text.to_string()),
@@ -665,6 +680,51 @@ struct ApiError {
 mod tests {
     use super::*;
     use crate::types::{ToolCall, ToolResult};
+
+    #[test]
+    fn test_consecutive_user_text_merges_into_tool_result_turn() {
+        // tool_result 轮后紧跟 user 文本（运行时收尾提醒的形态）：
+        // 合并为同一 user 轮次 [tool_result, text]——合法且避免相邻同角色消息
+        let mut messages = vec![Message::user("hi")];
+        messages.push(Message {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: Some(vec![ToolCall {
+                id: "t1".to_string(),
+                name: "grep".to_string(),
+                arguments: serde_json::json!({}),
+            }]),
+            tool_results: None,
+            reasoning: None,
+        });
+        messages.push(Message {
+            role: Role::Tool,
+            content: String::new(),
+            tool_calls: None,
+            tool_results: Some(vec![ToolResult {
+                tool_call_id: "t1".to_string(),
+                content: "match".to_string(),
+            }]),
+            reasoning: None,
+        });
+        messages.push(Message::user("[system notice] FINAL TURN"));
+
+        let (_, converted) = AnthropicProvider::convert_messages(&messages);
+        assert_eq!(
+            converted.len(),
+            3,
+            "notice merges into the tool-result turn"
+        );
+        let last = converted.last().unwrap();
+        assert_eq!(last.role, "user");
+        assert_eq!(last.content.len(), 2);
+        assert_eq!(last.content[0].block_type, "tool_result");
+        assert_eq!(last.content[1].block_type, "text");
+        // 普通相邻两条 user 文本不合并（无 tool_result 语义）
+        let (_, plain) =
+            AnthropicProvider::convert_messages(&[Message::user("a"), Message::user("b")]);
+        assert_eq!(plain.len(), 2, "no merging without tool_result blocks");
+    }
 
     #[test]
     fn test_build_request_body_shapes() {
