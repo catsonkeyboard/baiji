@@ -7,7 +7,7 @@ A terminal AI coding agent built on a multi-crate Rust workspace: async streamin
 ```bash
 cargo build                # Build the whole workspace
 cargo run                  # Run the TUI app (default)
-cargo test --workspace     # Run all tests (356 total)
+cargo test --workspace     # Run all tests (358 total)
 baiji -e "msg" --yes      # Headless one-shot run (streams to stdout)
 baiji -e "msg" --plan     # Read-only planning run (plan mode)
 baiji --sessions          # List sessions (no API key needed)
@@ -115,7 +115,7 @@ TokenHub has regional endpoints (default here is the international one) — over
 
 - Unified types: `Message { role, content, tool_calls, tool_results }`, `ChatRequest/Response`, `StreamChunk { Content, ToolCallStart, ToolCallArguments, Done, Error }`.
 - `Provider` trait: `chat` / `chat_stream` (+ `protocol`, `model`).
-- Anthropic `/v1/messages`: multiple System messages joined into `system`; tool args streamed as `ToolCallArguments` (index→id mapping).
+- Anthropic `/v1/messages`: multiple System messages joined into `system`; a user text message directly after a tool-result user turn merges into that turn as a trailing text block (wrap-up notices); tool args streamed as `ToolCallArguments` (index→id mapping).
 - OpenAI-compatible: Chat Completions + Responses. Streaming tool calls are **buffered per index/item_id and flushed at stream end** — parallel tool-call fragments may interleave, and the agent accumulator is sequential. A stream-end sentinel flushes even when the server omits `[DONE]` / `response.completed`.
 - Endpoint joining (`openai::endpoint`): full path kept as-is; versioned base (`/v1`, `/v4`, `/plan/v3`) appends the path; bare root appends `/v1<path>`.
 - Model discovery `list_models`: OpenAI-style `GET /models` (Bearer) or Anthropic `/v1/models` (x-api-key + anthropic-version); both return `{"data":[{"id",...}]}`.
@@ -125,7 +125,7 @@ TokenHub has regional endpoints (default here is the international one) — over
 ```
 run()
   ├─ inject steering messages each turn
-  ├─ loop (≤ max_turns, default 24):
+  ├─ loop (≤ max_turns, default 24; last 2 turns inject a request-copy-only wrap-up notice — 'one turn left' then 'FINAL TURN, answer now' — so budget exhaustion returns an answer instead of a bare max-iterations error):
   │    ├─ chat_stream with retry (transient: rate/timeout/5xx; backoff 500ms×2^n, ≤2 retries)
   │    ├─ accumulate Content→text, ToolCallStart/Arguments→tool calls
   │    ├─ no tool calls → final answer, break (a `max_tokens`-truncated answer carries a visible continuation marker)
@@ -158,7 +158,7 @@ run()
 ### Tools (`baiji-tools`)
 
 `read` (multi-mode JIT disclosure: `signatures` = symbol outline with line anchors → read exact ranges via offset/limit, `map` = compact directory tree, `full` = numbered lines with optional `density` (0.05-1.0) entropy-based line selection; over-budget full reads auto-degrade to `[auto-density …]` instead of hard truncation — disable via `ExecutionEnv::without_density_fallback`; **cached re-read**: in-process `(path, args)` cache keyed on `(mtime, size)` — an identical re-read of an unmodified file whose previous output was ≥2KB returns a short `[unchanged: … ctx:<handle>]` stub instead of resending the content, recoverable via `expand`; no ctx store / small outputs / `map` mode (dir mtime unreliable) never stub), `write` (creates parents), `edit` (exact-match replace; unique or `replace_all`), `bash` (`sh -c` in workdir, timeout + kill, exit/stdout/stderr, three-stage output compression: ANSI strip → generic rules (noise-line filtering + consecutive-duplicate folding `⟨… repeated N×⟩`) → content-aware domain compressors), `grep` (regex, depth ≤10, skips `.git`/`target`/`node_modules`/hidden, glob filter, ≤200 matches; consecutive same-file matches are grouped under a `File: path` header with `line: text` rows when shorter), `find` (name substring + kind filter), `ls` (dirs first), `expand` (retrieve truncated/compressed output by `ctx:` handle).
-**Subagent task tool (T8)**: the `task` tool spawns a nested `AgentRuntime` (`subagent.rs`) with its own conversation, turn budget (default 12) and a read-only tool subset (`SUBAGENT_ALLOWED_TOOLS`: read/grep/find/ls/search/imports/expand — recursion depth 1, `task` is filtered out of the sub-registry). Only the final answer returns to the parent (capped at 16k chars with a truncation note); intermediate output never enters the parent history. Cancellation propagates for free — the parent runtime awaits tool futures in `select!`, so Esc drops the subagent's future. Subagent failure (max turns / LLM error) is an `is_error` tool result, not a run failure.
+**Subagent task tool (T8)**: the `task` tool spawns a nested `AgentRuntime` (`subagent.rs`) with its own conversation, turn budget (default 20; role `max_turns` overrides) and a read-only tool subset (`SUBAGENT_ALLOWED_TOOLS`: read/grep/find/ls/search/imports/expand — recursion depth 1, `task` is filtered out of the sub-registry). Only the final answer returns to the parent (capped at 16k chars with a truncation note); intermediate output never enters the parent history. Cancellation propagates for free — the parent runtime awaits tool futures in `select!`, so Esc drops the subagent's future. Subagent failure (max turns / LLM error) is an `is_error` tool result, not a run failure.
 
 **Definable subagent roles + parallel orchestration**: agent files `~/.baiji/agents/*.md` (user) + `./.baiji/agents/*.md` (project, same-name overrides) define `AgentRole`s — YAML-style frontmatter (`name`/`description`/`tools`/`model`/`thinking`/`max_turns`) with the body as the subagent system prompt; loaded into a shared `SubagentRegistry` (RwLock — `/subagents r` hot-reloads from disk). `task {agent: <name>}` dispatches to the role: its system prompt, tool subset (intersected with the read-only whitelist), thinking level and turn budget apply; a role `model` builds a dedicated provider (cached) from the `ProviderConfig` snapshot passed at wiring (`with_provider_config`), falling back to the parent provider when unavailable. Active roles render into the system prompt as a `## Subagents` section (name + description, parallel-dispatch hint). Parallelism: `AgentTool::parallel()` (default false) marks tools that are safe to run concurrently; `task` opts in — when ALL calls in one assistant turn are parallel-capable the runtime executes them via `join_all` (results paired back in tool_use order; steering/cancel take effect at batch granularity). Known simplification: subagent events are not forwarded to the parent stream.
 

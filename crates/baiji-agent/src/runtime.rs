@@ -327,6 +327,22 @@ impl AgentRuntime {
             if self.verbosity_steer {
                 steer_last_user(&mut request_messages);
             }
+            // 轮次预算告急提醒（同样仅请求副本）：倒计时 2 轮起提示收尾，
+            // 最后一轮强制"只作答不再调工具"——避免跑满预算直接报
+            // "达到最大迭代次数"而拿不到任何结果（子代理尤其常见）
+            let remaining = self.max_turns.saturating_sub(turn);
+            if remaining == 1 {
+                request_messages.push(Message::user(
+                    "[system notice] You have ONE turn left after this one before the hard turn \
+                     limit. Wrap up now: finish the current step only, then prepare your final \
+                     answer.",
+                ));
+            } else if remaining == 0 {
+                request_messages.push(Message::user(
+                    "[system notice] FINAL TURN — the turn limit is reached. Do NOT call any \
+                     tools. Give your final answer NOW based on what you have gathered.",
+                ));
+            }
             let request = ChatRequest::new(request_messages)
                 .with_tools(self.request_tool_definitions())
                 .with_max_tokens(self.max_tokens)
@@ -1054,6 +1070,8 @@ mod tests {
     struct CapturingProvider {
         requests: std::sync::Mutex<Vec<Vec<Message>>>,
         tool_names: std::sync::Mutex<Vec<Vec<String>>>,
+        /// true = 每轮都发工具调用（跑满预算），用于收尾提醒类测试
+        always_tool: bool,
     }
 
     #[async_trait]
@@ -1074,11 +1092,22 @@ mod tests {
                     .map(|t| t.name.clone())
                     .collect(),
             );
-            Ok(futures::stream::iter(vec![
-                Ok(StreamChunk::Content("ok".into())),
-                Ok(StreamChunk::Done),
-            ])
-            .boxed())
+            let chunks: Vec<Result<StreamChunk>> = if self.always_tool {
+                vec![
+                    Ok(StreamChunk::ToolCallStart {
+                        id: "t1".into(),
+                        name: "unknown".into(),
+                    }),
+                    Ok(StreamChunk::ToolCallArguments {
+                        id: "t1".into(),
+                        arguments: "{}".into(),
+                    }),
+                    Ok(StreamChunk::Done),
+                ]
+            } else {
+                vec![Ok(StreamChunk::Content("ok".into())), Ok(StreamChunk::Done)]
+            };
+            Ok(futures::stream::iter(chunks).boxed())
         }
         fn protocol(&self) -> Protocol {
             Protocol::OpenAIChat
@@ -1145,6 +1174,7 @@ mod tests {
         let provider = Arc::new(CapturingProvider {
             requests: std::sync::Mutex::new(Vec::new()),
             tool_names: std::sync::Mutex::new(Vec::new()),
+            always_tool: false,
         });
         let runtime = AgentRuntime::new(provider.clone()).with_verbosity_steer(true);
         let mut history = vec![Message::user("原始问题")];
@@ -1212,6 +1242,7 @@ mod tests {
         let provider = Arc::new(CapturingProvider {
             requests: std::sync::Mutex::new(Vec::new()),
             tool_names: std::sync::Mutex::new(Vec::new()),
+            always_tool: false,
         });
         let runtime = AgentRuntime::new(provider.clone());
         let mut history = vec![Message::user("q")];
@@ -1427,6 +1458,60 @@ mod tests {
         assert_eq!(runtime.thinking(), None);
     }
 
+    #[tokio::test]
+    async fn test_wrapup_notice_on_last_two_turns_request_copy_only() {
+        // 每轮都调工具 → 跑满预算；捕获每次请求断言倒计时提醒
+        let provider = Arc::new(CapturingProvider {
+            requests: std::sync::Mutex::new(Vec::new()),
+            tool_names: std::sync::Mutex::new(Vec::new()),
+            always_tool: true,
+        });
+        let runtime = AgentRuntime::new(provider.clone()).with_limits(3, 8192);
+
+        let mut messages = vec![Message::user("hi")];
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let result = runtime
+            .run(
+                "sys",
+                &mut messages,
+                &tx,
+                &CancellationToken::new(),
+                &SteeringQueue::new(),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "always-tool script must exhaust the budget"
+        );
+
+        let requests = provider.requests.lock().unwrap();
+        assert!(requests.len() >= 3, "{}", requests.len());
+        // 倒计时 1 轮：提醒收尾
+        assert!(
+            requests[requests.len() - 2]
+                .iter()
+                .any(|m| m.content.contains("ONE turn left")),
+            "penultimate turn carries the wrap-up warning"
+        );
+        // 最后一轮：只作答不调工具
+        assert!(
+            requests
+                .last()
+                .unwrap()
+                .iter()
+                .any(|m| m.content.contains("FINAL TURN")),
+            "final turn carries the answer-now notice"
+        );
+        // 非告急轮不注入
+        assert!(
+            !requests[0]
+                .iter()
+                .any(|m| m.content.contains("system notice"))
+        );
+        // 仅请求副本：会话历史不含提醒（也不落盘）
+        assert!(!messages.iter().any(|m| m.content.contains("system notice")));
+    }
+
     // ===== 计划模式 =====
 
     #[tokio::test]
@@ -1475,6 +1560,7 @@ mod tests {
         let provider = Arc::new(CapturingProvider {
             requests: std::sync::Mutex::new(Vec::new()),
             tool_names: std::sync::Mutex::new(Vec::new()),
+            always_tool: false,
         });
         let mut tools = ToolRegistry::new();
         tools.register(Arc::new(NamedTool("append"))); // 白名单外

@@ -216,12 +216,12 @@ async fn main() -> Result<()> {
         .collect();
     tools.register(Arc::new(
         baiji_agent::SubagentTool::new(provider.clone(), sub_tools)
-            .with_max_turns(12)
+            .with_max_turns(20)
             .with_roles(subagent_registry.clone())
             // 角色 model 字段生效的原料（无则角色回落父级 provider）
             .with_provider_config(provider_config.clone()),
     ));
-    info!("subagent task tool registered (read-only tools, max 12 turns, roles dispatchable)");
+    info!("subagent task tool registered (read-only tools, max 20 turns, roles dispatchable)");
 
     // ---- 插件 ----
     let mut hooks = HookRegistry::new();
