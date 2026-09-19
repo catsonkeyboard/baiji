@@ -415,6 +415,14 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
             " Esc 取消 · 输入即 steering ",
             Style::default().fg(theme.accent),
         ));
+    } else if app.plan_mode() {
+        // 计划模式静态指示：非运行态才占用顶边（运行态已有 steering 提示）
+        let tip = if app.awaiting_plan() {
+            " ⏸ 计划待批准：空回车=开始执行 · 输入=继续改计划 "
+        } else {
+            " ⏸ 计划模式（只读） · /plan off 退出 "
+        };
+        block = block.title_top(Line::styled(tip, Style::default().fg(theme.accent)));
     }
 
     let mut spans = vec![Span::styled(

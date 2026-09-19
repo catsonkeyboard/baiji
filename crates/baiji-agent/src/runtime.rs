@@ -59,6 +59,9 @@ pub struct AgentRuntime {
     /// 思考级别（请求级推理强度；RwLock 支持运行中热切换，如 TUI 的 /thinking）。
     /// None = 不发送思考字段（协议默认行为）
     thinking: std::sync::RwLock<Option<baiji_ai::ThinkingLevel>>,
+    /// 计划模式（只读规划态；AtomicBool 支持运行中热切换）。
+    /// 开启后：发给模型的工具定义过滤为只读白名单，白名单外的调用直接拒绝
+    plan_mode: std::sync::atomic::AtomicBool,
     /// spill 能力（可选）：运行中就地精简旧工具结果时，原文写入 ctx store
     /// 返回句柄（可逆）。闭包注入而非依赖 baiji-tools——agent 在依赖图上
     /// 位于 tools 之下，直接依赖会成环
@@ -67,6 +70,15 @@ pub struct AgentRuntime {
 
 /// spill 闭包：内容 → ctx 句柄（main.rs 用 baiji_tools::spill_to_store 构造）
 type SpillFn = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+/// 计划模式（只读规划态）可用的工具白名单。
+/// 探索类只读工具 + 状态外置工具（todo/memory 不进文件系统）+ 子代理
+/// （其工具集本身已是只读子集）。白名单外的工具（write/edit/bash 及全部
+/// MCP 工具）在计划模式下：定义不发给模型，模型经历史发起的调用直接拒绝。
+pub const PLAN_MODE_ALLOWED_TOOLS: &[&str] = &[
+    "read", "grep", "find", "ls", "search", "imports", "expand", "task", "todo", "memory", "skill",
+    "now",
+];
 
 impl AgentRuntime {
     pub fn new(provider: Arc<dyn Provider>) -> Self {
@@ -84,6 +96,7 @@ impl AgentRuntime {
             retry_max_delay: Duration::from_millis(30_000),
             verbosity_steer: false,
             thinking: std::sync::RwLock::new(None),
+            plan_mode: std::sync::atomic::AtomicBool::new(false),
             spill: None,
         }
     }
@@ -128,6 +141,12 @@ impl AgentRuntime {
         self
     }
 
+    /// 以计划模式启动（headless `--plan`；运行中仍可用 set_plan_mode 切换）
+    pub fn with_plan_mode(self, on: bool) -> Self {
+        self.set_plan_mode(on);
+        self
+    }
+
     /// 热切换思考级别（TUI /thinking；下一次请求生效）
     pub fn set_thinking(&self, thinking: Option<baiji_ai::ThinkingLevel>) {
         *self.thinking.write().unwrap() = thinking;
@@ -136,6 +155,31 @@ impl AgentRuntime {
     /// 当前思考级别
     pub fn thinking(&self) -> Option<baiji_ai::ThinkingLevel> {
         *self.thinking.read().unwrap()
+    }
+
+    /// 热切换计划模式（TUI /plan；下一次请求与工具调用生效）
+    pub fn set_plan_mode(&self, on: bool) {
+        self.plan_mode
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 是否处于计划模式（只读规划态）
+    pub fn plan_mode(&self) -> bool {
+        self.plan_mode.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 发给模型的工具定义：计划模式下只保留只读白名单（模型看不到写工具，
+    /// 执行路径另有拒绝兜底）
+    fn request_tool_definitions(&self) -> Vec<baiji_ai::ToolDefinition> {
+        if self.plan_mode() {
+            self.tools
+                .definitions()
+                .into_iter()
+                .filter(|d| PLAN_MODE_ALLOWED_TOOLS.contains(&d.name.as_str()))
+                .collect()
+        } else {
+            self.tools.definitions()
+        }
     }
 
     /// 注入 spill 能力：运行中精简旧工具结果时原文可逆（ctx 句柄 + expand 取回）
@@ -284,7 +328,7 @@ impl AgentRuntime {
                 steer_last_user(&mut request_messages);
             }
             let request = ChatRequest::new(request_messages)
-                .with_tools(self.tools.definitions())
+                .with_tools(self.request_tool_definitions())
                 .with_max_tokens(self.max_tokens)
                 .with_thinking(self.thinking());
             let response = match self.stream_with_retry(request, events, cancel).await? {
@@ -472,6 +516,32 @@ impl AgentRuntime {
             "agent.tool",
             attrs(&[("name", AttrValue::from(name.to_string()))]),
         );
+
+        // 计划模式门控：白名单外的工具不执行（定义已过滤，这里兜底历史里的
+        // 调用与热切换竞态），拒绝原因作为 is_error 结果回传给模型
+        if self.plan_mode() && !PLAN_MODE_ALLOWED_TOOLS.contains(&name) {
+            let output = ToolOutput::err(format!(
+                "[Plan mode] tool '{name}' is not allowed while planning — this session is \
+                 read-only. Explore with read/search/grep/task, then present your \
+                 implementation plan as the final answer; the user approves it before execution."
+            ));
+            tool_span.set_attribute("duration_ms", AttrValue::Uint(0));
+            tool_span.set_attribute("is_error", AttrValue::Bool(true));
+            tool_span.set_attribute("denied", AttrValue::from("plan_mode"));
+            tool_span.end();
+            events
+                .send(AgentEvent::ToolFinished {
+                    id: tool_call.id.clone(),
+                    name: name.to_string(),
+                    output: output.content.clone(),
+                    is_error: true,
+                    duration_ms: 0,
+                    original_bytes: None,
+                    original_tokens: None,
+                })
+                .ok();
+            return Ok(output);
+        }
 
         // Hook 拦截/改写 + HITL 确认。
         // hook 自身报错按拒绝处理（fail closed），而不是中止整个 run：
@@ -947,9 +1017,10 @@ mod tests {
 
     // ===== verbosity steer =====
 
-    /// 记录每次请求消息的捕获型 Provider
+    /// 记录每次请求消息与工具定义的捕获型 Provider
     struct CapturingProvider {
         requests: std::sync::Mutex<Vec<Vec<Message>>>,
+        tool_names: std::sync::Mutex<Vec<Vec<String>>>,
     }
 
     #[async_trait]
@@ -962,6 +1033,14 @@ mod tests {
             request: ChatRequest,
         ) -> Result<futures::stream::BoxStream<'static, Result<StreamChunk>>> {
             self.requests.lock().unwrap().push(request.messages.clone());
+            self.tool_names.lock().unwrap().push(
+                request
+                    .tools
+                    .iter()
+                    .flatten()
+                    .map(|t| t.name.clone())
+                    .collect(),
+            );
             Ok(futures::stream::iter(vec![
                 Ok(StreamChunk::Content("ok".into())),
                 Ok(StreamChunk::Done),
@@ -1032,6 +1111,7 @@ mod tests {
     async fn test_verbosity_steer_injects_into_request_copy_only() {
         let provider = Arc::new(CapturingProvider {
             requests: std::sync::Mutex::new(Vec::new()),
+            tool_names: std::sync::Mutex::new(Vec::new()),
         });
         let runtime = AgentRuntime::new(provider.clone()).with_verbosity_steer(true);
         let mut history = vec![Message::user("原始问题")];
@@ -1098,6 +1178,7 @@ mod tests {
     async fn test_verbosity_steer_disabled_by_default() {
         let provider = Arc::new(CapturingProvider {
             requests: std::sync::Mutex::new(Vec::new()),
+            tool_names: std::sync::Mutex::new(Vec::new()),
         });
         let runtime = AgentRuntime::new(provider.clone());
         let mut history = vec![Message::user("q")];
@@ -1311,6 +1392,146 @@ mod tests {
         assert_eq!(runtime.thinking(), Some(ThinkingLevel::Minimal));
         runtime.set_thinking(None);
         assert_eq!(runtime.thinking(), None);
+    }
+
+    // ===== 计划模式 =====
+
+    #[tokio::test]
+    async fn test_plan_mode_denies_non_readonly_tool() {
+        let provider = MockProvider::new(Script::ToolThenAnswer {
+            tool_id: "t1",
+            tool_name: "append",
+            args: r#"{"text":"x"}"#,
+            answer: "planned",
+        });
+        let runtime = runtime_with(provider).with_plan_mode(true);
+
+        let mut messages = vec![Message::user("hi")];
+        let events = drive(&runtime, &mut messages).await;
+
+        // 工具被计划模式门控拒绝（is_error 结果回传，循环继续到最终答案）
+        let result = &messages[2].tool_results.as_ref().unwrap()[0];
+        assert!(result.content.contains("[Plan mode]"), "{}", result.content);
+        assert_eq!(messages.last().unwrap().content, "planned");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolFinished { is_error: true, .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plan_mode_filters_tool_definitions_and_hot_toggles() {
+        struct NamedTool(&'static str);
+        #[async_trait]
+        impl AgentTool for NamedTool {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn description(&self) -> &str {
+                "stub"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> Result<ToolOutput> {
+                Ok(ToolOutput::ok("ran"))
+            }
+        }
+
+        let provider = Arc::new(CapturingProvider {
+            requests: std::sync::Mutex::new(Vec::new()),
+            tool_names: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(NamedTool("append"))); // 白名单外
+        tools.register(Arc::new(NamedTool("read"))); // 白名单内
+        let runtime = AgentRuntime::new(provider.clone())
+            .with_tools(tools)
+            .with_plan_mode(true);
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let steering = SteeringQueue::new();
+        let mut messages = vec![Message::user("plan this")];
+        runtime
+            .run(
+                "sys",
+                &mut messages,
+                &tx,
+                &CancellationToken::new(),
+                &steering,
+            )
+            .await
+            .unwrap();
+        {
+            let names = provider.tool_names.lock().unwrap();
+            assert_eq!(names[0], vec!["read"], "plan mode hides non-readonly tools");
+        }
+
+        // 热切换关闭（TUI Enter 执行计划路径）：下一次请求恢复全量定义
+        runtime.set_plan_mode(false);
+        messages.push(Message::user("execute"));
+        runtime
+            .run(
+                "sys",
+                &mut messages,
+                &tx,
+                &CancellationToken::new(),
+                &steering,
+            )
+            .await
+            .unwrap();
+        let names = provider.tool_names.lock().unwrap();
+        assert_eq!(
+            names[1],
+            vec!["append", "read"],
+            "registration order restored"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plan_mode_denies_before_hook_gate() {
+        // 门控顺序回归：计划模式拒绝必须发生在 hook 门控之前
+        //（不该为注定被拒的调用咨询 hook / 弹 HITL 确认）
+        struct RecordingHook(std::sync::Mutex<Vec<String>>);
+
+        #[async_trait]
+        impl crate::hooks::Hook for RecordingHook {
+            fn name(&self) -> &str {
+                "recording"
+            }
+            async fn on_tool_call(
+                &self,
+                name: &str,
+                _args: &serde_json::Value,
+            ) -> anyhow::Result<crate::HookDecision> {
+                self.0.lock().unwrap().push(name.to_string());
+                Ok(crate::HookDecision::Proceed)
+            }
+        }
+
+        let seen = Arc::new(RecordingHook(std::sync::Mutex::new(Vec::new())));
+        let provider = MockProvider::new(Script::ToolThenAnswer {
+            tool_id: "t1",
+            tool_name: "append",
+            args: r#"{"text":"x"}"#,
+            answer: "planned",
+        });
+        let mut hooks = HookRegistry::new();
+        hooks.register(seen.clone());
+        let runtime = runtime_with(provider)
+            .with_hooks(hooks)
+            .with_plan_mode(true);
+
+        let mut messages = vec![Message::user("hi")];
+        drive(&runtime, &mut messages).await;
+
+        assert!(
+            seen.0.lock().unwrap().is_empty(),
+            "plan-mode denial must short-circuit before the hook gate"
+        );
+        let result = &messages[2].tool_results.as_ref().unwrap()[0];
+        assert!(result.content.contains("[Plan mode]"));
     }
 
     async fn drive(runtime: &AgentRuntime, messages: &mut Vec<Message>) -> Vec<AgentEvent> {

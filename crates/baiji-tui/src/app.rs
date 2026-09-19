@@ -171,7 +171,10 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("kill", "停止后台任务：/kill <id>（列表见 /tasks）"),
     ("model", "切换模型：/model <名称>，或不带参数打开模型选择器"),
     ("new", "开新会话（当前会话完整保留在磁盘）"),
-    ("plan", "进入/管理 Plan 计划模式（规划中）"),
+    (
+        "plan",
+        "计划模式：/plan 切换只读规划态；/plan <目标> 开始规划；计划给出后 Enter 批准执行",
+    ),
     ("quit", "退出 baiji"),
     ("resume", "恢复其它会话（打开会话选择器）"),
     ("session", "显示当前会话信息与统计"),
@@ -455,6 +458,10 @@ pub struct App {
     jobs: Option<Arc<baiji_tools::tools::jobs::JobRegistry>>,
     /// 本次会话累计工具调用次数（/usage；跨 run 累计）
     tools_total: u64,
+    /// 计划模式展示镜像（真值在 runtime；每帧渲染免锁）
+    plan_mode: bool,
+    /// 计划已给出、等待用户 Enter 批准执行（Enter=退出计划模式并执行）
+    awaiting_plan: bool,
 }
 
 impl App {
@@ -481,6 +488,8 @@ impl App {
             .try_lock()
             .map(|h| h.template_list())
             .unwrap_or_default();
+        // 初始门控状态跟随 runtime（headless `--plan` 同样进 TUI 时镜像为真）
+        let plan_mode = harness.try_lock().is_ok_and(|h| h.plan_mode());
         Self {
             harness,
             context_tokens: 0,
@@ -518,6 +527,8 @@ impl App {
             git_branch,
             frame: 0,
             jobs,
+            plan_mode,
+            awaiting_plan: false,
         }
     }
 
@@ -684,6 +695,11 @@ impl App {
                 if self.agent_running {
                     self.cancel.cancel();
                     self.lines.push(ChatLine::System("已请求取消…".to_string()));
+                } else if self.awaiting_plan {
+                    self.awaiting_plan = false;
+                    self.lines.push(ChatLine::System(
+                        "已取消执行确认（仍处于计划模式）".to_string(),
+                    ));
                 } else {
                     return true;
                 }
@@ -691,8 +707,14 @@ impl App {
             KeyCode::Enter => {
                 let text = self.input.trim().to_string();
                 if text.is_empty() {
+                    // 计划等待态：空回车 = 批准执行（退出计划模式并发起执行 run）
+                    if self.awaiting_plan {
+                        self.approve_plan(ui_tx.clone()).await;
+                        self.scroll_to_bottom();
+                    }
                     return false;
                 }
+                self.awaiting_plan = false; // 任何输入都视为继续对话，批准作废
                 // 斜杠命令（/model /config /status /help …）。
                 // 用户 prompt 模板（/name 参数）不在此处理：当作普通消息交给 Harness 展开
                 let is_template = split_slash(&text)
@@ -1043,7 +1065,6 @@ impl App {
         args: &str,
         ui_tx: &UnboundedSender<UiEvent>,
     ) -> bool {
-        let _ = ui_tx;
         match cmd {
             "quit" => return true,
             "help" => {
@@ -1093,12 +1114,13 @@ impl App {
             "status" => {
                 let s = &self.settings;
                 self.lines.push(ChatLine::System(format!(
-                    "vendor: {} · endpoint: {} · model: {} · thinking: {} · session: {}\n{}",
+                    "vendor: {} · endpoint: {} · model: {} · thinking: {} · session: {}\n计划模式: {} · {}",
                     s.vendor,
                     s.endpoint.as_deref().unwrap_or("api"),
                     s.model.as_deref().unwrap_or("自动发现"),
                     s.thinking.map(|l| l.effort()).unwrap_or("off"),
                     self.session_id,
+                    if self.plan_mode { "开启（只读）" } else { "关闭" },
                     self.settings_summary
                 )));
             }
@@ -1365,9 +1387,32 @@ impl App {
                     }
                 }
             }
-            "plan" => self.lines.push(ChatLine::System(
-                "Plan 模式尚未实现（规划中：进入只读规划态，计划确认后执行）".to_string(),
-            )),
+            // 计划模式：/plan 开关（热切换，运行中亦可）；/plan <目标> = 开启并开始规划。
+            // 开关真值在 runtime（工具门控 + 系统提示段随之生效），此处镜像仅驱动渲染
+            "plan" => {
+                let arg = args.trim();
+                match arg.to_ascii_lowercase().as_str() {
+                    "" => self.set_plan_mode(!self.plan_mode).await,
+                    "on" => self.set_plan_mode(true).await,
+                    "off" => self.set_plan_mode(false).await,
+                    goal => {
+                        if !self.plan_mode {
+                            self.set_plan_mode(true).await;
+                        }
+                        if self.agent_running {
+                            // 运行中：目标作为 steering 注入当前 run
+                            // （写工具立即被计划模式门控拒绝，本轮即可转入规划）
+                            self.steering.push(goal);
+                            self.lines
+                                .push(ChatLine::System(format!("（steering·规划）{goal}")));
+                        } else {
+                            self.lines.push(ChatLine::user(goal));
+                            self.auto_turns = 0;
+                            self.spawn_run(goal.to_string(), ui_tx.clone());
+                        }
+                    }
+                }
+            }
             "subagents" => self.lines.push(ChatLine::System(
                 "子代理管理界面尚未实现（规划中：查看/修改子代理的模型、思考级别与提示词）"
                     .to_string(),
@@ -1387,6 +1432,36 @@ impl App {
             }
         }
         false
+    }
+
+    // ---- 计划模式 ----
+
+    /// 切换计划模式：runtime 门控（工具白名单 + 系统提示段）+ 本地镜像 + 提示行
+    async fn set_plan_mode(&mut self, on: bool) {
+        self.plan_mode = on;
+        self.awaiting_plan = false;
+        self.harness.lock().await.set_plan_mode(on);
+        if on {
+            self.lines.push(ChatLine::System(
+                "⏸ 计划模式已开启（只读）— 写/编辑/bash 被禁用；/plan off 退出".to_string(),
+            ));
+        } else {
+            self.lines.push(ChatLine::System(
+                "▶ 计划模式已关闭，恢复完整工具".to_string(),
+            ));
+        }
+    }
+
+    /// Enter 批准执行计划：退出计划模式并以固定指令发起执行 run
+    async fn approve_plan(&mut self, ui_tx: UnboundedSender<UiEvent>) {
+        self.awaiting_plan = false;
+        self.set_plan_mode(false).await;
+        self.lines.push(ChatLine::System(format!(
+            "⏩ 执行计划：{plan}",
+            plan = baiji_harness::PLAN_EXECUTE_PROMPT
+        )));
+        self.auto_turns = 0;
+        self.spawn_run(baiji_harness::PLAN_EXECUTE_PROMPT.to_string(), ui_tx);
     }
 
     // ---- 向导列表行（供键处理与渲染共用）----
@@ -1618,6 +1693,13 @@ impl App {
                     self.lines.push(ChatLine::assistant(&answer));
                 }
                 self.finish_run();
+                // 计划模式跑完一轮：非空回答视为待批准的计划
+                if self.plan_mode && !answer.is_empty() {
+                    self.awaiting_plan = true;
+                    self.lines.push(ChatLine::System(
+                        "⏸ 计划已给出 — 空回车退出计划模式并开始执行 · 或直接输入继续修改计划 · /plan off 仅退出".to_string(),
+                    ));
+                }
                 self.maybe_auto_continue(ui_tx.clone());
             }
             AgentEvent::RunFailed { error } => {
@@ -1647,7 +1729,8 @@ impl App {
     /// 自动接力（T4）：run 正常结束且 todo 仍有未完成项、轮次未超上限时，
     /// 以固定输入继续（用户可见、进入历史；Esc 可随时终止链）
     fn maybe_auto_continue(&mut self, ui_tx: UnboundedSender<UiEvent>) {
-        if !self.auto.enabled || self.agent_running || self.run_interrupted {
+        // 计划模式下不接力：规划结果等待用户批准，而不是自动开跑
+        if !self.auto.enabled || self.plan_mode || self.agent_running || self.run_interrupted {
             return;
         }
         let has_open = self
@@ -1681,6 +1764,7 @@ impl App {
     fn spawn_run(&mut self, text: String, ui_tx: UnboundedSender<UiEvent>) {
         self.agent_running = true;
         self.run_interrupted = false;
+        self.awaiting_plan = false; // 新一轮开始，旧的批准待办作废
 
         let steering = Arc::new(SteeringQueue::new());
         self.steering = Arc::clone(&steering);
@@ -1723,6 +1807,13 @@ impl App {
     /// 状态栏右半：会话与运行台账（各项在无数据时省略）
     pub(crate) fn status_right(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
+        if self.plan_mode {
+            parts.push(if self.awaiting_plan {
+                "计划·待执行".to_string()
+            } else {
+                "计划·只读".to_string()
+            });
+        }
         if self.context_tokens > 0 {
             parts.push(format!("ctx {:.1}k", self.context_tokens as f64 / 1000.0));
         }
@@ -1743,6 +1834,16 @@ impl App {
     // 访问器供 ui 模块渲染
     pub(crate) fn lines(&self) -> &[ChatLine] {
         &self.lines
+    }
+
+    /// 计划模式（展示镜像；门控真相在 AgentRuntime）
+    pub(crate) fn plan_mode(&self) -> bool {
+        self.plan_mode
+    }
+
+    /// 计划已给出、等待空回车批准执行
+    pub(crate) fn awaiting_plan(&self) -> bool {
+        self.awaiting_plan
     }
 
     pub(crate) fn streaming(&self) -> &str {
@@ -2191,6 +2292,50 @@ mod tests {
                 .iter()
                 .any(|l| matches!(l, ChatLine::System(s) if s.contains("用法：/thinking")))
         );
+
+        // /plan 计划模式：镜像切换 + runtime 门控生效 + 状态栏与输入框指示
+        app.handle_slash("plan", "", &ui_tx).await;
+        assert!(app.plan_mode(), "slash toggles the display mirror");
+        assert!(
+            app.harness.try_lock().unwrap().plan_mode(),
+            "runtime gate hot-swapped"
+        );
+        assert!(app.status_right().contains("计划·只读"));
+        terminal.clear().unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        assert!(
+            screen(&terminal)
+                .iter()
+                .any(|r| r.replace(' ', "").contains("计划模式（只读）")),
+            "input box top border shows the plan-mode hint"
+        );
+        app.handle_slash("plan", "off", &ui_tx).await;
+        assert!(!app.plan_mode());
+        assert!(!app.harness.try_lock().unwrap().plan_mode());
+
+        // 批准流：开启 → 模拟计划回答完成 → awaiting → 空回车批准执行
+        app.handle_slash("plan", "on", &ui_tx).await;
+        app.handle_agent_event(
+            AgentEvent::RunCompleted {
+                answer: "计划：三步实施".to_string(),
+            },
+            &ui_tx,
+        );
+        assert!(app.awaiting_plan(), "plan answer enters approval state");
+        assert!(app.status_right().contains("计划·待执行"));
+        app.input.clear();
+        app.handle_key(KeyEvent::new(K::Enter, M::NONE), &ui_tx)
+            .await;
+        assert!(!app.plan_mode(), "approval exits plan mode");
+        assert!(!app.awaiting_plan());
+        assert!(app.agent_running, "approval spawns the execute run");
+        assert!(
+            app.lines
+                .iter()
+                .any(|l| matches!(l, ChatLine::System(s) if s.contains("执行计划"))),
+            "execute prompt visible in history"
+        );
+        app.agent_running = false; // 后台 run 与后续断言解耦
 
         // /todos 与 /quit 命令分发（Enter 路径）
         let ui_tx = tokio::sync::mpsc::unbounded_channel().0;
