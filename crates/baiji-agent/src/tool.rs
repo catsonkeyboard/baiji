@@ -88,6 +88,13 @@ pub trait AgentTool: Send + Sync {
 
     async fn execute(&self, args: Value) -> Result<ToolOutput>;
 
+    /// 是否可与其他并行工具同轮并发执行（如 task 子代理——各自独立上下文，
+    /// 并发无共享状态）。默认 false：串行执行（HITL 顺序/副作用确定性）。
+    /// runtime 只在一轮的**全部**工具调用都声明 parallel 时才并发执行
+    fn parallel(&self) -> bool {
+        false
+    }
+
     /// 转为 LLM 工具定义
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {

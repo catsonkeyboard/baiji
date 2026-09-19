@@ -22,7 +22,10 @@ pub use event::AgentEvent;
 pub use hooks::{Hook, HookDecision, HookRegistry};
 pub use queue::SteeringQueue;
 pub use runtime::{AgentRuntime, PLAN_MODE_ALLOWED_TOOLS};
-pub use subagent::{SubagentTool, SUBAGENT_ALLOWED_TOOLS};
+pub use subagent::{
+    AgentRole, SubagentRegistry, SubagentTool, SUBAGENT_ALLOWED_TOOLS, load_agent_roles,
+    parse_agent_role,
+};
 pub use tool::{AgentTool, ToolOutput, ToolRegistry, estimate_text_tokens};
 
 pub use baiji_ai::{

@@ -56,6 +56,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(rows) = app.picker_rows() {
         draw_picker(frame, app, rows);
     }
+    if let Some(rows) = app.subagents_rows() {
+        draw_subagents(frame, app, rows);
+    }
     if app.wizard_title().is_some() {
         draw_wizard(frame, app);
     }
@@ -592,6 +595,53 @@ fn truncate_to_width(s: &str, budget: usize) -> String {
         used += w;
     }
     out
+}
+
+/// 子代理角色面板：居中 overlay（手风琴式列表 + 目录脚注）
+fn draw_subagents(frame: &mut Frame, app: &App, rows: Vec<String>) {
+    let theme = app.theme();
+    let area = centered_rect(frame.area(), 75, 60);
+
+    let items: Vec<ListItem> = rows
+        .into_iter()
+        .map(|row| ListItem::new(Line::from(row)))
+        .collect();
+    let list = List::new(items)
+        .block(
+            Block::new()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(" Subagents (↑↓ 选择 · r 热重载 · Esc 关闭) ")
+                .border_style(Style::default().fg(theme.accent)),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    frame.render_widget(Clear, area);
+    let mut state = ListState::default();
+    if let Some(selected) = app.subagents_selected() {
+        state.select(Some(selected));
+    }
+    frame.render_stateful_widget(list, area, &mut state);
+
+    // 目录脚注贴在列表框下方
+    if let Some(hint) = app.subagents_dirs_hint() {
+        let footer = Rect {
+            y: area.bottom(),
+            height: 1.min(frame.area().bottom().saturating_sub(area.bottom())),
+            x: area.x,
+            width: area.width,
+        };
+        if footer.height > 0 {
+            frame.render_widget(
+                Paragraph::new(Line::styled(hint, Style::default().fg(theme.system))),
+                footer,
+            );
+        }
+    }
 }
 
 /// 会话选择器：居中 overlay

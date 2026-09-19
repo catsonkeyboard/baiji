@@ -352,69 +352,102 @@ impl AgentRuntime {
                     // assistant 消息（含工具调用）+ 工具结果
                     let mut tool_results = Vec::new();
 
-                    let mut skip_rest = false;
-                    for tool_call in &tool_calls {
-                        // 每个 tool_call 都必须有对应的 tool_result，
-                        // 否则严格的 API（如 Anthropic）会拒绝下一次请求
-                        if skip_rest || cancel.is_cancelled() {
-                            let reason = if cancel.is_cancelled() {
-                                CANCELLED_BY_USER
-                            } else {
-                                SKIPPED_BY_STEERING
-                            };
-                            tool_results.push(ToolResult {
-                                tool_call_id: tool_call.id.clone(),
-                                content: reason.to_string(),
-                            });
-                            continue;
-                        }
-
-                        // 参数 JSON 无效（多为触及 max_tokens 被截断）：绝不以 `{}` 执行，
-                        // 把原因告诉模型让它重试
-                        if response.invalid_args.contains(&tool_call.id) {
-                            let content = invalid_args_message(
-                                &tool_call.name,
-                                response.stop.as_ref(),
-                                self.max_tokens,
-                            );
-                            warn!("tool '{}' not executed: {}", tool_call.name, content);
-                            events
-                                .send(AgentEvent::ToolStarted {
-                                    id: tool_call.id.clone(),
-                                    name: tool_call.name.clone(),
-                                    args: tool_call.arguments.clone(),
-                                })
-                                .ok();
-                            events
-                                .send(AgentEvent::ToolFinished {
-                                    id: tool_call.id.clone(),
-                                    name: tool_call.name.clone(),
-                                    output: content.clone(),
-                                    is_error: true,
-                                    duration_ms: 0,
-                                    original_bytes: None,
-                                    original_tokens: None,
-                                })
-                                .ok();
-                            tool_results.push(ToolResult {
-                                tool_call_id: tool_call.id.clone(),
-                                content,
-                            });
-                            continue;
-                        }
-
-                        let output = self
-                            .execute_tool_with_hooks(tool_call, events, cancel)
-                            .await?;
-                        tool_results.push(ToolResult {
-                            tool_call_id: tool_call.id.clone(),
-                            content: output.content.clone(),
+                    // 并行批次：本轮全部调用都是 parallel 工具（如多个 task
+                    // 子代理，各自独立上下文）时并发执行，结果按原顺序配对。
+                    // steering/取消只在批次级生效——已并发的兄弟调用无法
+                    // 中途跳过（并行语义的固有代价）
+                    let all_parallel = tool_calls.len() > 1
+                        && tool_calls.iter().all(|c| {
+                            !response.invalid_args.contains(&c.id)
+                                && self.tools.get(&c.name).is_some_and(|t| t.parallel())
                         });
-
-                        // 每个工具执行后检查 steering：发现则跳过剩余工具
+                    if all_parallel {
+                        info!(
+                            "running {} parallel tool calls concurrently",
+                            tool_calls.len()
+                        );
+                        let outputs = futures::future::join_all(
+                            tool_calls
+                                .iter()
+                                .map(|tc| self.execute_tool_with_hooks(tc, events, cancel)),
+                        )
+                        .await;
+                        for (tool_call, output) in tool_calls.iter().zip(outputs) {
+                            // 与串行路径同语义：工具级 Err 中止 run（is_error 走结果）
+                            let output = output?;
+                            tool_results.push(ToolResult {
+                                tool_call_id: tool_call.id.clone(),
+                                content: output.content.clone(),
+                            });
+                        }
                         if !steering.is_empty() {
-                            info!("Steering detected, skipping remaining tools");
-                            skip_rest = true;
+                            info!("Steering detected after parallel batch");
+                        }
+                    } else {
+                        let mut skip_rest = false;
+                        for tool_call in &tool_calls {
+                            // 每个 tool_call 都必须有对应的 tool_result，
+                            // 否则严格的 API（如 Anthropic）会拒绝下一次请求
+                            if skip_rest || cancel.is_cancelled() {
+                                let reason = if cancel.is_cancelled() {
+                                    CANCELLED_BY_USER
+                                } else {
+                                    SKIPPED_BY_STEERING
+                                };
+                                tool_results.push(ToolResult {
+                                    tool_call_id: tool_call.id.clone(),
+                                    content: reason.to_string(),
+                                });
+                                continue;
+                            }
+
+                            // 参数 JSON 无效（多为触及 max_tokens 被截断）：绝不以 `{}` 执行，
+                            // 把原因告诉模型让它重试
+                            if response.invalid_args.contains(&tool_call.id) {
+                                let content = invalid_args_message(
+                                    &tool_call.name,
+                                    response.stop.as_ref(),
+                                    self.max_tokens,
+                                );
+                                warn!("tool '{}' not executed: {}", tool_call.name, content);
+                                events
+                                    .send(AgentEvent::ToolStarted {
+                                        id: tool_call.id.clone(),
+                                        name: tool_call.name.clone(),
+                                        args: tool_call.arguments.clone(),
+                                    })
+                                    .ok();
+                                events
+                                    .send(AgentEvent::ToolFinished {
+                                        id: tool_call.id.clone(),
+                                        name: tool_call.name.clone(),
+                                        output: content.clone(),
+                                        is_error: true,
+                                        duration_ms: 0,
+                                        original_bytes: None,
+                                        original_tokens: None,
+                                    })
+                                    .ok();
+                                tool_results.push(ToolResult {
+                                    tool_call_id: tool_call.id.clone(),
+                                    content,
+                                });
+                                continue;
+                            }
+
+                            let output = self
+                                .execute_tool_with_hooks(tool_call, events, cancel)
+                                .await?;
+                            tool_results.push(ToolResult {
+                                tool_call_id: tool_call.id.clone(),
+                                content: output.content.clone(),
+                            });
+
+                            // 每个工具执行后检查 steering：发现则跳过剩余工具
+                            if !steering.is_empty() {
+                                info!("Steering detected, skipping remaining tools");
+                                skip_rest = true;
+                            }
                         }
                     }
 
@@ -1532,6 +1565,225 @@ mod tests {
         );
         let result = &messages[2].tool_results.as_ref().unwrap()[0];
         assert!(result.content.contains("[Plan mode]"));
+    }
+
+    // ===== 并行工具编排 =====
+
+    /// 第一轮发两个指定名字的工具调用，第二轮给最终答案
+    struct TwoCallsProvider {
+        names: [&'static str; 2],
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for TwoCallsProvider {
+        async fn chat(&self, _: ChatRequest) -> anyhow::Result<ChatResponse> {
+            unreachable!("runtime uses chat_stream")
+        }
+        async fn chat_stream(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<futures::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let chunks: Vec<anyhow::Result<StreamChunk>> = if n == 1 {
+                let mut v = Vec::new();
+                for (i, name) in self.names.iter().enumerate() {
+                    v.push(Ok(StreamChunk::ToolCallStart {
+                        id: format!("t{i}"),
+                        name: name.to_string(),
+                    }));
+                    v.push(Ok(StreamChunk::ToolCallArguments {
+                        id: format!("t{i}"),
+                        arguments: "{}".to_string(),
+                    }));
+                }
+                v.push(Ok(StreamChunk::Done));
+                v
+            } else {
+                vec![
+                    Ok(StreamChunk::Content("done".into())),
+                    Ok(StreamChunk::Done),
+                ]
+            };
+            Ok(futures::stream::iter(chunks).boxed())
+        }
+        fn protocol(&self) -> Protocol {
+            Protocol::OpenAIChat
+        }
+        fn model(&self) -> &str {
+            "mock"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    /// 探针工具：并发时两个探针在 barrier 相遇；串行时各自超时（overlap 恒 false）
+    struct BarrierProbe {
+        name: &'static str,
+        barrier: Arc<tokio::sync::Barrier>,
+        overlap: Arc<std::sync::atomic::AtomicBool>,
+        parallel: bool,
+        /// 单独等待 barrier 的超时（并行相遇在毫秒级；串行路径靠超时放行）
+        wait_ms: u64,
+    }
+
+    #[async_trait]
+    impl AgentTool for BarrierProbe {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "probe"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn parallel(&self) -> bool {
+            self.parallel
+        }
+        async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolOutput> {
+            let met = tokio::time::timeout(
+                std::time::Duration::from_millis(self.wait_ms),
+                self.barrier.wait(),
+            )
+            .await
+            .is_ok();
+            if met {
+                self.overlap.store(true, Ordering::Relaxed);
+            }
+            Ok(ToolOutput::ok(format!("{} met={met}", self.name)))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parallel_tools_run_concurrently() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let overlap = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(BarrierProbe {
+            name: "probe_a",
+            barrier: barrier.clone(),
+            overlap: overlap.clone(),
+            parallel: true,
+            wait_ms: 2000,
+        }));
+        tools.register(Arc::new(BarrierProbe {
+            name: "probe_b",
+            barrier,
+            overlap: overlap.clone(),
+            parallel: true,
+            wait_ms: 2000,
+        }));
+        let runtime = AgentRuntime::new(Arc::new(TwoCallsProvider {
+            names: ["probe_a", "probe_b"],
+            calls: AtomicUsize::new(0),
+        }))
+        .with_tools(tools);
+
+        let mut history = vec![Message::user("go")];
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let answer = runtime
+            .run(
+                "sys",
+                &mut history,
+                &tx,
+                &CancellationToken::new(),
+                &SteeringQueue::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer, "done");
+
+        assert!(
+            overlap.load(Ordering::Relaxed),
+            "two parallel-capable tools in one turn must run concurrently"
+        );
+        // 结果按原 id 顺序配对（tool_use/tool_result 稳定）
+        let results_msg = history.iter().find(|m| m.tool_results.is_some()).unwrap();
+        let results = results_msg.tool_results.as_ref().unwrap();
+        assert_eq!(results[0].tool_call_id, "t0");
+        assert_eq!(results[1].tool_call_id, "t1");
+        assert!(results[0].content.contains("probe_a"));
+        assert!(results[1].content.contains("probe_b"));
+    }
+
+    #[tokio::test]
+    async fn test_mixed_tools_fall_back_to_sequential() {
+        // 一轮里有非 parallel 工具 → 整轮回退串行（in-flight 计数恒 ≤ 1；结果仍配对）
+        use std::sync::atomic::{AtomicUsize as AU, Ordering as O};
+
+        struct Tracker {
+            name: &'static str,
+            parallel: bool,
+            active: Arc<AU>,
+            max_active: Arc<AU>,
+        }
+
+        #[async_trait]
+        impl AgentTool for Tracker {
+            fn name(&self) -> &str {
+                self.name
+            }
+            fn description(&self) -> &str {
+                "tracker"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            fn parallel(&self) -> bool {
+                self.parallel
+            }
+            async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolOutput> {
+                let n = self.active.fetch_add(1, O::SeqCst) + 1;
+                self.max_active.fetch_max(n, O::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                self.active.fetch_sub(1, O::SeqCst);
+                Ok(ToolOutput::ok(self.name))
+            }
+        }
+
+        let active = Arc::new(AU::new(0));
+        let max_active = Arc::new(AU::new(0));
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(Tracker {
+            name: "para",
+            parallel: true,
+            active: active.clone(),
+            max_active: max_active.clone(),
+        }));
+        tools.register(Arc::new(Tracker {
+            name: "seq",
+            parallel: false,
+            active,
+            max_active: max_active.clone(),
+        }));
+        let runtime = AgentRuntime::new(Arc::new(TwoCallsProvider {
+            names: ["para", "seq"],
+            calls: AtomicUsize::new(0),
+        }))
+        .with_tools(tools);
+
+        let mut history = vec![Message::user("go")];
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        runtime
+            .run(
+                "sys",
+                &mut history,
+                &tx,
+                &CancellationToken::new(),
+                &SteeringQueue::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            max_active.load(O::SeqCst),
+            1,
+            "mixed turn must fall back to sequential execution"
+        );
+        let results_msg = history.iter().find(|m| m.tool_results.is_some()).unwrap();
+        assert_eq!(results_msg.tool_results.as_ref().unwrap().len(), 2);
     }
 
     async fn drive(runtime: &AgentRuntime, messages: &mut Vec<Message>) -> Vec<AgentEvent> {

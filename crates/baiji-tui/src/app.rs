@@ -181,7 +181,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("status", "查看当前 vendor / endpoint / model / session"),
     (
         "subagents",
-        "管理子代理：模型 / 思考级别 / 提示词（规划中）",
+        "管理子代理角色：查看/热重载（agents/*.md 定义的角色）",
     ),
     ("tasks", "查看后台任务列表"),
     (
@@ -373,6 +373,23 @@ impl SessionPicker {
     }
 }
 
+/// 子代理角色面板状态（数据每帧从 harness 快照，热重载后即时刷新）
+pub struct SubagentsPanel {
+    pub selected: usize,
+}
+
+impl SubagentsPanel {
+    fn move_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    fn move_down(&mut self, len: usize) {
+        if self.selected + 1 < len {
+            self.selected += 1;
+        }
+    }
+}
+
 /// 待用户裁决的确认
 pub struct PendingConfirm {
     pub tool_name: String,
@@ -442,6 +459,8 @@ pub struct App {
     models_tx: Option<UnboundedSender<Result<Vec<baiji_ai::ModelInfo>, String>>>,
     /// 会话选择器打开时为 Some
     picker: Option<SessionPicker>,
+    /// 子代理角色面板打开时为 Some
+    subagents_panel: Option<SubagentsPanel>,
     /// 待裁决的 HITL 确认
     pending: Option<PendingConfirm>,
     /// 确认请求到达通道（来自 InteractiveApprover）
@@ -520,6 +539,7 @@ impl App {
             bytes_saved: 0,
             tokens_saved: 0,
             picker: None,
+            subagents_panel: None,
             pending: None,
             confirm_rx,
             project,
@@ -665,6 +685,11 @@ impl App {
         // 会话选择器模式
         if self.picker.is_some() {
             return self.handle_picker_key(key).await;
+        }
+
+        // 子代理角色面板模式
+        if self.subagents_panel.is_some() {
+            return self.handle_subagents_key(key).await;
         }
 
         // 配置向导模式：列表步骤全权拦截；输入步骤只拦 Enter/Esc，
@@ -1413,10 +1438,16 @@ impl App {
                     }
                 }
             }
-            "subagents" => self.lines.push(ChatLine::System(
-                "子代理管理界面尚未实现（规划中：查看/修改子代理的模型、思考级别与提示词）"
-                    .to_string(),
-            )),
+            // 子代理角色管理面板：查看角色（agent 文件定义）+ r 热重载
+            "subagents" => {
+                if self.agent_running {
+                    self.lines.push(ChatLine::System(
+                        "运行中无法打开子代理面板，先按 Esc 取消".to_string(),
+                    ));
+                } else {
+                    self.subagents_panel = Some(SubagentsPanel { selected: 0 });
+                }
+            }
             "btw" => self.lines.push(ChatLine::System(
                 "旁路提问尚未实现（规划中：不写入当前会话历史的一次性问答）".to_string(),
             )),
@@ -1481,6 +1512,52 @@ impl App {
             return;
         }
         self.picker = Some(SessionPicker::from_metas(sessions, &self.session_id));
+    }
+
+    /// 子代理面板按键：↑↓ 选择 · r 热重载 · Esc/Enter/q 关闭
+    async fn handle_subagents_key(&mut self, key: KeyEvent) -> bool {
+        let roles_len = self.subagent_roles_len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                self.subagents_panel = None;
+            }
+            KeyCode::Char('q') => {
+                self.subagents_panel = None;
+            }
+            KeyCode::Char('r') => {
+                // 热重载：编辑 agents/*.md 后免重启生效（task 分发与系统提示段共用注册表）
+                match self.harness.try_lock() {
+                    Ok(harness) => {
+                        let count = harness.subagents_reload();
+                        self.lines.push(ChatLine::System(format!(
+                            "已重载子代理角色：{count} 个（下一次 task 调用生效）"
+                        )));
+                    }
+                    Err(_) => self.lines.push(ChatLine::System(
+                        "harness 忙，稍后再试（运行中不可重载）".to_string(),
+                    )),
+                }
+            }
+            KeyCode::Up => {
+                if let Some(panel) = &mut self.subagents_panel {
+                    panel.move_up();
+                }
+            }
+            KeyCode::Down => {
+                if let Some(panel) = &mut self.subagents_panel {
+                    panel.move_down(roles_len);
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn subagent_roles_len(&self) -> usize {
+        self.harness
+            .try_lock()
+            .map(|h| h.subagent_roles().len())
+            .unwrap_or(0)
     }
 
     async fn handle_picker_key(&mut self, key: KeyEvent) -> bool {
@@ -1949,6 +2026,73 @@ impl App {
         self.pending.as_ref()
     }
 
+    /// 子代理面板展示行（手风琴式：选中角色附描述与提示词预览）
+    pub(crate) fn subagents_rows(&self) -> Option<Vec<String>> {
+        let panel = self.subagents_panel.as_ref()?;
+        let roles = self
+            .harness
+            .try_lock()
+            .map(|h| h.subagent_roles())
+            .unwrap_or_default();
+        let mut rows: Vec<String> = Vec::new();
+        for (i, role) in roles.iter().enumerate() {
+            let mark = if i == panel.selected { "▸ " } else { "  " };
+            rows.push(format!(
+                "{mark}{:<16} model:{:<10} think:{:<7} turns:{:<4} tools:{}",
+                role.name,
+                role.model.as_deref().unwrap_or("继承"),
+                role.thinking.map(|t| t.effort()).unwrap_or("-"),
+                role.max_turns
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "默认".into()),
+                role.tools
+                    .as_ref()
+                    .map(|t| t.len().to_string())
+                    .unwrap_or_else(|| "全部".into()),
+            ));
+            if i == panel.selected {
+                if !role.description.is_empty() {
+                    rows.push(format!("    {}", role.description));
+                }
+                if !role.system_prompt.is_empty() {
+                    let preview: String = role.system_prompt.chars().take(160).collect();
+                    rows.push(format!("    提示词: {}…", preview.trim_end()));
+                }
+            }
+        }
+        if roles.is_empty() {
+            rows.push("（尚无角色）在下列目录创建 <name>.md：frontmatter 声明".into());
+            rows.push(
+                "name/description/tools/model/thinking/max_turns，正文为该角色的系统提示".into(),
+            );
+        }
+        Some(rows)
+    }
+
+    /// 子代理角色目录提示行（面板脚注）
+    pub(crate) fn subagents_dirs_hint(&self) -> Option<String> {
+        self.subagents_panel.as_ref()?;
+        let dirs = self
+            .harness
+            .try_lock()
+            .map(|h| h.subagent_dirs())
+            .unwrap_or_default();
+        let joined = if dirs.is_empty() {
+            "（未启用）".to_string()
+        } else {
+            dirs.iter()
+                .map(|d| d.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" · ")
+        };
+        Some(format!("角色目录: {joined}（编辑后按 r 热重载）"))
+    }
+
+    /// 子代理面板选中项（渲染高亮用）
+    pub(crate) fn subagents_selected(&self) -> Option<usize> {
+        self.subagents_panel.as_ref().map(|p| p.selected)
+    }
+
     /// 粘贴并入输入框（换行折叠为空格，保持单行输入语义）
     pub(crate) fn handle_paste(&mut self, text: String) {
         self.input.push_str(&sanitize_paste(&text));
@@ -2336,6 +2480,41 @@ mod tests {
             "execute prompt visible in history"
         );
         app.agent_running = false; // 后台 run 与后续断言解耦
+
+        // /subagents 面板：打开 → 渲染（角色行 + 目录脚注）→ r 重载 → Esc 关闭
+        let agents_dir = dir.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("reviewer.md"),
+            "---\nname: reviewer\ndescription: finds issues\n---\nYou review code.",
+        )
+        .unwrap();
+        let registry = Arc::new(baiji_agent::SubagentRegistry::new(vec![agents_dir]));
+        registry.load();
+        app.harness.lock().await.set_subagents(registry);
+        app.handle_slash("subagents", "", &ui_tx).await;
+        assert!(app.subagents_rows().is_some(), "panel opens");
+        terminal.clear().unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let rows = screen(&terminal);
+        assert!(rows.iter().any(|r| r.contains("Subagents")));
+        assert!(rows.iter().any(|r| r.contains("reviewer")));
+        assert!(
+            rows.iter().any(|r| r.replace(' ', "").contains("角色目录")),
+            "dirs footer shown"
+        );
+        // r 热重载（面板键路由）
+        app.handle_key(KeyEvent::new(K::Char('r'), M::NONE), &ui_tx)
+            .await;
+        assert!(
+            app.lines
+                .iter()
+                .any(|l| matches!(l, ChatLine::System(s) if s.contains("已重载子代理角色：1"))),
+            "reload reports the count"
+        );
+        // Esc 关闭
+        app.handle_key(KeyEvent::new(K::Esc, M::NONE), &ui_tx).await;
+        assert!(app.subagents_rows().is_none(), "panel closes");
 
         // /todos 与 /quit 命令分发（Enter 路径）
         let ui_tx = tokio::sync::mpsc::unbounded_channel().0;
