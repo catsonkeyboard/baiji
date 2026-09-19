@@ -173,9 +173,19 @@ pub const SLASH_COMMANDS: &[(&str, &str, &str)] = &[
         "打开配置向导：选厂商 → 端点 → API Key → 模型（热生效）",
     ),
     (
+        "experts",
+        "Experts mode: orchestrate expert subagents (architect/developer/reviewer)",
+        "Experts 模式：主代理编排专家子代理（架构/实现/评审）",
+    ),
+    (
         "fork",
         "Fork the session: /fork inherits all history; /fork <n> rewinds n turns",
         "分叉会话：/fork 继承全部历史；/fork <n> 回到 n 轮之前重来（原会话保留）",
+    ),
+    (
+        "goal",
+        "Goal mode: /goal <objective> drives autonomously until the todos complete",
+        "Goal 模式：/goal <目标> 自主推进直到 todo 完成",
     ),
     ("help", "Show command help", "显示命令帮助"),
     (
@@ -208,6 +218,11 @@ pub const SLASH_COMMANDS: &[(&str, &str, &str)] = &[
         "session",
         "Show current session info and stats",
         "显示当前会话信息与统计",
+    ),
+    (
+        "spec",
+        "Spec-driven: /spec <feature> drafts a spec; /spec approve seeds tasks and implements",
+        "Spec 驱动：/spec <特性> 起草规格；/spec approve 生成任务并开始实施",
     ),
     (
         "status",
@@ -1215,6 +1230,18 @@ impl App {
             }
             "status" => {
                 let s = &self.settings;
+                let workflow = {
+                    let w = self
+                        .harness
+                        .try_lock()
+                        .map(|h| h.workflow_summary())
+                        .unwrap_or_default();
+                    if w.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\nworkflow: {w}")
+                    }
+                };
                 let external = if s.external_agents.is_empty() {
                     String::new()
                 } else {
@@ -1228,7 +1255,7 @@ impl App {
                     )
                 };
                 self.lines.push(ChatLine::System(format!(
-                    "vendor: {} · endpoint: {} · model: {} · thinking: {} · session: {}\nplan mode: {} · {}{external}",
+                    "vendor: {} · endpoint: {} · model: {} · thinking: {} · session: {}\nplan mode: {} · {}{workflow}{external}",
                     s.vendor,
                     s.endpoint.as_deref().unwrap_or("api"),
                     s.model.as_deref().unwrap_or("auto"),
@@ -1570,6 +1597,156 @@ impl App {
                 } else {
                     self.subagents_panel = Some(SubagentsPanel { selected: 0 });
                 }
+            }
+            // spec 驱动：<描述> 起草 → approve（任务种子进 todo 并开跑）→ done
+            "spec" => {
+                let arg = args.trim();
+                match arg.to_ascii_lowercase().as_str() {
+                    "" => self.lines.push(ChatLine::System(
+                        "usage: /spec <feature> | /spec approve | /spec show | /spec list | /spec done | /spec off"
+                            .to_string(),
+                    )),
+                    "approve" => {
+                        let mut harness = self.harness.lock().await;
+                        match harness.spec_approve() {
+                            Ok(true) => {
+                                let slug = harness
+                                    .spec_active()
+                                    .map(|s| s.slug.clone())
+                                    .unwrap_or_default();
+                                drop(harness);
+                                self.lines.push(ChatLine::System(format!(
+                                    "spec '{slug}' approved — tasks seeded into the todo list, implementing (the run chain auto-continues)"
+                                )));
+                                self.auto_turns = 0;
+                                self.spawn_run(
+                                    "Implement the active spec following its task list.".to_string(),
+                                    ui_tx.clone(),
+                                );
+                            }
+                            Ok(false) => self.lines.push(ChatLine::System(
+                                "the spec has no '- [ ] task' lines yet — draft them first (/spec show)"
+                                    .to_string(),
+                            )),
+                            Err(e) => self
+                                .lines
+                                .push(ChatLine::System(format!("✗ spec approve failed: {e}"))),
+                        }
+                    }
+                    "show" => {
+                        let harness = self.harness.lock().await;
+                        match harness
+                            .spec_active()
+                            .map(|s| std::fs::read_to_string(&s.path).ok())
+                            .flatten()
+                        {
+                            Some(content) => {
+                                let head: String =
+                                    content.lines().take(60).collect::<Vec<_>>().join("\n");
+                                self.lines.push(ChatLine::System(format!("spec:\n{head}")));
+                            }
+                            None => self.lines.push(ChatLine::System(
+                                "no active spec (/spec <feature> to start)".to_string(),
+                            )),
+                        }
+                    }
+                    "list" => {
+                        let list = self.harness.lock().await.spec_list();
+                        self.lines.push(ChatLine::System(if list.is_empty() {
+                            "(no spec files yet)".to_string()
+                        } else {
+                            list.join(" · ")
+                        }));
+                    }
+                    "done" | "off" => {
+                        self.harness.lock().await.spec_end();
+                        self.lines
+                            .push(ChatLine::System("spec cleared (file kept on disk)".to_string()));
+                    }
+                    description => {
+                        // slug：前三个词 kebab-case
+                        let slug: String = description
+                            .split_whitespace()
+                            .take(3)
+                            .collect::<Vec<_>>()
+                            .join("-")
+                            .chars()
+                            .map(|c| {
+                                if c.is_ascii_alphanumeric() || c == '-' {
+                                    c.to_ascii_lowercase()
+                                } else {
+                                    '-'
+                                }
+                            })
+                            .collect();
+                        let slug = slug.trim_matches('-').to_string();
+                        let result = self.harness.lock().await.spec_start(&slug, description);
+                        match result {
+                            Ok(_) => {
+                                self.lines
+                                    .push(ChatLine::user(format!("/spec {description}")));
+                                self.lines.push(ChatLine::System(format!(
+                                    "spec '{slug}' drafting — the agent writes .baiji/specs/{slug}.md; review it, then /spec approve"
+                                )));
+                                self.auto_turns = 0;
+                                self.spawn_run(
+                                    format!("Draft the specification for: {description}"),
+                                    ui_tx.clone(),
+                                );
+                            }
+                            Err(e) => self
+                                .lines
+                                .push(ChatLine::System(format!("✗ spec start failed: {e}"))),
+                        }
+                    }
+                }
+            }
+            // goal 驱动：<目标> 自主推进（todo + 自动接力直到完成）
+            "goal" => {
+                let arg = args.trim();
+                if arg.is_empty() {
+                    let active = self
+                        .harness
+                        .try_lock()
+                        .ok()
+                        .and_then(|h| h.goal_objective().map(str::to_string));
+                    match active {
+                        Some(goal) => self
+                            .lines
+                            .push(ChatLine::System(format!("active goal: {goal}"))),
+                        None => self.lines.push(ChatLine::System(
+                            "usage: /goal <objective> | /goal off".to_string(),
+                        )),
+                    }
+                } else if arg.eq_ignore_ascii_case("off") || arg.eq_ignore_ascii_case("done") {
+                    self.harness.lock().await.goal_end();
+                    self.lines
+                        .push(ChatLine::System("goal cleared".to_string()));
+                } else {
+                    self.harness.lock().await.goal_set(arg);
+                    self.lines.push(ChatLine::user(format!("/goal {arg}")));
+                    self.auto_turns = 0;
+                    self.spawn_run(format!("Pursue this goal: {arg}"), ui_tx.clone());
+                }
+            }
+            // experts 编排：主代理作为 orchestrator 委派专家子代理
+            "experts" => {
+                let on = match args.trim().to_ascii_lowercase().as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => !self
+                        .harness
+                        .try_lock()
+                        .map(|h| h.experts_active())
+                        .unwrap_or(false),
+                };
+                self.harness.lock().await.experts_set(on);
+                self.lines.push(ChatLine::System(if on {
+                    "Experts mode ON — work is orchestrated via expert subagents (see ## Experts mode in the system prompt)"
+                } else {
+                    "Experts mode OFF"
+                }
+                .to_string()));
             }
             "btw" => self
                 .lines
@@ -1963,8 +2140,18 @@ impl App {
     /// 自动接力（T4）：run 正常结束且 todo 仍有未完成项、轮次未超上限时，
     /// 以固定输入继续（用户可见、进入历史；Esc 可随时终止链）
     fn maybe_auto_continue(&mut self, ui_tx: UnboundedSender<UiEvent>) {
-        // 计划模式下不接力：规划结果等待用户批准，而不是自动开跑
-        if !self.auto.enabled || self.plan_mode || self.agent_running || self.run_interrupted {
+        // 计划模式下不接力：规划结果等待用户批准，而不是自动开跑。
+        // goal / spec 实施模式 = 本次链内显式授权自主推进（仍受轮次上限约束）
+        let goal_driven = self
+            .harness
+            .try_lock()
+            .map(|h| h.goal_active())
+            .unwrap_or(false);
+        if (!self.auto.enabled && !goal_driven)
+            || self.plan_mode
+            || self.agent_running
+            || self.run_interrupted
+        {
             return;
         }
         let has_open = self
@@ -2844,6 +3031,51 @@ mod tests {
             "the prompt is echoed into the chat"
         );
         app.agent_running = false; // RunCompleted 由事件循环处理，这里手动复位
+
+        // 工作流模式命令：spec / goal / experts
+        let (tx3, mut rx3) = tokio::sync::mpsc::unbounded_channel();
+        // 等待此前后台 run（计划批准/Echo）释放 harness 锁，保证断言确定性
+        async fn wait_lock(app: &App) {
+            for _ in 0..200 {
+                if app.harness.try_lock().is_ok() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+        wait_lock(&app).await;
+        app.handle_slash("experts", "", &tx3).await;
+        assert!(
+            app.harness.try_lock().unwrap().experts_active(),
+            "experts toggled on"
+        );
+        app.handle_slash("goal", "ship the release", &tx3).await;
+        wait_lock(&app).await;
+        assert_eq!(
+            app.harness.try_lock().unwrap().goal_objective(),
+            Some("ship the release".to_string()).as_deref()
+        );
+        assert!(app.agent_running, "goal starts a run");
+        app.agent_running = false;
+        // spec：无任务清单时 approve 提示补稿；show/list 不 panic
+        app.handle_slash("spec", "add dark mode toggle", &tx3).await;
+        wait_lock(&app).await;
+        assert!(app.harness.try_lock().unwrap().spec_active().is_some());
+        app.agent_running = false;
+        app.handle_slash("spec", "approve", &tx3).await;
+        assert!(
+            app.lines
+                .iter()
+                .any(|l| matches!(l, ChatLine::System(s) if s.contains("no '- [ ] task' lines"))),
+            "approve without tasks asks for a draft"
+        );
+        app.handle_slash("spec", "list", &tx3).await;
+        app.handle_slash("spec", "off", &tx3).await;
+        assert!(app.harness.try_lock().unwrap().spec_active().is_none());
+        app.handle_slash("goal", "off", &tx3).await;
+        app.handle_slash("experts", "off", &tx3).await;
+        assert!(!app.harness.try_lock().unwrap().experts_active());
+        let _ = rx3.try_recv(); // 排空（后台 run 事件，不参与断言）
 
         // /todos 与 /quit 命令分发（Enter 路径）
         let ui_tx = tokio::sync::mpsc::unbounded_channel().0;

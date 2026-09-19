@@ -7,7 +7,7 @@ A terminal AI coding agent built on a multi-crate Rust workspace: async streamin
 ```bash
 cargo build                # Build the whole workspace
 cargo run                  # Run the TUI app (default)
-cargo test --workspace     # Run all tests (366 total)
+cargo test --workspace     # Run all tests (367 total)
 baiji -e "msg" --yes      # Headless one-shot run (streams to stdout)
 baiji -e "msg" --plan     # Read-only planning run (plan mode)
 baiji --sessions          # List sessions (no API key needed)
@@ -159,6 +159,7 @@ run()
 - Project memory (cross-session, `memory.rs`): per-project JSONL at `~/.baiji/memory/<name-hash>.jsonl` (project key = dir name + path hash). Entries carry a kind (fact/decision/preference/gotcha), `learned_at`, optional `valid_until` TTL — expired entries are lazily evicted and never injected. Active entries (≤20, 200 chars each) render into the system prompt as `## Project memory`. The `memory` tool (add/list/forget) lets the LLM write entries; same-fact re-add refreshes instead of duplicating.
 - Session todo list (`todo.rs`, long-horizon state externalization): the `todo` tool (add/update/list/clear) maintains `TodoItem { id, content, status, note }` in a `TodoStore` shared between the harness and the tool (Arc). The current list renders into the system prompt as `## Task list` — the system prompt never participates in compaction, so the plan survives context reduction and session resume. Persistence: a `Record::Todo { items }` snapshot is appended to the session JSONL at the end of any run that mutated the list (replay = last record wins; `branch` inherits, `switch_session` restores). `has_open_todos()` feeds the future auto-continue (T4).
 - Plan mode proxy: `AgentHarness::set_plan_mode(&self, on)` / `plan_mode()` delegate to the runtime; when on, the system prompt gains a `## Plan mode (read-only)` section (explore read-only, end with a concrete ordered plan, ask instead of guessing, never attempt changes). `PLAN_EXECUTE_PROMPT` is the fixed "plan approved, start implementing" input used by the TUI on approval (visible in history, like `AUTO_CONTINUE_PROMPT`).
+- **Workflow modes** (`Workflow { spec, goal, experts }` on the harness, session-memory state — spec files persist on disk under `.baiji/specs/`): **spec-driven** (`/spec <feature>` drafts `<slug>.md` — Requirements/Design/Tasks with `- [ ]` lines, draft-phase prompt constrains writing to that file only; `/spec approve` seeds the Tasks into the TodoStore and injects the full spec as `## Active spec` for every run while auto-continue drives implementation; `show`/`list`/`done`/`off` manage it), **goal-driven** (`/goal <objective>` injects a `## Goal` section — decompose into todos first, work autonomously; the goal chain auto-continues even when global auto-continue is off, still bounded by `auto_continue_max_turns`; `/goal off` ends), **experts mode** (`/experts` toggles an orchestrator `## Experts mode` section — decompose, dispatch expert subagents via `task {agent: ...}` incl. parallel batches, synthesize, always review non-trivial changes). `/status` shows a workflow summary line; the modes compose (e.g. experts + goal).
 
 ### Tools (`baiji-tools`)
 

@@ -402,6 +402,9 @@ async fn main() -> Result<()> {
     // 子代理角色（与已注册的 task 工具共享注册表：分发 + 系统提示段）
     harness.set_subagents(subagent_registry);
 
+    // spec 驱动模式的规格文件目录（项目内 .baiji/specs）
+    harness.set_spec_dir(workdir.join(".baiji/specs"));
+
     // LLM 压缩摘要（可选）
     if app_config.llm_compaction.unwrap_or(false) {
         info!("LLM compaction enabled");

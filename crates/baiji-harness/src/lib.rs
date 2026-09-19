@@ -139,6 +139,11 @@ pub struct AgentHarness {
     todos: Option<Arc<TodoStore>>,
     /// 可定义子代理角色注册表（None = 未启用 agent 文件/角色分发）
     subagents: Option<Arc<baiji_agent::SubagentRegistry>>,
+    /// 工作流模式（spec 驱动 / goal 驱动 / experts 编排；会话内存态不持久化，
+    /// spec 文件本身在磁盘）
+    workflow: Workflow,
+    /// spec 文件目录（默认 .baiji/specs；main 装配注入）
+    spec_dir: Option<PathBuf>,
     /// usage 锚点：最近一次厂商上报的真实上下文占用 + 当时的消息数。
     /// 压缩触发估算 = usage + 锚点后新增消息的字符估算（参考 pi 的
     /// estimateContextTokens——不可见的系统提示/工具定义/tokenizer 差异
@@ -148,6 +153,28 @@ pub struct AgentHarness {
     /// （防陈旧锚点：消息数恰好回到锚点值但内容已不同）
     history_version: u64,
     telemetry: Arc<dyn baiji_telemetry::Telemetry>,
+}
+
+/// 工作流模式状态（spec / goal / experts；会话内存态）
+#[derive(Default)]
+struct Workflow {
+    spec: Option<ActiveSpec>,
+    goal: Option<String>,
+    experts: bool,
+}
+
+/// 活跃 spec
+pub struct ActiveSpec {
+    pub slug: String,
+    pub phase: SpecPhase,
+    pub path: PathBuf,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecPhase {
+    Draft,
+    Implement,
 }
 
 /// usage 锚点（会话内存态，不持久化——重放后首个 run 重建）
@@ -196,6 +223,8 @@ impl AgentHarness {
             ctx_store: None,
             todos: None,
             subagents: None,
+            workflow: Workflow::default(),
+            spec_dir: None,
             usage_anchor: None,
             history_version: 0,
             telemetry: Arc::new(NoopTelemetry),
@@ -224,6 +253,8 @@ impl AgentHarness {
             ctx_store: None,
             todos: None,
             subagents: None,
+            workflow: Workflow::default(),
+            spec_dir: None,
             usage_anchor: None,
             history_version: 0,
             telemetry: Arc::new(NoopTelemetry),
@@ -478,6 +509,135 @@ impl AgentHarness {
         self.runtime.plan_mode()
     }
 
+    // ---- 工作流模式（spec / goal / experts）----
+
+    /// spec 目录（默认项目 .baiji/specs）
+    pub fn set_spec_dir(&mut self, dir: impl Into<PathBuf>) {
+        self.spec_dir = Some(dir.into());
+    }
+
+    /// 开始 spec 草稿阶段：<slug>.md 由模型起草（软约束：只写这个文件）
+    pub fn spec_start(&mut self, slug: &str, description: &str) -> Result<PathBuf> {
+        let dir = self.spec_dir.clone().unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_default()
+                .join(".baiji/specs")
+        });
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{slug}.md"));
+        self.workflow.spec = Some(ActiveSpec {
+            slug: slug.to_string(),
+            phase: SpecPhase::Draft,
+            path: path.clone(),
+            description: description.to_string(),
+        });
+        Ok(path)
+    }
+
+    pub fn spec_active(&self) -> Option<&ActiveSpec> {
+        self.workflow.spec.as_ref()
+    }
+
+    /// 批准 spec：进入实施阶段；Tasks 复选框种子进 todo 清单
+    pub fn spec_approve(&mut self) -> Result<bool> {
+        let Some(spec) = self.workflow.spec.as_mut() else {
+            return Ok(false);
+        };
+        let content = std::fs::read_to_string(&spec.path).unwrap_or_default();
+        let tasks: Vec<String> = content
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("- [ ] ").map(str::to_string))
+            .filter(|t| !t.is_empty())
+            .collect();
+        if tasks.is_empty() {
+            return Ok(false); // 无任务清单：视为 spec 未起草完成
+        }
+        let items = tasks
+            .into_iter()
+            .enumerate()
+            .map(|(i, content)| TodoItem {
+                id: i + 1,
+                content,
+                status: TodoStatus::Pending,
+                note: None,
+            })
+            .collect();
+        if let Some(todos) = &self.todos {
+            todos.replace(items);
+        }
+        spec.phase = SpecPhase::Implement;
+        Ok(true)
+    }
+
+    /// 结束 spec（done/off 均清除活跃状态；文件保留）
+    pub fn spec_end(&mut self) {
+        self.workflow.spec = None;
+    }
+
+    /// 列出 spec 目录的文件名
+    pub fn spec_list(&self) -> Vec<String> {
+        let Some(dir) = &self.spec_dir else {
+            return Vec::new();
+        };
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// goal 模式：目标注入系统提示 + 自动接力持续到目标完成
+    pub fn goal_set(&mut self, objective: &str) {
+        self.workflow.goal = Some(objective.to_string());
+    }
+
+    pub fn goal_active(&self) -> bool {
+        self.workflow.goal.is_some()
+    }
+
+    pub fn goal_end(&mut self) {
+        self.workflow.goal = None;
+    }
+
+    pub fn goal_objective(&self) -> Option<&str> {
+        self.workflow.goal.as_deref()
+    }
+
+    /// experts 编排模式：主代理作为 orchestrator 委派专家子代理
+    pub fn experts_set(&mut self, on: bool) {
+        self.workflow.experts = on;
+    }
+
+    pub fn experts_active(&self) -> bool {
+        self.workflow.experts
+    }
+
+    /// 工作流概览（/status 用）
+    pub fn workflow_summary(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(spec) = &self.workflow.spec {
+            parts.push(format!(
+                "spec:{}:{}",
+                spec.slug,
+                match spec.phase {
+                    SpecPhase::Draft => "draft",
+                    SpecPhase::Implement => "implement",
+                }
+            ));
+        }
+        if self.workflow.goal.is_some() {
+            parts.push("goal".to_string());
+        }
+        if self.workflow.experts {
+            parts.push("experts".to_string());
+        }
+        parts.join(" · ")
+    }
+
     /// 启用可定义子代理角色（task 工具分发与系统提示 Subagents 段共享同一注册表）
     pub fn set_subagents(&mut self, registry: Arc<baiji_agent::SubagentRegistry>) {
         self.subagents = Some(registry);
@@ -571,6 +731,49 @@ impl AgentHarness {
         if self.runtime.plan_mode() {
             prompt.push_str("\n\n");
             prompt.push_str(PLAN_MODE_SECTION);
+        }
+        // 工作流模式段：spec 草稿 / spec 实施 / goal / experts
+        if let Some(spec) = &self.workflow.spec {
+            match spec.phase {
+                SpecPhase::Draft => {
+                    prompt.push_str(&format!(
+                        "\n\n## Spec drafting: {}\nWrite the specification for: {}. The ONLY \
+                         file you may create or modify is {}. Structure it as:\n# Spec: <title>\n## \
+                         Requirements\n- ...\n## Design\n...\n## Tasks\n- [ ] concrete, verifiable \
+                         task per line (these become the todo list on approval)\nEnd your turn by \
+                         summarizing the spec and asking the user to review it (/spec approve).",
+                        spec.slug, spec.description, spec.path.display()
+                    ));
+                }
+                SpecPhase::Implement => {
+                    let content = std::fs::read_to_string(&spec.path).unwrap_or_default();
+                    prompt.push_str(&format!(
+                        "\n\n## Active spec: {}\nImplement this specification exactly. Track \
+                         progress with the todo tool (tasks were seeded from the spec). The spec:\n{}",
+                        spec.slug, content
+                    ));
+                }
+            }
+        }
+        if let Some(goal) = &self.workflow.goal {
+            prompt.push_str(&format!(
+                "\n\n## Goal\nDrive autonomously toward this objective: {}. First break it \
+                 into a todo list (definition of done as the last item), then execute items one \
+                 by one, marking them done as you go. The run chain continues automatically \
+                 until every todo is done — do not stop to ask unless truly blocked.",
+                goal
+            ));
+        }
+        if self.workflow.experts {
+            prompt.push_str(
+                "\n\n## Experts mode (orchestrator)\nYou orchestrate expert \
+             subagents instead of doing everything yourself: decompose the work, dispatch \
+             self-contained subtasks with the task tool (use matching `agent` roles when \
+             available — e.g. architect for design, developer for implementation, reviewer \
+             for verification; issue multiple task calls in one turn to run them in \
+             parallel), then synthesize their results. Do direct work only for trivial steps; \
+             always have a reviewer pass over non-trivial changes.",
+            );
         }
         prompt
     }
@@ -1760,6 +1963,66 @@ mod tests {
         assert_eq!(harness.subagent_roles().len(), 1);
         assert_eq!(harness.subagents_reload(), 1);
         assert_eq!(harness.subagent_dirs(), vec![agents_dir]);
+    }
+
+    #[test]
+    fn test_workflow_spec_goal_experts_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(AgentRuntime::new(Arc::new(EchoProvider)));
+        let mut harness = AgentHarness::new(runtime, dir.path().join("sessions")).unwrap();
+        harness.set_spec_dir(dir.path().join("specs"));
+
+        // spec 草稿：目录创建 + 草稿段（含唯一可写文件）
+        let path = harness
+            .spec_start("login-oauth", "add OAuth login")
+            .unwrap();
+        assert!(path.ends_with("login-oauth.md"));
+        let prompt = harness.system_prompt();
+        assert!(prompt.contains("## Spec drafting: login-oauth"), "{prompt}");
+        assert!(prompt.contains(path.display().to_string().as_str()));
+
+        // approve 前无任务清单 → 拒绝
+        assert!(!harness.spec_approve().unwrap());
+
+        // 写入带复选框任务的 spec → approve：todo 种子 + 实施段注入 spec 内容
+        std::fs::write(
+            &path,
+            "# Spec: oauth\n## Tasks\n- [ ] add provider config\n- [ ] wire callback route\n",
+        )
+        .unwrap();
+        let todos = Arc::new(TodoStore::new());
+        harness.set_todos(todos.clone());
+        assert!(harness.spec_approve().unwrap());
+        let items = todos.items();
+        assert_eq!(items.len(), 2, "tasks seeded from the spec");
+        assert_eq!(items[0].content, "add provider config");
+        let prompt = harness.system_prompt();
+        assert!(prompt.contains("## Active spec: login-oauth"), "{prompt}");
+        assert!(
+            prompt.contains("wire callback route"),
+            "spec content injected"
+        );
+
+        // goal 段 + summary + experts 段
+        harness.goal_set("make all tests pass");
+        harness.experts_set(true);
+        let prompt = harness.system_prompt();
+        assert!(prompt.contains("## Goal"), "{prompt}");
+        assert!(prompt.contains("make all tests pass"));
+        assert!(
+            prompt.contains("## Experts mode (orchestrator)"),
+            "{prompt}"
+        );
+        assert_eq!(
+            harness.workflow_summary(),
+            "spec:login-oauth:implement · goal · experts"
+        );
+
+        // 结束：段落消失
+        harness.spec_end();
+        harness.goal_end();
+        harness.experts_set(false);
+        assert!(harness.workflow_summary().is_empty());
     }
 
     #[tokio::test]
