@@ -318,7 +318,12 @@ impl ChatStreamState {
 
         let chunk: ChatStreamChunk = match serde_json::from_str(data) {
             Ok(c) => c,
-            Err(e) => return vec![StreamChunk::Error(format!("Parse error: {}", e))],
+            Err(e) => {
+                // 帧解析失败 = 流不可信，立即终止（不再产出 Done 兜底）；
+                // 与 runtime 对 Error 的致命处理保持一致，见 anthropic.rs 同处注释
+                self.finished = true;
+                return vec![StreamChunk::Error(format!("Parse error: {}", e))];
+            }
         };
 
         if let Some(err) = chunk.error {
@@ -803,5 +808,14 @@ mod tests {
             "final answers never replay"
         );
         assert_eq!(msgs[4]["reasoning_content"], "plan");
+    }
+
+    #[test]
+    fn test_parse_failure_terminates_stream() {
+        let mut state = ChatStreamState::default();
+        let chunks = state.process_data("not valid json{{{");
+        assert!(matches!(chunks.as_slice(), [StreamChunk::Error(_)]));
+        assert!(state.process_data("[DONE]").is_empty());
+        assert!(state.process_end().is_empty());
     }
 }

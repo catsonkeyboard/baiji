@@ -141,11 +141,17 @@ impl AnthropicProvider {
                 .max(t.budget_tokens + 1024),
             None => request.max_tokens.unwrap_or(4096),
         };
+        // 启用 thinking 时 API 只接受默认 temperature（显式下发会被 400 拒绝），
+        // 与 OpenAI 系推理模型的处理对齐（见 chat_completions.rs 同名逻辑）
+        let temperature = match &thinking {
+            Some(_) => None,
+            None => request.temperature,
+        };
 
         AnthropicRequest {
             model: model.to_string(),
             max_tokens,
-            temperature: request.temperature,
+            temperature,
             system,
             messages,
             tools: request.tools.as_ref().map(|tools| {
@@ -311,7 +317,14 @@ impl AnthropicStreamState {
 
         let event: StreamEvent = match serde_json::from_str(data) {
             Ok(e) => e,
-            Err(e) => return vec![StreamChunk::Error(format!("Parse error: {}", e))],
+            Err(e) => {
+                // 帧解析失败 = 流不可信（厂商协议变体或传输损坏），立即终止：
+                // 置 finished 后不再产出任何 chunk（含 process_end 的 Done 兜底）。
+                // 下游（runtime）本就把 Error 视为致命，这里让状态机与其一致；
+                // 宁可显式失败也不静默丢帧——丢一帧 tool_use 会让后续参数错位。
+                self.finished = true;
+                return vec![StreamChunk::Error(format!("Parse error: {}", e))];
+            }
         };
 
         match event.event_type.as_str() {
@@ -810,6 +823,29 @@ mod tests {
     }
 
     #[test]
+    fn test_thinking_drops_temperature() {
+        // 启用 thinking 时显式 temperature 必须丢弃（API 只接受默认值，否则 400）
+        use crate::types::ThinkingLevel;
+        let request = ChatRequest::new(vec![Message::user("hi")])
+            .with_temperature(0.7)
+            .with_thinking(Some(ThinkingLevel::Low));
+        let body = serde_json::to_value(AnthropicProvider::build_request_body(
+            &request, "claude-x", false,
+        ))
+        .unwrap();
+        assert!(body.get("temperature").is_none(), "thinking on: dropped");
+
+        // 未启用 thinking 时 temperature 正常下发（f32 精度用近似比较）
+        let request = ChatRequest::new(vec![Message::user("hi")]).with_temperature(0.7);
+        let body = serde_json::to_value(AnthropicProvider::build_request_body(
+            &request, "claude-x", false,
+        ))
+        .unwrap();
+        let kept = body["temperature"].as_f64().expect("temperature kept");
+        assert!((kept - 0.7).abs() < 1e-6, "thinking off: kept, got {kept}");
+    }
+
+    #[test]
     fn test_parse_chat_response() {
         let raw = r#"{
             "content": [
@@ -989,5 +1025,16 @@ mod tests {
         assert_eq!(msgs[5]["content"][0]["thinking"], "plan");
         assert_eq!(msgs[5]["content"][0]["signature"], "sig");
         assert_eq!(msgs[5]["content"][1]["type"], "tool_use");
+    }
+
+    #[test]
+    fn test_parse_failure_terminates_stream() {
+        // 帧解析失败后流必须终止：后续事件不处理，process_end 也不再有 Done 兜底
+        let mut state = AnthropicStreamState::default();
+        let chunks = state.process_data("not valid json{{{");
+        assert!(matches!(chunks.as_slice(), [StreamChunk::Error(_)]));
+        // 流终止后的任何输入（包括 process_end）都不再产出
+        assert!(state.process_data(r#"{"type":"message_stop"}"#).is_empty());
+        assert!(state.process_end().is_empty());
     }
 }

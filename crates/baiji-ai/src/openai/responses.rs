@@ -333,7 +333,12 @@ impl ResponsesStreamState {
 
         let event: ResponsesStreamEvent = match serde_json::from_str(data) {
             Ok(e) => e,
-            Err(e) => return vec![StreamChunk::Error(format!("Parse error: {}", e))],
+            Err(e) => {
+                // 帧解析失败 = 流不可信，立即终止（不再产出 Done 兜底）；
+                // 与 runtime 对 Error 的致命处理保持一致，见 anthropic.rs 同处注释
+                self.finished = true;
+                return vec![StreamChunk::Error(format!("Parse error: {}", e))];
+            }
         };
 
         match event.event_type.as_str() {
@@ -789,5 +794,14 @@ mod tests {
         let body = serde_json::to_value(build_request("glm-4.6", &request, true)).unwrap();
         assert!(body.get("store").is_none() && body.get("include").is_none());
         assert_eq!(body["input"][1]["type"], "function_call");
+    }
+
+    #[test]
+    fn test_parse_failure_terminates_stream() {
+        let mut state = ResponsesStreamState::default();
+        let chunks = state.process_data("not valid json{{{");
+        assert!(matches!(chunks.as_slice(), [StreamChunk::Error(_)]));
+        assert!(state.process_data("[DONE]").is_empty());
+        assert!(state.process_end().is_empty());
     }
 }
