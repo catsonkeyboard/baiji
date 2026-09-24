@@ -1607,7 +1607,7 @@ mod tests {
         let first_id = harness.session().meta.id.clone();
 
         // 同库另建一个会话并切换：锚点失效（历史整体替换）
-        let mut other = AgentHarness::new(runtime, store_dir.clone()).unwrap();
+        let other = AgentHarness::new(runtime, store_dir.clone()).unwrap();
         let other_id = other.session().meta.id.clone();
         drop(other);
         harness.switch_session(&other_id).unwrap();

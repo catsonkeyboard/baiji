@@ -155,6 +155,33 @@ pub struct Strings {
     pub cmd_thinking_usage: &'static str,
     /// "✗ failed to save config: {err}"
     pub cmd_config_save_fail_tpl: &'static str,
+    /// spec 驱动：用法
+    pub cmd_spec_usage: &'static str,
+    /// "spec '{slug}' approved — tasks seeded into the todo list, implementing (the run chain auto-continues)"
+    pub cmd_spec_approved_tpl: &'static str,
+    /// "the spec has no '- [ ] task' lines yet — draft them first (/spec show)"
+    pub cmd_spec_no_tasks: &'static str,
+    /// "✗ spec approve failed: {err}"
+    pub cmd_spec_approve_fail_tpl: &'static str,
+    /// "spec:\n{head}"
+    pub cmd_spec_show_tpl: &'static str,
+    /// "no active spec (/spec <feature> to start)"
+    pub cmd_spec_none: &'static str,
+    pub cmd_spec_list_empty: &'static str,
+    pub cmd_spec_cleared: &'static str,
+    /// "spec '{slug}' drafting — the agent writes .baiji/specs/{slug}.md; review it, then /spec approve"
+    pub cmd_spec_drafting_tpl: &'static str,
+    /// "✗ spec start failed: {err}"
+    pub cmd_spec_start_fail_tpl: &'static str,
+    /// goal 驱动
+    /// "active goal: {goal}"
+    pub cmd_goal_active_tpl: &'static str,
+    /// "usage: /goal <objective> | /goal off"
+    pub cmd_goal_usage: &'static str,
+    pub cmd_goal_cleared: &'static str,
+    /// experts 编排
+    pub cmd_experts_on: &'static str,
+    pub cmd_experts_off: &'static str,
     /// "✗ switch failed (config saved; restart to apply): {err}"
     pub cmd_swap_fail_tpl: &'static str,
     /// "✓ config applied: {vendor} · endpoint={endpoint} · model={model} (written to config)"
@@ -288,6 +315,21 @@ impl Strings {
             cmd_thinking_set_tpl: "thinking set to {} (effective on the next request, saved to config)",
             cmd_thinking_usage: "usage: /thinking <minimal|low|medium|high|off>",
             cmd_config_save_fail_tpl: "✗ failed to save config: {}",
+            cmd_spec_usage: "usage: /spec <feature> | /spec approve | /spec show | /spec list | /spec done | /spec off",
+            cmd_spec_approved_tpl: "spec '{}' approved — tasks seeded into the todo list, implementing (the run chain auto-continues)",
+            cmd_spec_no_tasks: "the spec has no '- [ ] task' lines yet — draft them first (/spec show)",
+            cmd_spec_approve_fail_tpl: "✗ spec approve failed: {}",
+            cmd_spec_show_tpl: "spec:\n{}",
+            cmd_spec_none: "no active spec (/spec <feature> to start)",
+            cmd_spec_list_empty: "(no spec files yet)",
+            cmd_spec_cleared: "spec cleared (file kept on disk)",
+            cmd_spec_drafting_tpl: "spec '{}' drafting — the agent writes .baiji/specs/{}.md; review it, then /spec approve",
+            cmd_spec_start_fail_tpl: "✗ spec start failed: {}",
+            cmd_goal_active_tpl: "active goal: {}",
+            cmd_goal_usage: "usage: /goal <objective> | /goal off",
+            cmd_goal_cleared: "goal cleared",
+            cmd_experts_on: "Experts mode ON — work is orchestrated via expert subagents (see ## Experts mode in the system prompt)",
+            cmd_experts_off: "Experts mode OFF",
             cmd_swap_fail_tpl: "✗ switch failed (config saved; restart to apply): {}",
             cmd_applied_tpl: "✓ config applied: {} · endpoint={} · model={} (written to config)",
             cmd_external_usage_tpl: "usage: /{} <task> (delegates to the external {} agent CLI)",
@@ -389,6 +431,21 @@ impl Strings {
             cmd_thinking_set_tpl: "思考级别已设为 {}（下一次请求生效，已写入配置）",
             cmd_thinking_usage: "用法：/thinking <minimal|low|medium|high|off>",
             cmd_config_save_fail_tpl: "✗ 配置保存失败: {}",
+            cmd_spec_usage: "用法：/spec <特性描述> | /spec approve | /spec show | /spec list | /spec done | /spec off",
+            cmd_spec_approved_tpl: "spec '{}' 已批准 — 任务已写入 todo 清单，开始实施（运行链自动接力）",
+            cmd_spec_no_tasks: "spec 中还没有 '- [ ] task' 任务行 — 请先起草（/spec show 查看）",
+            cmd_spec_approve_fail_tpl: "✗ spec 批准失败: {}",
+            cmd_spec_show_tpl: "spec 内容：\n{}",
+            cmd_spec_none: "当前没有激活的 spec（/spec <特性描述> 开始）",
+            cmd_spec_list_empty: "（尚无 spec 文件）",
+            cmd_spec_cleared: "spec 已清除（文件保留在磁盘）",
+            cmd_spec_drafting_tpl: "spec '{}' 起草中 — 代理将写入 .baiji/specs/{}.md；审阅后执行 /spec approve",
+            cmd_spec_start_fail_tpl: "✗ spec 启动失败: {}",
+            cmd_goal_active_tpl: "当前目标: {}",
+            cmd_goal_usage: "用法：/goal <目标> | /goal off",
+            cmd_goal_cleared: "目标已清除",
+            cmd_experts_on: "专家模式已开启 — 工作经专家子代理编排（见系统提示中的 ## Experts mode）",
+            cmd_experts_off: "专家模式已关闭",
             cmd_swap_fail_tpl: "✗ 切换失败（配置已保存，重启后生效）: {}",
             cmd_applied_tpl: "✓ 配置已生效：{} · endpoint={} · model={}（已写入配置文件）",
             cmd_external_usage_tpl: "用法：/{} <任务描述>（委托给外部 {} agent CLI）",
