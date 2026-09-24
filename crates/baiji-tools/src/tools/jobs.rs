@@ -296,7 +296,7 @@ impl AgentTool for JobsTool {
 mod tests {
     use super::*;
     use crate::env::ExecutionEnv;
-    use crate::tools::{BashTool, JobRegistry as _unused};
+    use crate::tools::BashTool;
 
     fn kit(dir: &std::path::Path) -> (BashTool, JobsTool, Arc<JobRegistry>) {
         let env = Arc::new(ExecutionEnv::new(dir));
