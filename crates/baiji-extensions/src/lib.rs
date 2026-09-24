@@ -6,7 +6,7 @@
 //! 内置：
 //! - [`ClockPlugin`]：注册 `now` 工具，返回当前时间
 //! - [`SafetyPlugin`]：注册 hook，拦截 `rm -rf /` 等危险 bash 命令
-//! - [`mcp`]：mcporter CLI 桥（MCP 工具发现与调用）
+//! - [`mcp`]：MCP 工具桥（原生 stdio 客户端，常驻进程）
 
 pub mod command_hook;
 pub mod mcp;
@@ -18,7 +18,7 @@ use serde_json::Value;
 use std::sync::Arc;
 
 pub use command_hook::{CommandHookSpec, CommandHooks, HooksConfig};
-pub use mcp::{McpTool, McporterBridge, register_mcp_tools};
+pub use mcp::{McpClient, McpTool, ServerSpec, register_mcp_tools};
 
 /// 插件注册上下文：插件把工具/hooks 塞进来
 #[derive(Default)]

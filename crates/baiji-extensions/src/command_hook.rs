@@ -353,7 +353,7 @@ mod tests {
         assert_eq!(decision, HookDecision::Proceed);
 
         // 超时：不拦截且快速返回
-        let hook = hooks("tool_call", "sleep 30");
+        hooks("tool_call", "sleep 30");
         let spec_timeout = Duration::from_secs(1);
         let started = std::time::Instant::now();
         let hook = CommandHooks::from_config(HooksConfig {

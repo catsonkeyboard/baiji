@@ -21,3 +21,9 @@ chrono = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = { workspace = true }
+
+# 集成测试陪测进程（CARGO_BIN_EXE_mock-mcp-server 编译期路径引用）
+[[bin]]
+name = "mock-mcp-server"
+path = "src/bin/mock-mcp-server.rs"
+test = false
