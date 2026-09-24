@@ -23,7 +23,7 @@ use crate::event::AgentEvent;
 use crate::queue::SteeringQueue;
 use crate::tool::{AgentTool, ToolOutput, ToolRegistry};
 use baiji_ai::{Message, Provider, ThinkingLevel};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -619,7 +619,6 @@ mod tests {
     #[tokio::test]
     async fn test_long_answer_truncated_with_note() {
         let long = "x".repeat(20 * 1024);
-        let provider = Arc::new(ScriptProvider::answering("a"));
         // 直接构造长答案 provider
         struct LongAnswer;
         #[async_trait::async_trait]
