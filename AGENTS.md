@@ -7,7 +7,7 @@ A terminal AI coding agent built on a multi-crate Rust workspace: async streamin
 ```bash
 cargo build                # Build the whole workspace
 cargo run                  # Run the TUI app (default)
-cargo test --workspace     # Run all tests (367 total)
+cargo test --workspace     # Run all tests (380 total)
 baiji -e "msg" --yes      # Headless one-shot run (streams to stdout)
 baiji -e "msg" --plan     # Read-only planning run (plan mode)
 baiji --sessions          # List sessions (no API key needed)
@@ -93,7 +93,7 @@ Dependency direction: telemetry ← ai ← agent ← tools ← harness ← {tui,
 - `retry`: transient-error retries with exponential backoff (`base_delay_ms × 2^attempt`, capped at `max_delay_ms`; server `Retry-After` honored but also capped). Defaults 2 / 500ms / 30s.
 - `ui.theme`: `"dark"` (default) or `"light"` palettes. `ui.language`: `"en"` (default) or `"zh"` — every TUI string lives in `baiji-tui/src/i18n.rs` (`Strings::en/zh`, positional `{}` templates filled via `i18n::fill` since `format!` requires literals); slash-command usages are bilingual triples in `SLASH_COMMANDS`. English is the default UI language.
 - `hooks` (global-only): user command hooks fired on lifecycle events — `run_start` / `turn_start` / `tool_call` / `tool_result` / `run_end`, each a list of `{ "command": "...", "timeout_secs": 10 }` (`command_hook.rs` in baiji-extensions). Context is JSON on the hook's stdin (`{"event", ...}` with tool/args/input/turn/output-preview) plus the `BAIJI_HOOK_EVENT` env var. Convention: **exit code 2 on `tool_call` blocks the call** (stderr becomes the deny reason the LLM sees); any other failure or timeout is logged and fails open. `tool_result` is observe-only. Security: hooks run arbitrary shell — the section is NOT project-whitelisted (project-level `hooks` is dropped with a warning) and `BAIJI_HOOKS=off` is the global kill switch; the /status summary shows the count.
-- MCP: place a `mcporter.json` in the project root; tools are discovered via `npx -y mcporter` at startup (requires Node). Tool names use `server.tool`.
+- MCP: place a `mcporter.json` in the project root; servers are spawned as resident stdio processes (native JSON-RPC client — no Node/npx dependency) at startup. Tool names use `server.tool` internally and `mcp__server__tool` for the LLM. Crashed servers restart lazily.
 
 ### Vendor presets (`baiji-ai::vendors`)
 
@@ -188,7 +188,7 @@ run()
 
 `Plugin::register(&mut PluginContext)` adds tools/hooks; `PluginManager::apply` merges into the registries. Built-ins: `ClockPlugin` (a `now` tool), `SafetyPlugin` (hook denying command-position `rm -rf` against `/`, `~`, `$HOME` — token-level detection, `echo rm -rf /` is not blocked).
 
-MCP: `mcp` module ports the mcporter CLI bridge — `register_mcp_tools(&mut ToolRegistry, mcporter.json path)` discovers `server.tool` tools via `npx -y mcporter list --json` (30s timeout per server, per-server failures warn-and-skip) and wraps each as an `AgentTool` that shells out to `mcporter call`.
+MCP: `mcp` module is a native stdio JSON-RPC client — `register_mcp_tools(&mut ToolRegistry, mcporter.json path)` spawns each configured server as a resident process (`McpClient`: spawn → initialize handshake → tools/list; per-server startup is concurrent; failures warn-and-skip), and `McpTool::execute` reuses the same process via `tools/call` (millisecond round-trips instead of the old per-call `npx mcporter` cold starts; timeouts abandon the wait without killing the shared process; crashed servers restart lazily on the next call). Config keeps the `mcporter.json` format (`mcpServers: {command, args, env}`, env values `$VAR`-expanded) — no Node/npx dependency anymore. LLM-visible names are `mcp__server__tool` (`llm_tool_name`). Integration tests (`tests/mcp_client.rs`) drive a real mock server binary (`src/bin/mock-mcp-server.rs` via `CARGO_BIN_EXE_`): handshake, noise-line tolerance, crash + lazy restart, slow-tool process survival.
 
 ### Headless CLI & Telemetry backends
 

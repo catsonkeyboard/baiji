@@ -1,23 +1,32 @@
 # baiji
 
-> A terminal-based AI agent client built in Rust — featuring a ReAct reasoning loop, MCP tool integration, and a production-grade Harness Engineering guardrail system.
+> A terminal AI coding agent built in Rust — a multi-crate workspace with a streaming ReAct runtime, multi-vendor providers (API-key-only setup), built-in coding tools, and sessions with JSONL persistence and context compaction.
 
 ![Rust](https://img.shields.io/badge/Rust-2024_Edition-orange?logo=rust)
+
 ![License](https://img.shields.io/badge/License-MIT-blue)
+
 ![Build](https://img.shields.io/badge/build-cargo-green)
+
+
+
+![Tests](https://img.shields.io/badge/tests-380_passing-brightgreen)
 
 ---
 
 ## Features
 
-- 🤖 **ReAct Agent** — Reasoning + Acting loop with up to 5 iterations per turn
-- 🖥️ **Terminal UI** — Fully interactive TUI powered by [Ratatui](https://ratatui.rs)
-- 🔌 **MCP Integration** — Discovers and executes tools via the [mcporter](https://github.com/catsonkeyboard/mcporter) CLI bridge
-- 🛡️ **Harness Engineering** — Production-grade guardrails: path whitelisting, tool blocking, output truncation, retry & backoff
-- 🧠 **Context Management** — Token-estimation-based smart compression; older turns are summarized, not discarded
-- 📊 **Observability** — Per-run trace files with LLM latency, tool timing, and I/O sizes
-- ⏎ **Steering** — Send new instructions mid-run; the agent re-orients without restarting
-- ❌ **Cancellation** — Press `Esc` to instantly cancel the current agent run
+- 🤖 **Streaming ReAct loop** — reasoning + native tool calling, with steering (inject new instructions mid-run) and instant cancellation (`Esc`)
+- 🔌 **Multi-vendor providers** — Anthropic Messages + OpenAI Chat Completions + OpenAI Responses protocols; 12 vendor presets (OpenAI, Anthropic, DeepSeek, GLM, Kimi, MiniMax, MiMo, Bailian, OpenRouter, xAI Grok, OpenCode Zen, TokenHub) with model auto-discovery
+- 🧠 **Thinking/reasoning support** — hot-swappable reasoning level (`/thinking high`), cross-protocol replay of thinking blocks within the current tool loop
+- 🛠️ **Built-in coding tools** — read / write / edit / bash / grep / find / ls / search (BM25) / imports (tree-sitter index) / expand, plus external agent delegation (`/codex`, `/claude`, …)
+- 🧵 **Context engineering** — reversible tool-output compression (content-addressed store + `expand` to recover), tiered compaction (deterministic or LLM-generated summaries), usage-anchored token estimation
+- 💾 **Sessions** — tree-structured (fork/branch), JSONL persistence, `--session <id>` resume, cross-session project memory
+- 📋 **Todo & goal & spec modes** — long-horizon task state externalized; auto-continue chains runs until todos complete; spec-driven drafting → approve → implement
+- 👥 **Subagents** — `task` tool spawns isolated-context read-only subagents with role files (`agents/*.md`), optional per-role model/thinking config
+- 🛡️ **Guardrails** — path whitelisting (lexical + realpath), HITL confirmation gates, plan mode (read-only tool gate), hook system (`exit 2` on `tool_call` blocks the call), safety plugin, output truncation
+- 🖥️ **TUI** — Ratatui UI with streaming render, 19 slash commands, fish-style ghost completion, bilingual (en/zh) interface
+- 📊 **Observability** — per-run JSONL telemetry (`BAIJI_TELEMETRY=file`), daily-rotated logs, compression savings accounting
 
 ---
 
@@ -25,198 +34,133 @@
 
 ### Prerequisites
 
-- Rust toolchain (`rustup` recommended)
-- An API key for Anthropic or OpenAI
+- Rust toolchain (`rustup` recommended, edition 2024)
+- An API key for any supported vendor
 
-### Installation
+### Build & Run
 
 ```bash
 git clone https://github.com/catsonkeyboard/baiji.git
 cd baiji
 cargo build --release
+
+baiji                 # interactive TUI (config wizard on first run)
+baiji -e "msg" --yes  # headless one-shot run (streams to stdout)
+baiji -e "msg" --plan # read-only planning run (plan mode)
+baiji --sessions      # list sessions (no API key needed)
 ```
 
 ### Configuration
 
-Copy the sample config and fill in your credentials:
-
-```bash
-cp config.sample.json ~/.baiji/config.json
-```
-
-Edit `~/.baiji/config.json`:
+Global config lives at `~/.baiji/config.json` (a template is auto-generated on first run). A project may override a whitelisted subset via `./.baiji/config.json` (deep-merged; security-sensitive fields like `api_key` / `vendor` / `allowed_paths` are global-only).
 
 ```json
 {
-  "llm": {
-    "provider": "anthropic",
-    "base_url": "https://api.anthropic.com",
-    "api_key": "$ANTHROPIC_API_KEY",
-    "model": "claude-3-5-sonnet-20241022",
-    "max_tokens": 4096
-  },
+  "vendor": "glm",
+  "api_key": "$ZHIPU_API_KEY",
+  "model": null,
+  "endpoint": null,
+  "max_tokens": 4096,
+  "thinking": null,
+  "llm_compaction": false,
+  "max_turns": 24,
+  "compaction": { "enabled": true, "max_estimated_tokens": null, "keep_recent_turns": 6 },
+  "retry": { "max_retries": 2, "base_delay_ms": 500, "max_delay_ms": 30000 },
+  "external_agents": [
+    { "name": "codex", "command": "codex exec {prompt}", "timeout_secs": 300 }
+  ],
   "policy": {
-    "allowed_paths": ["./"],
-    "max_tool_output_bytes": 8192,
-    "blocked_tools": [],
-    "require_confirmation_tools": ["builtin__write"],
-    "max_search_depth": 10,
-    "max_file_size": 1048576
+    "allowed_paths": [],
+    "require_confirmation_tools": ["bash", "write", "edit"],
+    "max_tool_output_bytes": 32768,
+    "bash_timeout_secs": 30,
+    "compression_enabled": true
   },
-  "ui": {
-    "theme": "dark",
-    "show_thoughts": false
-  }
+  "ui": { "theme": "dark", "language": "en" }
 }
 ```
 
-> `api_key` supports `$ENV_VAR` and `${ENV_VAR}` syntax for automatic environment variable expansion.
+- Only `vendor` + API key are required; `model` is auto-discovered from the vendor's models API when omitted (`/model` to change).
+- `api_key` supports `$ENV_VAR` / `${ENV_VAR}` syntax; if omitted, the vendor's recommended env var is read.
+- `endpoint` selects vendor endpoint variants — Coding Plan subscriptions use dedicated endpoints (e.g. GLM `"anthropic"` / `"coding"` / `"responses"`; deepseek/kimi/minimax/mimo/bailian expose verified `"anthropic"`-compatible endpoints).
+- `thinking` sets the reasoning level: `"minimal"` / `"low"` / `"medium"` / `"high"` (null = off), mapped per protocol and hot-swappable via `/thinking`.
+- `require_confirmation_tools` (HITL): listed tools prompt a y/a/n dialog before executing; empty list = auto-approve.
+- `hooks` (global-only): user shell hooks on `run_start` / `turn_start` / `tool_call` / `tool_result` / `run_end`. Convention: **exit code 2 on `tool_call` blocks the call**; all other hook failures fail open. `BAIJI_HOOKS=off` disables.
 
-### Run
+### MCP Tools
 
-```bash
-cargo run
-# or with debug logging:
-RUST_LOG=debug cargo run
-```
+Drop an `mcporter.json` in the project root; servers are spawned as resident stdio processes speaking native MCP (JSON-RPC), initialized once and reused for every call — millisecond round-trips instead of per-call CLI cold starts. Config format is identical to Claude Code's `.mcp.json` (`mcpServers: {command, args, env}`); tools are exposed to the model as `mcp__<server>__<tool>`. Crashed servers restart lazily on the next call.
 
 ---
 
 ## Architecture
 
 ```
-main.rs
-  ├── Config::load()            Load ~/.baiji/config.json
-  ├── ProviderFactory::create   Create LLM Provider (Anthropic / OpenAI)
-  ├── McporterBridge::new()     Initialize MCP bridge (async tool discovery)
-  ├── ToolPolicy::from_config() Load guardrail policy
-  ├── ReActAgent::new()         Assemble Agent (LLM + tools + policy + MCP)
-  └── App::run()                Enter Ratatui main loop
+crates/
+  baiji-telemetry/   Span/event contracts (noop default, in-memory recorder, JSONL backend)
+  baiji-ai/          Provider layer: types, Provider trait, Anthropic Messages,
+                     OpenAI Chat Completions + Responses, 12-vendor registry, model discovery
+  baiji-agent/       Agent runtime: AgentTool trait, ToolRegistry, streaming ReAct loop,
+                     HookRegistry, SteeringQueue, ConfirmationGate, subagents
+  baiji-tools/       Coding tools (read/write/edit/bash/grep/find/ls/search/imports/expand)
+                     + ExecutionEnv (path whitelist, output truncation, timeouts)
+                     + reversible output compressors
+  baiji-harness/     AgentHarness: session tree, JSONL persistence, compaction,
+                     skills, prompt templates, todo/goal/spec/memory, run loop
+  baiji-extensions/  Plugin layer (Plugin/PluginManager) + built-ins: clock, safety,
+                     command hooks, MCP stdio client
+  baiji-tui/         Ratatui terminal UI (streaming, steering, ghost completion,
+                     wizard, i18n en/zh)
+src/                 Root bin crate `baiji`: config resolution + composition root
 ```
 
-### Agent Run Loop
+Dependency direction: `telemetry ← ai ← agent ← tools ← harness ← {tui, bin}`; `extensions ← agent`.
+
+### Agent run loop
 
 ```
-ReActAgent::run()
-  ContextManager::trim()              ← Smart context compression
-  TraceRecorder::start_turn()         ← Begin trace recording
-  loop (max 5 iterations):
-    stream_llm_response() + Retry     ← LLM call with automatic retry
-    if tool_calls:
-      ToolPolicy::check_tool()        ← Policy check (block/confirm/allow)
-      ToolPolicy::check_path()        ← Path whitelist enforcement
-      execute_tool()                  ← Execute the tool
-      ToolPolicy::truncate_output()   ← Output truncation protection
-      ToolResultValidator::validate() ← Inject [Observation] hints for LLM
-      TraceRecorder::record_tool()    ← Track tool latency & I/O
-    else:
-      TraceRecorder::finish()         ← Save JSON trace to logs/traces/
-      tx.send(Completed(answer))      ← Return answer to UI
+AgentRuntime::run()
+  ├─ drain steering queue (mid-run user instructions)
+  └─ loop (≤ max_turns):
+       ├─ ChatRequest(system + history + tool definitions)   # plan mode filters to read-only tools
+       ├─ chat_stream (transient errors retried w/ backoff)  # status-code-based classification
+       ├─ no tool calls → final answer, done
+       └─ tool calls → per call:
+            hooks.on_tool_call (Deny/Modify/Proceed)
+            ConfirmationGate (HITL y/a/n) → execute → hooks.on_tool_result
+            # all-parallel batches run concurrently
+       └─ context near window → elide old tool results (reversible, ctx-store handles)
 ```
+
+Between runs, `AgentHarness` handles compaction (keep recent N turns intact, fold older turns into a summary), session persistence, and system-prompt assembly (skills, memory, todos, subagent roles, spec state).
 
 ---
 
-## Module Reference
+## Keyboard & Commands
 
-| Module | File | Responsibility |
-|---|---|---|
-| `app` | `src/app.rs` | App state, main loop, keyboard/Agent event handling |
-| `ui` | `src/ui/mod.rs` | Ratatui rendering — Chat, Input, StatusBar |
-| `event` | `src/event.rs` | Async keyboard event listener |
-| `agent` | `src/agent/agent.rs` | ReAct Agent core loop |
-| `builtin_tools` | `src/agent/builtin_tools.rs` | Built-in tools: grep / read / write |
-| `tool_policy` | `src/agent/tool_policy.rs` | 🛡️ Path whitelist, tool blocking, output truncation |
-| `retry` | `src/agent/retry.rs` | 🔄 Error classification, exponential backoff |
-| `validator` | `src/agent/validator.rs` | 🔍 Tool result validation, observation injection |
-| `context` | `src/agent/context.rs` | 🧠 Token estimation, summary compression |
-| `trace` | `src/agent/trace.rs` | 📊 Per-turn latency & tool timing traces |
-| `memory` | `src/agent/memory.rs` | System prompt construction, AGENTS.md loading |
-| `llm` | `src/llm/` | LLM abstraction (`LLMProvider` trait + Anthropic + streaming) |
-| `mcp` | `src/mcp/` | MCP bridge — tool discovery & execution via mcporter |
-| `config` | `src/config.rs` | JSON config loading, env var expansion, validation |
+| Key         | Action                                        |
+| ----------- | --------------------------------------------- |
+| `Enter`     | Send message (mid-run = steering)             |
+| `Esc`       | Cancel current run / stop auto-continue chain |
+| `Ctrl+O`    | Session picker (switch / fork)                |
+| `Ctrl+C`    | Quit                                          |
+| `PgUp/PgDn` | Scroll chat history                           |
 
----
-
-## Harness Engineering Guardrail System
-
-### Architectural Constraints — ToolPolicy
-
-| Config Key | Default | Description |
-|---|---|---|
-| `allowed_paths` | `["./"]` | Restrict file operations to whitelisted directories |
-| `blocked_tools` | `[]` | Prevent the agent from calling specified tools |
-| `require_confirmation_tools` | `["builtin__write"]` | Tools that require user confirmation before execution |
-| `max_tool_output_bytes` | `8192` | Auto-truncate tool output with `[truncated]` marker |
-| `max_search_depth` | `10` | Maximum grep recursion depth |
-| `max_file_size` | `1048576` (1MB) | Skip files larger than this |
-
-### Feedback Loop — Retry & Validation
-
-- Transient errors (network, rate-limit, 5xx) → exponential backoff: `500ms → 1s → 2s`, max 2 retries
-- Permanent errors (401, 404) → fail immediately, no retry
-- Empty results, error strings, and truncated output are detected and flagged
-- Automatic `[Observation: ...]` injection guides LLM self-correction
-
-### Context Engineering — ContextManager
-
-- Token estimation: ASCII ≈ 0.25 tok/char, CJK ≈ 0.5 tok/char
-- The most recent **6 turns** are always preserved intact
-- Older turns are **compressed into summaries** (not dropped), injected as `[Conversation Summary]`
-
-### Observability — TraceRecorder
-
-- Each agent run writes a trace to `logs/traces/trace_YYYYMMDD_HHMMSS.json`
-- Captures: per-turn LLM latency, tool call details (name / duration / I/O size / success)
-- Status bar shows real-time: `⏳ Turn N | M tools`
-
----
-
-## MCP Tool Integration
-
-MCP tools are configured via `mcporter.json` in the project root (excluded from version control — see `mcporter.sample.json` for a template).
-
-```json
-{
-  "mcpServers": {
-    "your-server": {
-      "command": "npx",
-      "args": ["-y", "your-mcp-package"],
-      "env": {
-        "YOUR_API_KEY": "$YOUR_API_KEY"
-      }
-    }
-  }
-}
-```
-
-### Tool Naming Convention
-
-| Type | Format | Example |
-|---|---|---|
-| Built-in | `builtin__<name>` | `builtin__read`, `builtin__write`, `builtin__grep` |
-| MCP | `<server>__<tool>` | `tavily__search` |
-
----
-
-## Keyboard Shortcuts
-
-| Key | Action |
-|---|---|
-| `Enter` | Send message |
-| `Esc` | Cancel current agent run |
-| `↑ / ↓` | Scroll chat history |
-| `Ctrl+C` | Quit |
+19 slash commands: `/help` `/config` `/model` `/thinking` `/plan` `/goal` `/spec` `/experts` `/subagents` `/todos` `/tasks` `/kill` `/compact` `/usage` `/status` `/session` `/fork` `/new` `/resume` — plus dynamic `/codex`-style commands for configured external agents. Ghost completion suggests as you type; `Tab` accepts.
 
 ---
 
 ## Development
 
 ```bash
-cargo build          # Build
-cargo run            # Run
-cargo test           # Run all tests (62 total)
-RUST_LOG=debug cargo run  # Run with debug logging
+cargo build                # Build the whole workspace
+cargo test --workspace     # Run all tests (380 total, zero warnings)
+cargo test -p baiji-agent  # Test a single crate
+RUST_LOG=debug cargo run   # Debug logs → ~/.baiji/logs/ (never pollutes the project dir)
+cargo build --release      # Optimized build
 ```
+
+Tests live inline (`#[cfg(test)]` modules): stream state machines are pure and exhaustively unit-tested against raw SSE frames; the TUI has a full-layout `TestBackend` render smoke test; bash tool tests verify process-group kill of grandchildren.
 
 ---
 
