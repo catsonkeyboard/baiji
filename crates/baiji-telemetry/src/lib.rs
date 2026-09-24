@@ -147,19 +147,21 @@ impl RecordingTelemetry {
 
 impl Telemetry for RecordingTelemetry {
     fn span(&self, name: &str, attributes: Vec<(String, AttrValue)>) -> Box<dyn Span> {
-        self.inner.lock().unwrap().spans.push(SpanRecord {
-            name: name.to_string(),
-            attributes,
-            ended: false,
-            error: None,
-        });
+        // push 与取索引必须在同一次持锁内完成：分两次加锁的话，
+        // 两个并发 span() 会互相抢末尾位置，索引错配会把属性写到别人的 span 上
+        let index = {
+            let mut log = self.inner.lock().unwrap();
+            log.spans.push(SpanRecord {
+                name: name.to_string(),
+                attributes,
+                ended: false,
+                error: None,
+            });
+            log.spans.len() - 1
+        };
         Box::new(RecordingSpan {
             log: Arc::clone(&self.inner),
-            index: {
-                // 刚压入的 span 位于末尾；索引在 end 前保持有效，
-                // 因为 span 结束只会修改既有条目而不会移除
-                self.inner.lock().unwrap().spans.len() - 1
-            },
+            index,
         })
     }
 
@@ -204,32 +206,79 @@ impl Span for RecordingSpan {
 //
 // 每条 span_start / span_end / event 追加一行 JSON（时间戳为 Unix 毫秒，
 // 零额外依赖）。用于离线分析 Agent 运行（BAIJI_TELEMETRY=file 启用）。
+//
+// 写入走 mpsc channel + 专用后台线程：调用线程只做序列化与入队
+// （持锁仅为 send，微秒级），文件 IO 不再阻塞 agent 主路径。
+// ts_ms 在入队时打点（事件发生时刻，保真度不低于旧同步实现）。
+// mpst Sender 为 !Sync，用 Mutex 包一层以满足 Telemetry: Sync。
+
+/// 后台写线程的消息
+enum WriterMsg {
+    /// 一行完整 JSON（已含 ts_ms）
+    Line(String),
+    /// 排空回执：写入方 flush 文件后 ack
+    Flush(std::sync::mpsc::SyncSender<()>),
+}
 
 /// JSONL 落盘后端
 pub struct JsonlTelemetry {
-    file: Arc<Mutex<std::fs::File>>,
+    tx: Arc<Mutex<std::sync::mpsc::Sender<WriterMsg>>>,
 }
 
 impl JsonlTelemetry {
-    /// 打开（追加模式）一个轨迹文件；文件不存在时创建
+    /// 打开（追加模式）一个轨迹文件；文件不存在时创建。
+    /// 同时启动后台写线程；所有发送端析构后线程自动排空退出。
     pub fn open(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+        use std::io::Write as _;
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = std::fs::OpenOptions::new()
+        let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)?;
+        let (tx, rx) = std::sync::mpsc::channel::<WriterMsg>();
+        std::thread::Builder::new()
+            .name("baiji-telemetry-jsonl".to_string())
+            .spawn(move || {
+                for msg in rx {
+                    match msg {
+                        WriterMsg::Line(line) => {
+                            let _ = writeln!(file, "{line}");
+                        }
+                        WriterMsg::Flush(ack) => {
+                            let _ = file.flush();
+                            let _ = ack.send(());
+                        }
+                    }
+                }
+                // 通道关闭（所有发送端析构）：收尾 flush
+                let _ = file.flush();
+            })?;
         Ok(Self {
-            file: Arc::new(Mutex::new(file)),
+            tx: Arc::new(Mutex::new(tx)),
         })
     }
 
-    fn write(file: &Mutex<std::fs::File>, mut record: serde_json::Value) {
-        use std::io::Write;
+    /// 阻塞等待队列中已入队的记录全部写入并 flush 文件。
+    /// 后台线程已退出时静默返回。测试与进程退出前调用。
+    pub fn flush(&self) {
+        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel::<()>(0);
+        let sent = {
+            let Ok(tx) = self.tx.lock() else { return };
+            tx.send(WriterMsg::Flush(ack_tx))
+        };
+        if sent.is_ok() {
+            let _ = ack_rx.recv();
+        }
+    }
+
+    /// 序列化并入队（调用线程不触碰文件）
+    fn enqueue(tx: &Arc<Mutex<std::sync::mpsc::Sender<WriterMsg>>>, mut record: serde_json::Value) {
         record["ts_ms"] = serde_json::json!(now_ms());
-        let Ok(mut file) = file.lock() else { return };
-        let _ = writeln!(file, "{record}");
+        let line = record.to_string();
+        let Ok(tx) = tx.lock() else { return };
+        let _ = tx.send(WriterMsg::Line(line));
     }
 }
 
@@ -260,7 +309,7 @@ fn attr_to_json(value: &AttrValue) -> serde_json::Value {
 }
 
 struct JsonlSpan {
-    file: Arc<Mutex<std::fs::File>>,
+    tx: Arc<Mutex<std::sync::mpsc::Sender<WriterMsg>>>,
     name: String,
     started_ms: u128,
     /// span 生命周期内追加的属性（end 时随结束记录一并落盘）
@@ -294,7 +343,7 @@ impl JsonlSpan {
             "attrs": attrs_to_json(&attrs),
             "error": error,
         });
-        JsonlTelemetry::write(&self.file, record);
+        JsonlTelemetry::enqueue(&self.tx, record);
     }
 }
 
@@ -306,9 +355,9 @@ impl Telemetry for JsonlTelemetry {
             "name": name,
             "attrs": attrs_to_json(&attributes),
         });
-        Self::write(&self.file, record);
+        Self::enqueue(&self.tx, record);
         Box::new(JsonlSpan {
-            file: Arc::clone(&self.file),
+            tx: Arc::clone(&self.tx),
             name: name.to_string(),
             started_ms: now_ms(),
             attrs: Mutex::new(Vec::new()),
@@ -321,7 +370,7 @@ impl Telemetry for JsonlTelemetry {
             "name": name,
             "attrs": attrs_to_json(&attributes),
         });
-        Self::write(&self.file, record);
+        Self::enqueue(&self.tx, record);
     }
 }
 
@@ -374,6 +423,52 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_span_creation_no_index_misplacement() {
+        // 回归：push 与取索引曾分两次加锁，并发创建 span 时索引互相
+        // 错配——线程 A 的 span 拿到线程 B 的索引，属性写错对象。
+        // 修复后每个 span 的构造属性必须与其名字一一对应。
+        let tel = RecordingTelemetry::new();
+        let shared = std::sync::Arc::new(tel);
+        let handles: Vec<_> = (0..8u64)
+            .map(|i| {
+                let t = std::sync::Arc::clone(&shared);
+                std::thread::spawn(move || {
+                    for n in 0..100 {
+                        let name = format!("span-{i}");
+                        let marker = format!("{i}:{n}");
+                        let span = t.span(&name, attrs(&[("marker", AttrValue::from(marker))]));
+                        span.end();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let log = shared.log();
+        assert_eq!(log.spans.len(), 800, "8 threads x 100 spans");
+        for record in &log.spans {
+            // 构造属性里的 marker 前缀必须与 span 名字的编号一致
+            let expected_prefix = record.name.trim_start_matches("span-");
+            let marker = record
+                .attributes
+                .iter()
+                .find(|(k, _)| k == "marker")
+                .map(|(_, v)| match v {
+                    AttrValue::Str(s) => s.clone(),
+                    other => format!("{other:?}"),
+                })
+                .unwrap_or_default();
+            assert!(
+                marker.starts_with(&format!("{expected_prefix}:")),
+                "span '{}' got misplaced marker '{}'",
+                record.name,
+                marker
+            );
+        }
+    }
+
+    #[test]
     fn jsonl_backend_writes_records() {
         let dir = std::env::temp_dir().join(format!(
             "baiji-telemetry-test-{}",
@@ -396,6 +491,7 @@ mod tests {
 
             let failed = tel.span("agent.run", vec![]);
             Box::new(failed).end_with_error("boom");
+            tel.flush();
         }
 
         let content = std::fs::read_to_string(&path).expect("read back");
@@ -434,7 +530,47 @@ mod tests {
         let path = dir.join("a/b/trace.jsonl");
         let tel = JsonlTelemetry::open(&path).expect("open with nested dirs");
         tel.event("boot", vec![]);
+        tel.flush();
         assert!(path.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn jsonl_backend_writer_survives_clones() {
+        // Telemetry 以 Arc<dyn Telemetry> 共享：克隆句柄写入的记录
+        // 也要落盘，且 flush 排空后文件内容完整、逐行可解析
+        let dir = std::env::temp_dir().join(format!(
+            "baiji-telemetry-clones-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("trace.jsonl");
+        {
+            let tel = std::sync::Arc::new(JsonlTelemetry::open(&path).expect("open"));
+            let clones: Vec<_> = (0..4u64)
+                .map(|i| {
+                    let t = std::sync::Arc::clone(&tel);
+                    std::thread::spawn(move || {
+                        for n in 0..50 {
+                            t.event("concurrent", attrs(&[("i", AttrValue::Uint(i * 100 + n))]));
+                        }
+                    })
+                })
+                .collect();
+            for handle in clones {
+                handle.join().unwrap();
+            }
+            tel.flush();
+        }
+        let content = std::fs::read_to_string(&path).expect("read back");
+        let count = content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter(|l| serde_json::from_str::<serde_json::Value>(l).is_ok())
+            .count();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(count, 200, "4 threads x 50 events, all persisted");
     }
 }
