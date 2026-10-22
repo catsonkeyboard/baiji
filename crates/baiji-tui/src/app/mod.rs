@@ -91,6 +91,8 @@ pub(crate) enum UiEvent {
 
 pub struct App {
     harness: Arc<tokio::sync::Mutex<AgentHarness>>,
+    /// 与 todo 工具共享存储，渲染时不再争用运行期间持有的 harness 锁。
+    todos: Option<Arc<baiji_harness::TodoStore>>,
     /// 最近一次 LLM 调用的真实上下文占用（厂商上报；0 = 尚无数据）
     context_tokens: u64,
     /// 用户 prompt 模板：(调用名, 描述)
@@ -206,8 +208,10 @@ impl App {
             .unwrap_or_default();
         // 初始门控状态跟随 runtime（headless `--plan` 同样进 TUI 时镜像为真）
         let plan_mode = harness.try_lock().is_ok_and(|h| h.plan_mode());
+        let todos = harness.try_lock().ok().and_then(|h| h.todo_store());
         Self {
             harness,
+            todos,
             context_tokens: 0,
             templates,
             status_hint,
@@ -1472,11 +1476,11 @@ impl App {
         self.frame
     }
 
-    /// 当前任务清单快照（右上角悬浮面板；锁忙时跳过本帧）
+    /// 当前任务清单快照（右上角悬浮面板；运行中也直接读取工具的实时状态）。
     pub(crate) fn todo_items(&self) -> Vec<baiji_harness::TodoItem> {
-        self.harness
-            .try_lock()
-            .map(|h| h.todos_snapshot())
+        self.todos
+            .as_ref()
+            .map(|todos| todos.items())
             .unwrap_or_default()
     }
 

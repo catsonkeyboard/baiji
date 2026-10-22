@@ -415,6 +415,12 @@ impl AgentHarness {
         self.todos = Some(store);
     }
 
+    /// 共享任务存储句柄：UI 可在 run 持有 harness 锁期间读取实时状态。
+    /// 会话切换/新建仍更新同一存储，持有此句柄的观察者随之同步。
+    pub fn todo_store(&self) -> Option<Arc<TodoStore>> {
+        self.todos.clone()
+    }
+
     /// 是否有未完成任务（自动接力的判定条件）
     pub fn has_open_todos(&self) -> bool {
         self.todos.as_ref().is_some_and(|t| t.has_open())

@@ -36,6 +36,10 @@ impl Provider for Echo {
 fn test_app(dir: &std::path::Path) -> App {
     let runtime = Arc::new(AgentRuntime::new(Arc::new(Echo)).with_tools(ToolRegistry::new()));
     let harness = AgentHarness::new(runtime, dir.join("sessions")).unwrap();
+    app_with_harness(dir, harness)
+}
+
+fn app_with_harness(dir: &std::path::Path, harness: AgentHarness) -> App {
     App::new(
         Arc::new(tokio::sync::Mutex::new(harness)),
         Theme::dark(),
@@ -102,6 +106,163 @@ fn call(id: &str, text: &str) -> ChatLine {
 
 fn result(text: &str) -> ChatLine {
     ChatLine::Tool(text.to_string())
+}
+
+#[tokio::test]
+async fn test_todo_panel_updates_during_run_and_follows_sessions() {
+    use baiji_harness::{TodoStatus, TodoStore, TodoTool};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Semaphore;
+
+    // Each request waits for a permit so the UI can render between real todo calls,
+    // while spawn_run still holds the harness lock for the entire run.
+    struct TodoProvider {
+        requests: UnboundedSender<usize>,
+        permits: Arc<Semaphore>,
+        turn: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for TodoProvider {
+        async fn chat(&self, _: ChatRequest) -> anyhow::Result<ChatResponse> {
+            unreachable!()
+        }
+
+        async fn chat_stream(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<BoxStream<'static, anyhow::Result<StreamChunk>>> {
+            let turn = self.turn.fetch_add(1, Ordering::SeqCst);
+            self.requests.send(turn)?;
+            self.permits.acquire().await?.forget();
+            let args = match turn {
+                0 => Some(json!({"action": "add", "content": "Build feature"})),
+                1 => Some(json!({"action": "update", "id": 1, "status": "in_progress"})),
+                2 => Some(json!({"action": "update", "id": 1, "status": "done"})),
+                _ => None,
+            };
+            let chunks = if let Some(args) = args {
+                let id = format!("todo-{turn}");
+                vec![
+                    StreamChunk::ToolCallStart {
+                        id: id.clone(),
+                        name: "todo".into(),
+                    },
+                    StreamChunk::ToolCallArguments {
+                        id,
+                        arguments: args.to_string(),
+                    },
+                    StreamChunk::Done,
+                ]
+            } else {
+                vec![StreamChunk::Content("Finished".into()), StreamChunk::Done]
+            };
+            Ok(futures::stream::iter(chunks.into_iter().map(Ok)).boxed())
+        }
+
+        fn protocol(&self) -> Protocol {
+            Protocol::OpenAIChat
+        }
+        fn model(&self) -> &str {
+            "mock"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let (requests_tx, mut requests_rx) = mpsc::unbounded_channel();
+    let permits = Arc::new(Semaphore::new(0));
+    let provider = Arc::new(TodoProvider {
+        requests: requests_tx,
+        permits: permits.clone(),
+        turn: AtomicUsize::new(0),
+    });
+    let todos = Arc::new(TodoStore::new());
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(TodoTool::new(todos.clone())));
+    let runtime = Arc::new(AgentRuntime::new(provider).with_tools(tools));
+    let mut harness = AgentHarness::new(runtime, dir.path().join("sessions")).unwrap();
+    harness.set_todos(todos);
+    let mut app = app_with_harness(dir.path(), harness);
+    let session_id = app.session_id.clone();
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+
+    app.spawn_run("Build a feature".into(), ui_tx.clone());
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), requests_rx.recv())
+            .await
+            .unwrap(),
+        Some(0)
+    );
+    assert!(
+        !draw(&mut app, &mut terminal)
+            .iter()
+            .any(|r| r.contains("Todo"))
+    );
+
+    for (turn, mark, status) in [
+        (1, "○", TodoStatus::Pending),
+        (2, "◉", TodoStatus::InProgress),
+        (3, "✓", TodoStatus::Done),
+    ] {
+        permits.add_permits(1);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), requests_rx.recv())
+                .await
+                .unwrap(),
+            Some(turn)
+        );
+        while let Ok(UiEvent::Agent(event)) = ui_rx.try_recv() {
+            app.on_agent_event(event, &ui_tx);
+        }
+        assert!(app.agent_running);
+        assert!(
+            app.harness.try_lock().is_err(),
+            "run must still hold the lock"
+        );
+        let rows = draw(&mut app, &mut terminal);
+        assert!(rows.iter().any(|r| r.contains("Todo")), "{rows:?}");
+        assert!(
+            rows.iter()
+                .any(|r| r.contains(&format!("{mark} Build feature"))),
+            "{rows:?}"
+        );
+        assert_eq!(app.todo_items()[0].status, status);
+    }
+
+    permits.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while app.agent_running {
+            let Some(UiEvent::Agent(event)) = ui_rx.recv().await else {
+                panic!("agent event channel closed before run completed");
+            };
+            app.on_agent_event(event, &ui_tx);
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        draw(&mut app, &mut terminal)
+            .iter()
+            .any(|r| r.contains("✓ Build feature"))
+    );
+
+    // The shared handle must follow session resets and restores, without stale rows.
+    app.handle_slash("new", "", &ui_tx).await;
+    assert!(
+        !draw(&mut app, &mut terminal)
+            .iter()
+            .any(|r| r.contains("Todo"))
+    );
+    app.switch_session(&session_id).await;
+    assert!(
+        draw(&mut app, &mut terminal)
+            .iter()
+            .any(|r| r.contains("✓ Build feature"))
+    );
 }
 
 #[tokio::test]
