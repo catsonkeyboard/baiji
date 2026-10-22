@@ -418,7 +418,12 @@ impl App {
             if wizard_input_step_intercept(key.code) {
                 match key.code {
                     KeyCode::Enter => self.wizard_enter(ui_tx).await,
-                    _ => self.wizard = None, // Esc
+                    // Esc：输入框里是给向导的内容（可能是 API key），随向导一起丢弃，
+                    // 不能留给下一次回车当普通消息发出
+                    _ => {
+                        self.wizard = None;
+                        self.input.clear();
+                    }
                 }
                 return false;
             }

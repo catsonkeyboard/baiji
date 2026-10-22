@@ -590,3 +590,29 @@ async fn test_esc_redirect_keeps_the_follow_up_run_running() {
     );
     app.cancel.cancel();
 }
+
+/// /config 输入 API key 时按 Esc：key 不能留在输入框里——否则下一次回车会把它
+/// 当普通消息发给模型，写进会话 JSONL 和 prompt-history.jsonl
+#[tokio::test]
+async fn test_esc_in_wizard_input_step_discards_the_typed_text() {
+    let dir = tempfile::tempdir().unwrap();
+    for step in [WizardStep::Key, WizardStep::ModelManual] {
+        let mut app = test_app(dir.path());
+        app.wizard = Some(ConfigWizard::new("glm", None));
+        app.wizard.as_mut().unwrap().step = step.clone();
+        type_str(&mut app, "sk-secret-123").await;
+        assert_eq!(app.input.text(), "sk-secret-123");
+
+        press(&mut app, K::Esc, M::NONE).await;
+        assert!(app.wizard.is_none(), "{step:?}");
+        assert!(
+            app.input.is_empty(),
+            "{step:?}: typed text must not survive"
+        );
+        press(&mut app, K::Enter, M::NONE).await;
+        assert!(
+            user_lines(&app).is_empty(),
+            "{step:?}: nothing is submitted"
+        );
+    }
+}
