@@ -347,3 +347,12 @@ fn short_options_with_inside_or_non_path_values_stay_read_only() {
         assert!(is_read_only(cmd, &policy), "should be read-only: {cmd}");
     }
 }
+
+#[test]
+fn roots_match_byte_wise_even_where_the_file_system_ignores_case() {
+    // A differently-cased root may be another directory on a case-sensitive
+    // volume (e.g. under /Volumes), so it is never auto-approved.
+    let policy = policy();
+    assert!(is_read_only("cat /home/u/proj/README.md", &policy));
+    assert!(!is_read_only("cat /HOME/U/PROJ/README.md", &policy));
+}

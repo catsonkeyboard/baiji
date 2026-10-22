@@ -429,6 +429,8 @@ fn looks_like_path(text: &str) -> bool {
     text.starts_with('/') || text.starts_with('~') || text.contains("..")
 }
 
+/// Byte-wise even on case-insensitive systems: a differently-cased path may
+/// be another directory on a case-sensitive volume, and a miss only asks.
 fn path_inside_roots(raw: &str, policy: &ReadOnlyPolicy, ctx: &RiskContext) -> bool {
     if raw == "/dev/null" {
         return true;

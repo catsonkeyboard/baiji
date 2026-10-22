@@ -280,3 +280,49 @@ fn known_variables_do_not_bypass_protected_paths() {
         RiskLevel::Catastrophic
     );
 }
+
+fn mac_ctx() -> RiskContext {
+    RiskContext {
+        scratch_dir: None,
+        working_dir: Some(PathBuf::from("/Users/u/proj")),
+        home_dir: Some(PathBuf::from("/Users/u")),
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[test]
+fn protected_paths_ignore_case_where_the_file_system_does() {
+    // APFS (macOS default) and NTFS are case-insensitive: `/users/u` is the
+    // home directory and `~/.SSH` is the credential store.
+    let ctx = mac_ctx();
+    for p in [
+        "/users/u",
+        "/USERS/U",
+        "/Users/u/.SSH",
+        "/users/u/.Ssh/id_ed25519",
+        "/Users/u/.CONFIG",
+        "/Users/u/documents",
+        "/ETC",
+        "/etc/PASSWD",
+        "/library",
+        "/SYSTEM/Library/x",
+        "/USR/bin",
+        "/users",
+    ] {
+        assert!(is_catastrophic_target(Path::new(p), &ctx), "{p}");
+    }
+    for p in ["/users/u/proj/target", "/Users/u/.CONFIG/app/settings.toml"] {
+        assert!(!is_catastrophic_target(Path::new(p), &ctx), "{p}");
+    }
+    // `~U` names the current user too; the shell resolves it case-insensitively.
+    assert_eq!(expand("~U/.ssh", &ctx), PathBuf::from("/Users/u/.ssh"));
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[test]
+fn protected_paths_are_case_sensitive_elsewhere() {
+    let ctx = mac_ctx();
+    for p in ["/users/u", "/Users/u/.SSH", "/ETC"] {
+        assert!(!is_catastrophic_target(Path::new(p), &ctx), "{p}");
+    }
+}

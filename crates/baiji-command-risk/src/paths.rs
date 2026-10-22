@@ -58,6 +58,23 @@ const SYSTEM_PATHS_PROTECTED_RECURSIVELY: &[&str] = &[
     "/var/lib", "/System", "/Library",
 ];
 
+/// APFS (the macOS default) and NTFS ignore case: `/users/u` is the home
+/// directory and `~/.SSH` the credential store. Linux file systems do not.
+const CASE_INSENSITIVE_FS: bool = cfg!(any(target_os = "macos", target_os = "windows"));
+
+/// `path` in the form protected paths are compared in: lowercased where the
+/// file system ignores case. Used only where a looser match gives the stricter
+/// verdict (protected and home paths); working-directory and temp-directory
+/// matching stay byte-wise, since folding there could only relax a verdict and
+/// would be wrong on a case-sensitive volume.
+fn fold_case(path: &Path) -> PathBuf {
+    if CASE_INSENSITIVE_FS {
+        PathBuf::from(path.to_string_lossy().to_lowercase())
+    } else {
+        path.to_path_buf()
+    }
+}
+
 /// The set of paths this policy protects, exposed for testing and docs.
 pub struct ProtectedPaths;
 
@@ -122,11 +139,14 @@ fn expand_known_prefix(raw: &str, ctx: &RiskContext) -> String {
         }
         // `~name` naming the current user is the home directory too:
         // `rm -rf ~alice` must not slip past the home check as a relative path.
+        // macOS resolves the name case-insensitively (`~ALICE`).
         if let Some(user) = home.file_name().and_then(|n| n.to_str())
-            && let Some(rest) = raw.strip_prefix('~').and_then(|r| r.strip_prefix(user))
-            && (rest.is_empty() || rest.starts_with('/'))
+            && let Some(named) = raw.strip_prefix('~')
         {
-            return format!("{}{rest}", home.display());
+            let (name, rest) = named.split_at(named.find('/').unwrap_or(named.len()));
+            if name == user || (CASE_INSENSITIVE_FS && name.to_lowercase() == user.to_lowercase()) {
+                return format!("{}{rest}", home.display());
+            }
         }
     }
     raw.to_string()
@@ -159,18 +179,19 @@ fn normalize(path: &Path) -> PathBuf {
 /// Exposed separately because this is the single most important predicate in
 /// the crate and deserves to be testable in isolation.
 pub fn is_catastrophic_target(path: &Path, ctx: &RiskContext) -> bool {
-    let path = normalize(path);
+    let path = fold_case(&normalize(path));
+    let protected = |p: &str| fold_case(Path::new(p));
 
     // Exact system roots, plus anything inside the ones whose contents are as
     // unrecoverable as the directory itself (`/etc/passwd`). `/home` and
     // `/Users` are deliberately not recursive: a user's own project lives
     // under them, and the home directory itself is handled below.
-    if PROTECTED_SYSTEM_PATHS.iter().any(|p| path == Path::new(p)) {
+    if PROTECTED_SYSTEM_PATHS.iter().any(|p| path == protected(p)) {
         return true;
     }
     if SYSTEM_PATHS_PROTECTED_RECURSIVELY
         .iter()
-        .any(|p| path.starts_with(p))
+        .any(|p| path.starts_with(protected(p)))
     {
         return true;
     }
@@ -178,7 +199,7 @@ pub fn is_catastrophic_target(path: &Path, ctx: &RiskContext) -> bool {
     let Some(home) = &ctx.home_dir else {
         return false;
     };
-    let home = normalize(home);
+    let home = fold_case(&normalize(home));
 
     // The home directory itself.
     if path == home {
@@ -187,14 +208,14 @@ pub fn is_catastrophic_target(path: &Path, ctx: &RiskContext) -> bool {
     // Credential stores, including anything inside them.
     if PROTECTED_CREDENTIAL_SUBPATHS
         .iter()
-        .any(|sub| path.starts_with(home.join(sub)))
+        .any(|sub| path.starts_with(home.join(protected(sub))))
     {
         return true;
     }
     // Config and document roots, but not their individual files.
     PROTECTED_HOME_SUBPATHS
         .iter()
-        .any(|sub| path == home.join(sub))
+        .any(|sub| path == home.join(protected(sub)))
 }
 
 /// Classify one resolved target, returning a finding when it is notable.

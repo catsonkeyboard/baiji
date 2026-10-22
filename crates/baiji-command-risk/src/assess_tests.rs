@@ -911,3 +911,34 @@ fn xargs_and_stdbuf_option_values_are_not_taken_for_the_program() {
         assert!(level(command) >= RiskLevel::Confirm, "{command:?}");
     }
 }
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[test]
+fn differently_cased_protected_paths_are_blocked_on_case_insensitive_file_systems() {
+    let ctx = RiskContext {
+        working_dir: Some(PathBuf::from("/Users/u/proj")),
+        home_dir: Some(PathBuf::from("/Users/u")),
+        scratch_dir: None,
+    };
+    for cmd in [
+        "rm -rf /users/u",
+        "rm -rf /USERS/U/",
+        "rm -rf ~/.SSH",
+        "shred /users/u/.Ssh/id_rsa",
+        "rm -rf /users/u/*",
+        "rm -rf ~U",
+        "rm -rf /ETC",
+        "rm -rf /library",
+        "dd if=disk.img of=/DEV/disk0",
+    ] {
+        assert_eq!(assess(cmd, &ctx).level, RiskLevel::Catastrophic, "{cmd}");
+    }
+    for cmd in [
+        "rm -rf target",
+        "rm -rf /Users/u/proj/build",
+        "rm -rf /users/u/proj/build",
+        "rm -f /Users/u/.CONFIG/app/stale.toml",
+    ] {
+        assert!(assess(cmd, &ctx).level.runs_immediately(), "{cmd}");
+    }
+}
