@@ -10,7 +10,7 @@
 
 
 
-![Tests](https://img.shields.io/badge/tests-664_passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-677_passing-brightgreen)
 
 ---
 
@@ -158,7 +158,7 @@ Between runs, `AgentHarness` handles compaction (keep recent N turns intact, fol
 
 ```bash
 cargo build                # Build the whole workspace
-cargo test --workspace     # Run all tests (664 total, zero warnings)
+cargo test --workspace     # Run all tests (677 total, zero warnings)
 cargo test -p baiji-agent  # Test a single crate
 RUST_LOG=debug cargo run   # Debug logs → ~/.baiji/logs/ (never pollutes the project dir)
 cargo build --release      # Optimized build
