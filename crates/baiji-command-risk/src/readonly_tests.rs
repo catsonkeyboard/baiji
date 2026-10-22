@@ -253,3 +253,97 @@ fn descriptor_duplication_sinks_are_read_only_but_file_redirects_are_not() {
         assert!(!is_read_only(cmd, &policy), "must not be read-only: {cmd}");
     }
 }
+
+#[test]
+fn abbreviated_long_options_are_the_options_they_abbreviate() {
+    // getopt_long and git's parse-options accept any unambiguous prefix of a
+    // long option: `sort --outp=x.txt` writes x.txt.
+    let policy = policy();
+    for cmd in [
+        "sort --outp=x.txt in.txt",
+        "sort --outp x.txt in.txt",
+        "sort --o=x.txt in.txt",
+        "sort --compress-prog=./x big.txt",
+        "git grep --open-files=sh -l TODO",
+        "git grep --open -l TODO",
+        "git log --conf=core.pager=sh",
+        "git diff --ext",
+        "git diff --outp=patch.diff",
+        "wc --files0=list.txt",
+        "wc --files=list.txt",
+        "du --files0-f=list.txt",
+        "tree --out=x.html src",
+        "file --compi x",
+        "file --magic=x y",
+        "date --se=2020-01-01",
+    ] {
+        assert!(!is_read_only(cmd, &policy), "must not be read-only: {cmd}");
+    }
+}
+
+#[test]
+fn ordinary_long_options_stay_read_only() {
+    let policy = policy();
+    for cmd in [
+        "sort -n in.txt",
+        "sort --numeric-sort in.txt",
+        "grep --count TODO src",
+        "grep --color=never -rn TODO src",
+        "grep --context=2 foo src",
+        "grep --only-matching foo src",
+        "grep -- -foo src",
+        "git log --oneline -5",
+        "git diff --stat",
+        "git diff --exit-code",
+        "ls --color=auto src",
+        // ripgrep matches long flags exactly: `--files` is not `--files0-from`
+        "rg --files",
+        "rg --files src",
+        "rg --pretty foo src",
+    ] {
+        assert!(is_read_only(cmd, &policy), "should be read-only: {cmd}");
+    }
+}
+
+#[test]
+fn values_attached_to_short_options_are_path_checked() {
+    // `grep -f/etc/hosts` reads /etc/hosts; `file -f<list>` echoes each line
+    // of the list file in its errors.
+    let policy = policy();
+    for cmd in [
+        "grep -f/etc/hosts x",
+        "grep -rf/etc/hosts x",
+        "file -f/etc/hosts",
+        "rg -f/etc/hosts x",
+        "git grep -f/etc/hosts TODO",
+        "diff -X/etc/hosts a b",
+        "sort -T/etc in.txt",
+        "grep -f../other/patterns x",
+        "grep -f.. x",
+        "grep -f~/.ssh/id_rsa x",
+        "grep -fsub/../../../etc/hosts x",
+        "grep -f/home/u/proj/../../../etc/hosts x",
+    ] {
+        assert!(!is_read_only(cmd, &policy), "must not be read-only: {cmd}");
+    }
+}
+
+#[test]
+fn short_options_with_inside_or_non_path_values_stay_read_only() {
+    let policy = policy();
+    for cmd in [
+        "grep -rn TODO src",
+        "grep -e foo src",
+        "grep -efoo src",
+        "grep -A3 foo src",
+        "head -n5 src/main.rs",
+        "tail -n+5 log.txt",
+        "sort -k2,2 -t, data.csv",
+        // a lone `/` is a delimiter here; opened as a file it is EISDIR
+        "cut -d/ -f2 paths.txt",
+        "grep -fpatterns.txt src",
+        "grep -f/home/u/proj/patterns.txt src",
+    ] {
+        assert!(is_read_only(cmd, &policy), "should be read-only: {cmd}");
+    }
+}

@@ -219,7 +219,7 @@ fn segment_is_read_only(tokens: &[Token], policy: &ReadOnlyPolicy, ctx: &RiskCon
         name if READ_ONLY_PROGRAMS.contains(&name) => {
             // `tail -f` never exits on its own; the bash timeout ends it,
             // which is harmless but wasteful — still read-only.
-            flags_allowed(name, args) && plain_args_ok(args, policy, ctx)
+            flags_allowed(name, args) && plain_args_ok(name, args, policy, ctx)
         }
         _ => false,
     }
@@ -282,7 +282,7 @@ fn git_is_read_only(args: &[Token], policy: &ReadOnlyPolicy, ctx: &RiskContext) 
             .all(|t| matches!(t.text.as_str(), "-l" | "--list" | "-n")),
         _ => false,
     };
-    read_only && plain_args_ok(rest, policy, ctx)
+    read_only && plain_args_ok("git", rest, policy, ctx)
 }
 
 fn find_is_read_only(args: &[Token], policy: &ReadOnlyPolicy, ctx: &RiskContext) -> bool {
@@ -330,7 +330,7 @@ fn sed_is_print_only(args: &[Token], policy: &ReadOnlyPolicy, ctx: &RiskContext)
     // GNU sed keeps parsing options after the script (`-e 'w /x'`, `-i`, `-f`):
     // everything after the script must be a file operand.
     let rest: Vec<Token> = words.cloned().collect();
-    rest.iter().all(|t| !t.is_flag()) && plain_args_ok(&rest, policy, ctx)
+    rest.iter().all(|t| !t.is_flag()) && plain_args_ok("sed", &rest, policy, ctx)
 }
 
 /// No forbidden short-flag character in any bundle and no forbidden long flag.
@@ -338,9 +338,8 @@ fn flags_allowed(program: &str, args: &[Token]) -> bool {
     let (short, long) = forbidden_flags(program);
     args.iter().filter(|t| t.is_flag()).all(|t| {
         let text = t.text.as_str();
-        if let Some(name) = text.strip_prefix("--") {
-            let name = name.split_once('=').map(|(k, _)| k).unwrap_or(name);
-            !long.iter().any(|l| l.trim_start_matches('-') == name)
+        if text.starts_with("--") {
+            !selects_long_flag(program, text, long)
         } else {
             // `-n` style bundle; for git, `-O<pager>` puts the value right after
             !text[1..].chars().any(|c| short.contains(c))
@@ -348,17 +347,68 @@ fn flags_allowed(program: &str, args: &[Token]) -> bool {
     })
 }
 
+/// Whether `text` (`--name` or `--name=value`) selects one of `dangerous`.
+/// getopt_long and git's parse-options accept any unambiguous prefix of a long
+/// option (`sort --outp=x` is `--output=x`), so every non-empty prefix counts;
+/// a benign option that happens to be a prefix merely asks the user. ripgrep
+/// matches long flags exactly (`rg --files` is not `--files0-from`).
+fn selects_long_flag(program: &str, text: &str, dangerous: &[&str]) -> bool {
+    let Some(name) = text.strip_prefix("--") else {
+        return false;
+    };
+    let name = name.split_once('=').map_or(name, |(key, _)| key);
+    !name.is_empty()
+        && dangerous.iter().any(|flag| {
+            let flag = flag.trim_start_matches('-');
+            if program == "rg" {
+                flag == name
+            } else {
+                flag.starts_with(name)
+            }
+        })
+}
+
+/// `grep -f/etc/hosts`: getopt lets a short option's value follow it in the
+/// same word, after a bundle of other options (`-rf/etc/hosts`). Which letters
+/// take a value is unknown, so every position that could start one is checked:
+/// from the second option character up to the first `/`, which no option
+/// letter can be. A bare `/` (`cut -d/`) is a delimiter; opened as a file it
+/// fails with EISDIR.
+fn attached_values_inside_roots(text: &str, policy: &ReadOnlyPolicy, ctx: &RiskContext) -> bool {
+    let mut chars = text.char_indices().skip(1);
+    if chars.next().is_none_or(|(_, first)| first == '/') {
+        return true;
+    }
+    for (start, c) in chars {
+        let value = &text[start..];
+        if value != "/" && looks_like_path(value) && !path_inside_roots(value, policy, ctx) {
+            return false;
+        }
+        if c == '/' {
+            break;
+        }
+    }
+    true
+}
+
 /// Every flag is non-writing, and every non-flag argument that could be a
 /// path resolves inside the allowed roots.
-fn plain_args_ok(args: &[Token], policy: &ReadOnlyPolicy, ctx: &RiskContext) -> bool {
+fn plain_args_ok(
+    program: &str,
+    args: &[Token],
+    policy: &ReadOnlyPolicy,
+    ctx: &RiskContext,
+) -> bool {
     args.iter().all(|token| {
         let text = token.text.as_str();
         if token.is_operator {
             return true;
         }
         if token.is_flag() {
-            let name = text.split_once('=').map(|(k, _)| k).unwrap_or(text);
-            if WRITING_FLAGS.contains(&name) {
+            if selects_long_flag(program, text, WRITING_FLAGS) {
+                return false;
+            }
+            if !text.starts_with("--") && !attached_values_inside_roots(text, policy, ctx) {
                 return false;
             }
             // `--file=/etc/x`, `--git-dir=…`: check the value like a path.
