@@ -178,3 +178,132 @@ fn inline_code_ranges_pair_equal_backtick_runs() {
     assert_eq!(&text[ranges[0].0..ranges[0].1], "`x`");
     assert_eq!(&text[ranges[1].0..ranges[1].1], "``y ` z``");
 }
+
+/// A complete, otherwise-recoverable envelope used inside documentation.
+const DANGEROUS_ENVELOPE: &str =
+    "<invoke name=\"bash\">\n<parameter name=\"command\">rm -rf build</parameter>\n</invoke>";
+
+#[test]
+fn fence_closes_only_with_same_char_at_least_as_long_and_no_info_string() {
+    // 4 反引号外层围栏里嵌套 ```xml：内层行不能关闭外层
+    let nested = format!(
+        "Show the user how a leak looks:\n````markdown\nThe model printed:\n```xml\n{DANGEROUS_ENVELOPE}\n```\n````\nNever do that."
+    );
+    assert_eq!(scan_tool_call_markup(&nested), MarkupScan::None);
+    // 带 info string 的 ``` 行不是关闭栏
+    let info = format!("```markdown\nRun:\n```bash\n{DANGEROUS_ENVELOPE}\n```\n```");
+    assert_eq!(scan_tool_call_markup(&info), MarkupScan::None);
+    // 更短的波浪线不能关闭更长的波浪线围栏
+    let tilde = format!("~~~~\n~~~ shorter\n{DANGEROUS_ENVELOPE}\n~~~~");
+    assert_eq!(scan_tool_call_markup(&tilde), MarkupScan::None);
+    // 反引号行不能关闭波浪线围栏
+    let mixed = format!("~~~\n```\n{DANGEROUS_ENVELOPE}\n~~~");
+    assert_eq!(scan_tool_call_markup(&mixed), MarkupScan::None);
+    // 未关闭的围栏延续到文本末尾
+    let unclosed = format!("Example:\n```xml\n{DANGEROUS_ENVELOPE}");
+    assert_eq!(scan_tool_call_markup(&unclosed), MarkupScan::None);
+}
+
+#[test]
+fn fences_in_lists_and_blockquotes_and_indented_code_are_code() {
+    let in_list = format!(
+        "Steps:\n1. ```xml\n   {}\n   ```\n2. Done.",
+        DANGEROUS_ENVELOPE.replace('\n', "\n   ")
+    );
+    assert_eq!(scan_tool_call_markup(&in_list), MarkupScan::None);
+    let quoted = format!(
+        "> ```xml\n> {}\n> ```",
+        DANGEROUS_ENVELOPE.replace('\n', "\n> ")
+    );
+    assert_eq!(scan_tool_call_markup(&quoted), MarkupScan::None);
+    let indented = format!(
+        "The format is:\n\n    {}\n\nThat is all.",
+        DANGEROUS_ENVELOPE.replace('\n', "\n    ")
+    );
+    assert_eq!(scan_tool_call_markup(&indented), MarkupScan::None);
+    // 同样适用于 to=functions 信封
+    assert!(
+        parse_text_wrapped_tool_call(
+            "Leaks look like:\n\n    to=functions.bash {\"command\": \"ls\"}"
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn pretty_printed_envelope_indentation_is_not_code() {
+    // 缩进 4 格但紧跟非空行：不能打断段落，仍是真实信封
+    let text = "<function_calls>\n  <invoke name=\"bash\">\n    <parameter name=\"command\">ls</parameter>\n    <parameter name=\"timeout\">5</parameter>\n  </invoke>\n</function_calls>";
+    let MarkupScan::Parsed { calls, .. } = scan_tool_call_markup(text) else {
+        panic!("expected Parsed");
+    };
+    assert_eq!(calls[0].arguments, json!({"command": "ls", "timeout": 5}));
+}
+
+#[test]
+fn backtick_before_closing_parameter_does_not_swallow_it() {
+    let text = "<invoke name=\"edit\">\n<parameter name=\"path\">README.md</parameter>\n<parameter name=\"old_string\">run tests</parameter>\n<parameter name=\"new_string\">run `cargo test`</parameter>\n<parameter name=\"replace_all\">false</parameter>\n</invoke>";
+    let MarkupScan::Parsed { calls, .. } = scan_tool_call_markup(text) else {
+        panic!("expected Parsed");
+    };
+    assert_eq!(
+        calls[0].arguments,
+        json!({
+            "path": "README.md",
+            "old_string": "run tests",
+            "new_string": "run `cargo test`",
+            "replace_all": false,
+        })
+    );
+}
+
+#[test]
+fn fence_line_right_before_closing_parameter_does_not_swallow_it() {
+    let text = "<invoke name=\"write\">\n<parameter name=\"content\">Example:\n```bash\ncargo test\n```</parameter>\n<parameter name=\"path\">notes.md</parameter>\n</invoke>";
+    let MarkupScan::Parsed { calls, .. } = scan_tool_call_markup(text) else {
+        panic!("expected Parsed");
+    };
+    assert_eq!(
+        calls[0].arguments,
+        json!({"content": "Example:\n```bash\ncargo test\n```", "path": "notes.md"})
+    );
+    // 值紧跟开标签、以围栏开头（DSML 常见写法）
+    let dsml = "<｜DSML｜invoke name=\"write\">\n<｜DSML｜parameter name=\"content\" string=\"true\">```bash\ncargo test\n```</｜DSML｜parameter>\n<｜DSML｜parameter name=\"path\" string=\"true\">notes.md</｜DSML｜parameter>\n</｜DSML｜invoke>";
+    let MarkupScan::Parsed { calls, .. } = scan_tool_call_markup(dsml) else {
+        panic!("expected Parsed");
+    };
+    assert_eq!(
+        calls[0].arguments,
+        json!({"content": "```bash\ncargo test\n```", "path": "notes.md"})
+    );
+    // 值里是完整的围栏、关闭标签另起一行
+    let balanced = "<invoke name=\"write\">\n<parameter name=\"content\">\n```js\nlet a = `x`;\n```\n</parameter>\n<parameter name=\"path\">a.md</parameter>\n</invoke>";
+    let MarkupScan::Parsed { calls, .. } = scan_tool_call_markup(balanced) else {
+        panic!("expected Parsed");
+    };
+    assert_eq!(
+        calls[0].arguments,
+        json!({"content": "\n```js\nlet a = `x`;\n```\n", "path": "a.md"})
+    );
+}
+
+#[test]
+fn raw_parameter_value_cannot_reopen_prose_inside_a_code_example() {
+    // 正文提到标签名、紧接着是代码示例：值按原文截到示例里的 </parameter>，
+    // 但示例剩下的部分仍是代码，绝不能拼出一个可执行的调用
+    let fenced = "Wrap it as <invoke name=\"bash\"> with a <parameter name=\"command\"> child:\n```xml\n<parameter name=\"command\">rm -rf build</parameter>\n</invoke>\n```";
+    assert!(!matches!(
+        scan_tool_call_markup(fenced),
+        MarkupScan::Parsed { .. }
+    ));
+    let inline = "Use <invoke name=\"bash\"> with <parameter name=\"command\"> as in `<parameter name=\"command\">rm -rf build</parameter></invoke>`.";
+    assert!(!matches!(
+        scan_tool_call_markup(inline),
+        MarkupScan::Parsed { .. }
+    ));
+    let indented = "Use <invoke name=\"bash\"> and a <parameter name=\"command\"> child, e.g.\n\n    <parameter name=\"command\">rm -rf build</parameter>\n    </invoke>";
+    assert!(!matches!(
+        scan_tool_call_markup(indented),
+        MarkupScan::Parsed { .. }
+    ));
+}

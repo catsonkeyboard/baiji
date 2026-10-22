@@ -1862,3 +1862,34 @@ async fn test_recovered_markup_replaces_streamed_text_for_the_ui() {
     ));
     assert!(matches!(&events[restart + 2], AgentEvent::ToolStarted { name, .. } if name == "append"));
 }
+
+#[tokio::test]
+async fn test_nested_fenced_markup_example_in_final_answer_is_not_executed() {
+    let answer = "A leaked call looks like this:\n````markdown\nThe model printed:\n```xml\n<invoke name=\"append\">\n<parameter name=\"text\">hi</parameter>\n</invoke>\n```\n````\nNever print calls as text.";
+    let provider = Arc::new(SeqProvider::new(vec![text(answer)]));
+    let (result, history) = run_seq(provider.clone(), append_tools(), &SteeringQueue::new()).await;
+    assert_eq!(result.unwrap(), answer);
+    assert_eq!(history.len(), 2, "the example must not run as a tool call");
+    assert!(history[1].tool_calls.as_ref().is_none_or(|c| c.is_empty()));
+    assert_eq!(provider.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_recovered_markup_value_ending_in_inline_code_is_exact() {
+    let provider = Arc::new(SeqProvider::new(vec![
+        text(
+            "<invoke name=\"append\">\n<parameter name=\"text\">run `cargo test`</parameter>\n<parameter name=\"mode\">x</parameter>\n</invoke>",
+        ),
+        text("done"),
+    ]));
+    let (answer, history) = run_seq(provider, append_tools(), &SteeringQueue::new()).await;
+    assert_eq!(answer.unwrap(), "done");
+    assert_eq!(
+        history[1].tool_calls.as_ref().unwrap()[0].arguments,
+        serde_json::json!({"text": "run `cargo test`", "mode": "x"})
+    );
+    assert_eq!(
+        history[2].tool_results.as_ref().unwrap()[0].content,
+        "appended:run `cargo test`"
+    );
+}

@@ -76,33 +76,169 @@ static ATTR_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"([A-Za-z_][\w-]*)\s*=\s*"([^"]*)""#).expect("valid tool markup attr regex")
 });
 
-/// Byte ranges covered by fenced code blocks (``` or ~~~). Markup inside them
-/// is documentation the model is showing, not a call it is making.
-fn fenced_code_ranges(text: &str) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::new();
-    let mut open: Option<(usize, &str)> = None;
-    let mut offset = 0usize;
-    for line in text.split_inclusive('\n') {
-        let trimmed = line.trim_start();
-        let fence = if trimmed.starts_with("```") {
-            Some("```")
-        } else if trimmed.starts_with("~~~") {
-            Some("~~~")
-        } else {
-            None
-        };
-        match (open, fence) {
-            (None, Some(f)) => open = Some((offset, f)),
-            (Some((start, f)), Some(g)) if f == g => {
-                ranges.push((start, offset + line.len()));
-                open = None;
+/// An open fenced code block: fence char, run length, column of the run and
+/// blockquote depth of the opening line.
+#[derive(Debug, Clone, Copy)]
+struct Fence {
+    ch: u8,
+    len: usize,
+    col: usize,
+    depth: usize,
+}
+
+/// Skip a line's indentation and blockquote markers (and list markers when
+/// `list_markers`): returns (byte offset of the content, its column, quote
+/// depth). Container structure is not parsed; this only locates the fence.
+fn container_prefix(line: &str, list_markers: bool) -> (usize, usize, usize) {
+    let bytes = line.as_bytes();
+    let (mut i, mut col, mut depth) = (0usize, 0usize, 0usize);
+    loop {
+        while let Some(&b) = bytes.get(i) {
+            match b {
+                b' ' => col += 1,
+                b'\t' => col += 4 - col % 4,
+                _ => break,
             }
-            _ => {}
+            i += 1;
         }
-        offset += line.len();
+        if bytes.get(i) == Some(&b'>') {
+            depth += 1;
+            i += 1;
+            col += 1;
+            continue;
+        }
+        let rest = &bytes[i..];
+        let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+        let marker = match rest.first() {
+            Some(b'-' | b'+' | b'*') => 1,
+            _ if (1..=9).contains(&digits) && matches!(rest.get(digits), Some(b'.' | b')')) => {
+                digits + 1
+            }
+            _ => 0,
+        };
+        if list_markers && marker > 0 && matches!(rest.get(marker), Some(b' ' | b'\t')) {
+            i += marker;
+            col += marker;
+            continue;
+        }
+        return (i, col, depth);
     }
-    if let Some((start, _)) = open {
-        ranges.push((start, text.len()));
+}
+
+/// CommonMark opening fence: ≥3 backticks or ≥3 tildes; a backtick fence's
+/// info string must not contain backticks. Indentation is not capped at 3
+/// columns because list nesting is not parsed — over-detecting code is the
+/// safe direction.
+fn fence_opener(line: &str) -> Option<Fence> {
+    let (i, col, depth) = container_prefix(line, true);
+    let rest = &line[i..];
+    let ch = *rest.as_bytes().first()?;
+    if ch != b'`' && ch != b'~' {
+        return None;
+    }
+    let len = rest.bytes().take_while(|&b| b == ch).count();
+    if len < 3 || (ch == b'`' && rest[len..].contains('`')) {
+        return None;
+    }
+    Some(Fence {
+        ch,
+        len,
+        col,
+        depth,
+    })
+}
+
+/// CommonMark closing fence: same char, at least as long as the opener,
+/// nothing but whitespace after it, at the opener's quote depth and indented
+/// no deeper than the opener (or 3 columns).
+fn is_fence_closer(line: &str, fence: Fence) -> bool {
+    let (i, col, depth) = container_prefix(line, false);
+    if depth != fence.depth || col > fence.col.max(3) {
+        return false;
+    }
+    let rest = &line[i..];
+    let len = rest.bytes().take_while(|&b| b == fence.ch).count();
+    len >= fence.len && rest[len..].trim().is_empty()
+}
+
+fn indent_columns(line: &str) -> usize {
+    let mut col = 0;
+    for b in line.bytes() {
+        match b {
+            b' ' => col += 1,
+            b'\t' => col += 4 - col % 4,
+            _ => break,
+        }
+    }
+    col
+}
+
+/// Byte ranges of fenced and indented code blocks. Markup inside them is
+/// documentation the model is showing, not a call it is making.
+///
+/// `breaks` (sorted) are the boundaries of parameter values already accepted
+/// as raw text; each also ends a line, so a value may open and close its own
+/// fence (`…```</parameter>`). Block state still flows through values: a fence
+/// a value leaves open keeps everything after it code.
+fn block_code_ranges(text: &str, breaks: &[usize]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut fence: Option<(usize, Fence)> = None;
+    let mut indented = false;
+    // An indented code block may start here (it cannot interrupt a paragraph).
+    let mut after_blank = true;
+    let mut pending = breaks.iter().copied().peekable();
+    let mut offset = 0usize;
+    for physical in text.split_inclusive('\n') {
+        let line_end = offset + physical.len();
+        let mut start = offset;
+        let mut at_break = false;
+        loop {
+            while pending.next_if(|&p| p <= start).is_some() {}
+            let end = pending
+                .peek()
+                .copied()
+                .filter(|&p| p < line_end)
+                .unwrap_or(line_end);
+            let line = &text[start..end];
+            if let Some((open_start, f)) = fence {
+                if is_fence_closer(line, f) {
+                    ranges.push((open_start, end));
+                    fence = None;
+                    after_blank = true;
+                }
+            } else if at_break {
+                // Rest of a physical line after a value boundary: never blank
+                // or indented in its own right, but it may open a fence when
+                // it starts a value.
+                if indented {
+                    ranges.push((start, end));
+                } else if let Some(f) = fence_opener(line) {
+                    fence = Some((start, f));
+                }
+                after_blank = false;
+            } else if line.trim().is_empty() {
+                after_blank = true;
+            } else if (indented || after_blank) && indent_columns(line) >= 4 {
+                ranges.push((start, end));
+                indented = true;
+                after_blank = false;
+            } else {
+                indented = false;
+                after_blank = false;
+                if let Some(f) = fence_opener(line) {
+                    fence = Some((start, f));
+                }
+            }
+            if end == line_end {
+                break;
+            }
+            start = end;
+            at_break = true;
+        }
+        offset = line_end;
+    }
+    if let Some((open_start, _)) = fence {
+        ranges.push((open_start, text.len()));
     }
     ranges
 }
@@ -151,36 +287,30 @@ fn inline_code_ranges(text: &str) -> Vec<(usize, usize)> {
     ranges
 }
 
-/// Whether `pos` falls inside fenced or inline code.
-fn in_code(pos: usize, fences: &[(usize, usize)], inline: &[(usize, usize)]) -> bool {
-    fences
+/// Whether `pos` falls inside block or inline code.
+fn in_code(pos: usize, blocks: &[(usize, usize)], inline: &[(usize, usize)]) -> bool {
+    blocks
         .iter()
         .chain(inline)
         .any(|&(s, e)| pos >= s && pos < e)
 }
 
+/// Tags outside code, in order. An accepted opening parameter tag is always
+/// followed by its closing tag (unless the value is unterminated): the value
+/// is raw text up to the next closing parameter tag, so backticks or fences
+/// inside it never hide that tag, and tags inside it are skipped.
 fn collect_tags(text: &str) -> Vec<Tag> {
-    let fences = fenced_code_ranges(text);
-    let inline = inline_code_ranges(text);
-    TAG_RE
+    let raw: Vec<Tag> = TAG_RE
         .captures_iter(text)
         .filter_map(|caps| {
             let whole = caps.get(0)?;
-            let start = whole.start();
-            if in_code(start, &fences, &inline) {
-                return None;
-            }
-            // `<invoke>` quoted inline with backticks is prose.
-            if text[..start].ends_with('`') {
-                return None;
-            }
             let kind = match caps.get(2)?.as_str().to_ascii_lowercase().as_str() {
                 "invoke" => TagKind::Invoke,
                 "parameter" => TagKind::Parameter,
                 _ => TagKind::Wrapper,
             };
             Some(Tag {
-                start,
+                start: whole.start(),
                 end: whole.end(),
                 closing: caps.get(1).is_some(),
                 kind,
@@ -190,7 +320,38 @@ fn collect_tags(text: &str) -> Vec<Tag> {
                     .unwrap_or_default(),
             })
         })
-        .collect()
+        .collect();
+    let inline = inline_code_ranges(text);
+    let mut breaks = Vec::new();
+    let mut blocks = block_code_ranges(text, &breaks);
+    let mut tags = Vec::new();
+    let mut i = 0usize;
+    while i < raw.len() {
+        let tag = &raw[i];
+        i += 1;
+        // `<invoke>` quoted inline with backticks is prose.
+        if in_code(tag.start, &blocks, &inline) || text[..tag.start].ends_with('`') {
+            continue;
+        }
+        tags.push(tag.clone());
+        if tag.kind != TagKind::Parameter || tag.closing {
+            continue;
+        }
+        let Some(offset) = raw[i..]
+            .iter()
+            .position(|t| t.kind == TagKind::Parameter && t.closing)
+        else {
+            break;
+        };
+        let close = &raw[i + offset];
+        tags.push(close.clone());
+        // Code state before the value is unaffected; rescan the rest with the
+        // value's boundaries as line breaks.
+        breaks.extend([tag.end, close.start]);
+        blocks = block_code_ranges(text, &breaks);
+        i += offset + 1;
+    }
+    tags
 }
 
 fn attr(attrs: &str, key: &str) -> Option<String> {
@@ -357,12 +518,12 @@ pub(super) fn unparsed_markup_notice(reason: &str) -> String {
 /// tool name directly (whitespace only), and it must end the message.
 pub(super) fn parse_text_wrapped_tool_call(text: &str) -> Option<(String, String, Value, String)> {
     let marker = "to=functions.";
-    let fences = fenced_code_ranges(text);
+    let blocks = block_code_ranges(text, &[]);
     let inline = inline_code_ranges(text);
     let marker_idx = text
         .match_indices(marker)
         .map(|(idx, _)| idx)
-        .filter(|idx| !in_code(*idx, &fences, &inline))
+        .filter(|idx| !in_code(*idx, &blocks, &inline))
         .last()?;
     let after_marker = &text[marker_idx + marker.len()..];
     let tool_name_end = after_marker
