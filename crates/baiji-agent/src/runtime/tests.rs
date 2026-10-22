@@ -952,7 +952,7 @@ async fn test_cancel_interrupts() {
     }
 
     let runtime = AgentRuntime::new(Arc::new(PendingProvider));
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
     let steering = SteeringQueue::new();
 
@@ -970,6 +970,46 @@ async fn test_cancel_interrupts() {
         .await
         .unwrap();
     assert_eq!(answer, "");
+    // 取消只以 Interrupted 结束：再补一个 RunCompleted 会让 UI 把
+    // 「Esc 后补发的新 run」误判为已结束
+    assert_eq!(terminal_event_kinds(&mut rx), vec!["interrupted"]);
+}
+
+#[tokio::test]
+async fn test_completed_run_emits_a_single_run_completed() {
+    let runtime = runtime_with(MockProvider::new(Script::AnswerOnly("ok")));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut messages = vec![Message::user("hi")];
+    let answer = runtime
+        .run(
+            "sys",
+            &mut messages,
+            &tx,
+            &CancellationToken::new(),
+            &SteeringQueue::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(answer, "ok");
+    assert_eq!(terminal_event_kinds(&mut rx), vec!["run_completed"]);
+}
+
+/// 一次 run 发出的结束事件（RunCompleted / RunFailed / Interrupted），按顺序
+fn terminal_event_kinds(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+) -> Vec<&'static str> {
+    let mut kinds = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if matches!(
+            event,
+            AgentEvent::RunCompleted { .. }
+                | AgentEvent::RunFailed { .. }
+                | AgentEvent::Interrupted
+        ) {
+            kinds.push(event.kind());
+        }
+    }
+    kinds
 }
 
 #[tokio::test]
@@ -1156,7 +1196,7 @@ async fn test_cancel_interrupts_running_tool() {
     let runtime = AgentRuntime::new(Arc::new(MockProvider::new(Script::ThreeToolsThenAnswer)))
         .with_tools(tools);
 
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
     let trigger = cancel.clone();
     tokio::spawn(async move {
@@ -1180,6 +1220,7 @@ async fn test_cancel_interrupts_running_tool() {
     let results = messages[2].tool_results.as_ref().unwrap();
     assert_eq!(results.len(), 3);
     assert!(results.iter().all(|r| r.content == CANCELLED_BY_USER));
+    assert_eq!(terminal_event_kinds(&mut rx), vec!["interrupted"]);
 }
 
 #[tokio::test]

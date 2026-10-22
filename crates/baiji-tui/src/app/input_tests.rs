@@ -29,10 +29,41 @@ impl baiji_ai::Provider for Echo {
     }
 }
 
+/// 永不结束的流：run 停在等模型输出，只能被 Esc 取消
+struct Pending;
+
+#[async_trait::async_trait]
+impl baiji_ai::Provider for Pending {
+    async fn chat(&self, _: baiji_ai::ChatRequest) -> anyhow::Result<baiji_ai::ChatResponse> {
+        unreachable!()
+    }
+    async fn chat_stream(
+        &self,
+        _: baiji_ai::ChatRequest,
+    ) -> anyhow::Result<futures::stream::BoxStream<'static, anyhow::Result<baiji_ai::StreamChunk>>>
+    {
+        use futures::StreamExt as _;
+        Ok(futures::stream::pending().boxed())
+    }
+    fn protocol(&self) -> baiji_ai::Protocol {
+        baiji_ai::Protocol::OpenAIChat
+    }
+    fn model(&self) -> &str {
+        "mock"
+    }
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
 /// 英文包 App（纯内存历史：不碰真实家目录）
 fn test_app(dir: &std::path::Path) -> App {
+    app_with_provider(dir, Arc::new(Echo))
+}
+
+fn app_with_provider(dir: &std::path::Path, provider: Arc<dyn baiji_ai::Provider>) -> App {
     let runtime = Arc::new(
-        baiji_agent::AgentRuntime::new(Arc::new(Echo)).with_tools(baiji_agent::ToolRegistry::new()),
+        baiji_agent::AgentRuntime::new(provider).with_tools(baiji_agent::ToolRegistry::new()),
     );
     let harness = AgentHarness::new(runtime, dir.join("sessions")).unwrap();
     App::new(
@@ -479,4 +510,83 @@ fn test_multiline_input_render_and_cursor() {
     // 覆盖层打开时不放置输入框光标（交给覆盖层）
     app.wizard = Some(ConfigWizard::new("glm", None));
     assert!(app.overlay_active());
+}
+
+/// 「运行中输入纠正，再按 Esc」：旧 run 被取消，纠正作为新 run 补发。
+/// 旧 run 的收尾事件不能把新 run 标成已结束——否则界面显示 ready，
+/// 空输入 Esc 直接退出，回车再开一个并发 run（取消令牌被替换）。
+#[tokio::test]
+async fn test_esc_redirect_keeps_the_follow_up_run_running() {
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_provider(dir.path(), Arc::new(Pending));
+    let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+
+    app.spawn_run("first task".to_string(), ui_tx.clone());
+    // 等旧 run 真正开跑（已发出请求、停在流上）
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), ui_rx.recv())
+            .await
+            .expect("first run never started")
+            .unwrap();
+        if let UiEvent::Agent(event) = event {
+            let started = matches!(event, AgentEvent::TurnStarted { .. });
+            app.on_agent_event(event, &ui_tx);
+            if started {
+                break;
+            }
+        }
+    }
+
+    app.steering.push("do this instead");
+    app.handle_key(KeyEvent::new(K::Esc, M::NONE), &ui_tx).await;
+    let first_cancel = app.cancel.clone();
+    assert!(first_cancel.is_cancelled());
+
+    // 处理旧 run 的全部收尾事件，直到补发的新 run 开跑，再留一段静默期
+    // 收齐迟到的事件
+    let mut interrupted = false;
+    let mut follow_up_started = false;
+    let mut quiet_ticks = 0;
+    let mut waits = 0;
+    loop {
+        match tokio::time::timeout(Duration::from_millis(200), ui_rx.recv()).await {
+            Ok(Some(UiEvent::Agent(event))) => {
+                quiet_ticks = 0;
+                if interrupted && matches!(event, AgentEvent::TurnStarted { .. }) {
+                    follow_up_started = true;
+                }
+                interrupted |= matches!(event, AgentEvent::Interrupted);
+                app.on_agent_event(event, &ui_tx);
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) if follow_up_started => {
+                quiet_ticks += 1;
+                if quiet_ticks >= 3 {
+                    break;
+                }
+            }
+            Err(_) => {
+                waits += 1;
+                assert!(waits < 25, "follow-up run never started");
+            }
+        }
+    }
+
+    assert!(interrupted);
+    assert!(
+        follow_up_started,
+        "the correction is resubmitted as a new run"
+    );
+    assert_eq!(
+        user_lines(&app).last().map(String::as_str),
+        Some("do this instead")
+    );
+    assert!(app.agent_running, "the follow-up run is still in flight");
+    assert!(
+        !app.cancel.is_cancelled(),
+        "Esc now targets the follow-up run, not the cancelled one"
+    );
+    app.cancel.cancel();
 }

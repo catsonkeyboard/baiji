@@ -51,6 +51,14 @@ the task: call the next tool you need, or give your final answer now.";
 const CONTINUE_NOTICE: &str = "[system notice] Your previous answer was cut off by the output \
 token limit. Continue exactly where you left off — do not repeat anything already written.";
 
+/// `run_loop` 的结束方式：决定 `run` 发哪一个结束事件
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopEnd {
+    Completed,
+    /// 用户取消；`Interrupted` 已在循环内发出
+    Interrupted,
+}
+
 /// Agent 运行时
 pub struct AgentRuntime {
     /// 可热替换的 Provider（TUI 内切换厂商/端点时 swap）
@@ -277,14 +285,18 @@ impl AgentRuntime {
         sync_new_messages(&convo, history_len, messages);
 
         match result {
-            Ok(()) => {
+            Ok(end) => {
                 self.hooks.run_end(&final_answer).await?;
                 run_span.end();
-                events
-                    .send(AgentEvent::RunCompleted {
-                        answer: final_answer.clone(),
-                    })
-                    .ok();
+                // 每次 run 恰好一个结束事件：取消时 run_loop 已发出 Interrupted，
+                // 再补 RunCompleted 会让 UI 把 Esc 后补发的新 run 当成已结束
+                if end == LoopEnd::Completed {
+                    events
+                        .send(AgentEvent::RunCompleted {
+                            answer: final_answer.clone(),
+                        })
+                        .ok();
+                }
                 Ok(final_answer)
             }
             Err(e) => {
@@ -307,7 +319,7 @@ impl AgentRuntime {
         cancel: &CancellationToken,
         steering: &SteeringQueue,
         final_answer: &mut String,
-    ) -> Result<()> {
+    ) -> Result<LoopEnd> {
         let mut turn: u32 = 0;
         // 补救用的请求后缀（仅进入下一次请求副本，不进历史）：空响应/信封解析失败提醒、
         // 截断续写的"半截回答 + 继续"
@@ -322,7 +334,7 @@ impl AgentRuntime {
             if cancel.is_cancelled() {
                 self.commit_partial_answer(convo, events, &mut partial_answer);
                 events.send(AgentEvent::Interrupted).ok();
-                return Ok(());
+                return Ok(LoopEnd::Interrupted);
             }
 
             turn += 1;
@@ -379,7 +391,7 @@ impl AgentRuntime {
                     self.commit_partial_answer(convo, events, &mut partial_answer);
                     events.send(AgentEvent::Interrupted).ok();
                     turn_span.end();
-                    return Ok(());
+                    return Ok(LoopEnd::Interrupted);
                 }
                 Err(e) => {
                     self.commit_partial_answer(convo, events, &mut partial_answer);
@@ -651,7 +663,7 @@ impl AgentRuntime {
             }
         }
 
-        Ok(())
+        Ok(LoopEnd::Completed)
     }
 
     /// 截断续写途中被取消/出错：已流给用户的半截回答带截断标记落入历史，不丢
