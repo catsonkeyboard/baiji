@@ -171,11 +171,12 @@ pub fn is_read_only(command: &str, policy: &ReadOnlyPolicy) -> bool {
     if segments.iter().flatten().any(|t| token_is_opaque(&t.text)) {
         return false;
     }
-    // A lone `&` backgrounds a job; `split_segments` does not split on it.
-    if segments
+    // A lone `&` backgrounds a job that outlives the bash timeout, and `|&`
+    // was never part of the allowlist. `split_segments` consumes separators,
+    // so look at the raw token stream.
+    if tokenize::tokenize(command)
         .iter()
-        .flatten()
-        .any(|t| t.is_operator && t.text == "&")
+        .any(|t| t.is_operator && matches!(t.text.as_str(), "&" | "|&"))
     {
         return false;
     }

@@ -53,8 +53,12 @@ impl Token {
     }
 }
 
-/// Characters that separate one command from the next.
-const SEGMENT_SEPARATORS: &[&str] = &["&&", "||", ";", "|", "\n", "(", ")"];
+/// Characters that separate one command from the next. A lone `&` backgrounds
+/// the command before it and then runs the next one, so it splits like `;`.
+const SEGMENT_SEPARATORS: &[&str] = &["&&", "||", ";", "|", "|&", "&", "\n", "(", ")"];
+
+/// Separators whose next command reads the previous one's output.
+const PIPE_SEPARATORS: &[&str] = &["|", "|&"];
 
 /// Split a command line into individual command segments, each tokenized.
 ///
@@ -73,7 +77,7 @@ pub fn split_segments(command: &str) -> Vec<Vec<Token>> {
             }
             // The command after `|` consumes the previous one's output as
             // operands, which this parser cannot see.
-            next_receives_pipe = token.text == "|";
+            next_receives_pipe = PIPE_SEPARATORS.contains(&token.text.as_str());
             continue;
         }
         let mut token = token;
@@ -158,11 +162,26 @@ pub fn tokenize(command: &str) -> Vec<Token> {
                 op.is_operator = true;
                 tokens.push(op);
             }
+            // `&>` / `&>>` redirect stdout+stderr; they are not the
+            // background operator, so the command must not be split here.
+            '&' if chars.peek() == Some(&'>') => {
+                flush!();
+                chars.next();
+                if chars.peek() == Some(&'>') {
+                    chars.next();
+                } else {
+                    pending_redirect = true;
+                }
+            }
             '&' | '|' => {
                 flush!();
                 let mut text = c.to_string();
                 if chars.peek() == Some(&c) {
                     text.push(c);
+                    chars.next();
+                } else if c == '|' && chars.peek() == Some(&'&') {
+                    // `|&` pipes stdout and stderr together.
+                    text.push('&');
                     chars.next();
                 }
                 let mut op = Token::word(text);
@@ -187,8 +206,19 @@ pub fn tokenize(command: &str) -> Vec<Token> {
                     }
                     pending_redirect = true;
                 }
+                // `>&2` / `2>&1` duplicate a descriptor: the `&` belongs to
+                // the redirect, not to the background operator.
+                if chars.peek() == Some(&'&') {
+                    chars.next();
+                }
             }
-            '<' => flush!(),
+            '<' => {
+                flush!();
+                // `<&3` duplicates an input descriptor.
+                if chars.peek() == Some(&'&') {
+                    chars.next();
+                }
+            }
             _ => {
                 has_content = true;
                 current.push(c);

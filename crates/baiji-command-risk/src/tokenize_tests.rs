@@ -151,3 +151,41 @@ fn parentheses_split_subshell_and_command_substitution_bodies() {
         vec![vec!["x=$"], vec!["rm", "-rf", "~"], vec!["echo", "ok"]]
     );
 }
+
+#[test]
+fn background_ampersand_splits_segments_but_redirect_ampersands_do_not() {
+    let segments = split_segments("sleep 1 & rm -rf /tmp/a");
+    assert_eq!(segments.len(), 2, "{segments:#?}");
+    assert_eq!(segments[1][0].text, "rm");
+    assert!(!segments[1][0].receives_pipe);
+
+    for command in [
+        "cargo build 2>&1",
+        "echo x >&2",
+        "cat <&3",
+        "make &> out.log",
+    ] {
+        let segments = split_segments(command);
+        assert_eq!(segments.len(), 1, "{command:?}: {segments:#?}");
+        assert!(
+            !segments[0].iter().any(|t| t.is_operator),
+            "{command:?}: {segments:#?}"
+        );
+    }
+    let clobber = tokenize("make &> out.log");
+    assert!(
+        clobber
+            .iter()
+            .any(|t| t.is_truncating_redirect_target && t.text == "out.log")
+    );
+    let append = tokenize("make &>> out.log");
+    assert!(!append.iter().any(|t| t.is_truncating_redirect_target));
+}
+
+#[test]
+fn pipe_ampersand_is_a_pipe() {
+    let segments = split_segments("ls |& grep x");
+    assert_eq!(segments.len(), 2, "{segments:#?}");
+    assert_eq!(segments[1][0].text, "grep");
+    assert!(segments[1][0].receives_pipe);
+}

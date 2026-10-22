@@ -160,8 +160,10 @@ const WRAPPER_COMMANDS: &[&str] = &[
 ];
 
 /// Shell grammar words that may prefix the actual command in a segment.
+/// `{` opens a brace group and `!` negates the exit status; neither changes
+/// what runs.
 const SHELL_CONTROL_PREFIXES: &[&str] = &[
-    "then", "do", "else", "elif", "if", "while", "until", "case", "in", "select",
+    "then", "do", "else", "elif", "if", "while", "until", "case", "in", "select", "{", "!",
 ];
 
 /// Whether a wrapper option consumes the following word. Option spelling is
@@ -178,8 +180,22 @@ fn wrapper_flag_takes_value(wrapper: &str, flag: &str) -> bool {
         "timeout" => matches!(flag, "-s" | "--signal" | "-k" | "--kill-after"),
         "xargs" => matches!(
             flag,
-            "-n" | "--max-args" | "-P" | "--max-procs" | "-s" | "--max-chars"
+            "-n" | "--max-args"
+                | "-P"
+                | "--max-procs"
+                | "-s"
+                | "--max-chars"
+                | "-a"
+                | "--arg-file"
+                | "-d"
+                | "--delimiter"
+                | "-E"
+                | "-I"
+                | "-L"
+                | "--max-lines"
+                | "--process-slot-var"
         ),
+        "stdbuf" => matches!(flag, "-i" | "-o" | "-e"),
         "chroot" => matches!(flag, "--userspec" | "--groups"),
         _ => false,
     }
@@ -285,11 +301,31 @@ fn assess_segment(tokens: &[Token], ctx: &RiskContext, findings: &mut Vec<RiskFi
             return;
         }
         wrapped_by = Some(name.clone());
+        // `eval` joins its arguments and runs them as shell source, so
+        // `eval 'rm -rf ~'` must be assessed like `rm -rf ~`. The joined text
+        // drops the word `eval`, so the recursion terminates.
+        if name == "eval" {
+            let script = tokens[1..]
+                .iter()
+                .filter(|t| !t.is_operator && !t.is_truncating_redirect_target)
+                .map(|t| t.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            for finding in assess(&script, ctx).findings {
+                if !findings.contains(&finding) {
+                    findings.push(finding);
+                }
+            }
+            return;
+        }
         // Skip the wrapper plus its own options and `VAR=value` assignments,
         // landing on the wrapped program. Options that take a separate value
         // (`nice -n 10`, `timeout 5`) must consume that value too.
         let rest = &tokens[1..];
         let mut idx = 0;
+        // `timeout`'s first operand is always its duration, whatever its
+        // spelling (`5`, `5s`, `1.5m`, `inf`).
+        let mut duration_pending = name == "timeout";
         while idx < rest.len() {
             let token = &rest[idx];
             if name == "env"
@@ -317,7 +353,12 @@ fn assess_segment(tokens: &[Token], ctx: &RiskContext, findings: &mut Vec<RiskFi
                 }
                 continue;
             }
-            // A bare number is an operand of the wrapper itself (`timeout 5`),
+            if duration_pending {
+                duration_pending = false;
+                idx += 1;
+                continue;
+            }
+            // A bare number is an operand of the wrapper itself (`nice 5`),
             // not the program to run.
             if token.text.chars().all(|c| c.is_ascii_digit() || c == '.') {
                 idx += 1;

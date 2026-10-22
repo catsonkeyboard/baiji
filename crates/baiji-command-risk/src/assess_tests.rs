@@ -831,3 +831,83 @@ fn tilde_user_and_brace_expansion_do_not_bypass_the_home_check() {
         );
     }
 }
+
+// ── Regression: shell grammar that used to hide the destructive command ──
+
+#[test]
+fn background_operator_does_not_hide_the_next_command() {
+    // A lone `&` ends a command just like `;`; the part after it runs too.
+    assert_eq!(level("true & rm -rf ~"), RiskLevel::Catastrophic);
+    assert_eq!(level("sleep 1 & rm -rf ~/.ssh"), RiskLevel::Catastrophic);
+    assert_eq!(level("ls & git reset --hard"), RiskLevel::Confirm);
+    // `|&` pipes stdout+stderr: still a segment boundary, still a pipe.
+    assert_eq!(level("ls |& rm -rf ~"), RiskLevel::Catastrophic);
+    assert_eq!(level("find ~ |& xargs rm -rf"), RiskLevel::Confirm);
+}
+
+#[test]
+fn ampersand_redirects_are_not_background_operators() {
+    // `2>&1`, `>&2`, `<&3` and `&>` are redirects: the command stays whole.
+    assert_eq!(level("rm -rf ~ 2>&1"), RiskLevel::Catastrophic);
+    assert_eq!(level("rm -rf ~ &> /dev/null"), RiskLevel::Catastrophic);
+    assert!(level("cargo build 2>&1 | tail -20").runs_immediately());
+    assert!(level("cargo test &> test.log").runs_immediately());
+    assert!(level("echo oops >&2").runs_immediately());
+    assert!(level("cat <&3").runs_immediately());
+    // `&>` truncates its target exactly like `>`.
+    assert_eq!(
+        level("echo x &> ~/.ssh/config"),
+        level("echo x > ~/.ssh/config")
+    );
+    assert!(!level("echo x &> ~/.ssh/config").runs_immediately());
+}
+
+#[test]
+fn brace_groups_and_negation_do_not_hide_the_command() {
+    assert_eq!(level("{ rm -rf ~; }"), RiskLevel::Catastrophic);
+    assert_eq!(level("! rm -rf ~"), RiskLevel::Catastrophic);
+    assert_eq!(level("f() { rm -rf ~; }; f"), RiskLevel::Catastrophic);
+    assert_eq!(level("{ ! git reset --hard; }"), RiskLevel::Confirm);
+}
+
+#[test]
+fn timeout_duration_with_a_unit_is_not_taken_for_the_program() {
+    for command in [
+        "timeout 5s rm -rf ~",
+        "timeout 1.5m rm -rf ~",
+        "timeout 2h rm -rf ~",
+        "timeout inf rm -rf ~",
+        "timeout -k 2s 10s rm -rf ~",
+        "timeout --signal=KILL 1d rm -rf ~",
+        "timeout -s KILL 30s rm -rf ~",
+    ] {
+        assert_eq!(level(command), RiskLevel::Catastrophic, "{command:?}");
+    }
+    assert!(level("timeout 30s cargo test").runs_immediately());
+}
+
+#[test]
+fn eval_payload_is_assessed_as_shell_source() {
+    assert_eq!(level("eval 'rm -rf ~'"), RiskLevel::Catastrophic);
+    assert_eq!(
+        level("eval \"echo hi; rm -rf ~/.aws\""),
+        RiskLevel::Catastrophic
+    );
+    assert_eq!(level("eval 'git reset --hard'"), RiskLevel::Confirm);
+    assert!(level("eval 'echo hi'").runs_immediately());
+    // An empty eval runs nothing.
+    assert!(level("eval").runs_immediately());
+}
+
+#[test]
+fn xargs_and_stdbuf_option_values_are_not_taken_for_the_program() {
+    assert_eq!(level("stdbuf -o L rm -rf ~"), RiskLevel::Catastrophic);
+    assert_eq!(level("xargs -a list.txt rm -rf ~"), RiskLevel::Catastrophic);
+    for command in [
+        "find ~ -name '*.log' | xargs -I {} rm -rf {}",
+        "find ~ -name '*.log' | xargs -d x rm -rf",
+        "find ~ -name '*.log' | xargs -L 1 rm -rf",
+    ] {
+        assert!(level(command) >= RiskLevel::Confirm, "{command:?}");
+    }
+}

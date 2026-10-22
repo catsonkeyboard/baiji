@@ -105,6 +105,9 @@ fn writes_and_side_effects_are_not_read_only() {
         "/tmp/evil/cat x",
         "sleep 100 &",
         "ls & rm -rf build",
+        "ls & cat Cargo.toml",
+        "cat Cargo.toml & ls",
+        "ls |& cat",
         "env",
         "printenv",
         "curl https://example.com",
@@ -231,6 +234,22 @@ fn reviewer_found_bypasses_are_not_read_only() {
         "wc --files0-from=list.txt",
         "less README.md",
     ] {
+        assert!(!is_read_only(cmd, &policy), "must not be read-only: {cmd}");
+    }
+}
+
+#[test]
+fn descriptor_duplication_sinks_are_read_only_but_file_redirects_are_not() {
+    let policy = policy();
+    for cmd in [
+        "git status 2>&1",
+        "ls -la >/dev/null 2>&1",
+        "ls >&2",
+        "ls &>/dev/null",
+    ] {
+        assert!(is_read_only(cmd, &policy), "should be read-only: {cmd}");
+    }
+    for cmd in ["ls >&out.txt", "ls &> out.txt", "ls 2>&1 > out.txt"] {
         assert!(!is_read_only(cmd, &policy), "must not be read-only: {cmd}");
     }
 }
