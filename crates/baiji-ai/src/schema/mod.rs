@@ -219,6 +219,163 @@ mod tests {
     }
 
     #[test]
+    fn test_root_one_of_discriminator_consts_union_into_enum() {
+        // MCP 常见的判别联合：只保留首个分支的 const 会让其它模式永远不可用
+        let schema = json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {"action": {"const": "get"}, "id": {"type": "string"}},
+                    "required": ["action", "id"]
+                },
+                {
+                    "type": "object",
+                    "properties": {"action": {"const": "list"}, "limit": {"type": "integer"}},
+                    "required": ["action"]
+                }
+            ]
+        });
+        let want = json!({
+            "type": "object",
+            "properties": {
+                "action": {"enum": ["get", "list"]},
+                "id": {"type": "string"},
+                "limit": {"type": "integer"}
+            },
+            // 每个分支都要求的 action 才能提升为 required；id 只有一个分支要求
+            "required": ["action"]
+        });
+        for spec in [&OPENAI_COMPATIBLE, &ANTHROPIC] {
+            assert_eq!(normalize(&schema, spec), want, "{}", spec.id);
+        }
+    }
+
+    #[test]
+    fn test_root_any_of_enum_and_const_union_preserves_first_seen_order() {
+        let schema = json!({
+            "anyOf": [
+                {"properties": {"mode": {"type": "string", "enum": ["a", "b"], "description": "Mode"}}},
+                {"properties": {"mode": {"type": "string", "const": "c"}}},
+                {"properties": {"mode": {"enum": ["b", "d"]}}}
+            ]
+        });
+        for spec in [&OPENAI_COMPATIBLE, &ANTHROPIC] {
+            let out = normalize(&schema, spec);
+            assert_eq!(
+                out["properties"]["mode"],
+                json!({"type": "string", "enum": ["a", "b", "c", "d"], "description": "Mode"}),
+                "{}",
+                spec.id
+            );
+        }
+    }
+
+    #[test]
+    fn test_root_combiner_unconstrained_branch_drops_enum() {
+        // 有一个分支对该属性不做 const/enum 约束：并集即不受限
+        let schema = json!({
+            "oneOf": [
+                {"properties": {"mode": {"type": "string", "const": "a"}}},
+                {"properties": {"mode": {"type": "string", "description": "free-form"}}},
+                {"properties": {"mode": {"type": "string", "enum": ["b"]}}}
+            ]
+        });
+        for spec in [&OPENAI_COMPATIBLE, &ANTHROPIC] {
+            let out = normalize(&schema, spec);
+            assert_eq!(
+                out["properties"]["mode"],
+                json!({"type": "string"}),
+                "{}",
+                spec.id
+            );
+        }
+    }
+
+    #[test]
+    fn test_root_combiner_identical_consts_collapse_to_one_enum() {
+        let schema = json!({
+            "oneOf": [
+                {"properties": {"kind": {"type": "string", "const": "x"}, "a": {"type": "string"}}},
+                {"properties": {"kind": {"type": "string", "const": "x"}, "b": {"type": "string"}}}
+            ]
+        });
+        for spec in [&OPENAI_COMPATIBLE, &ANTHROPIC] {
+            let out = normalize(&schema, spec);
+            assert_eq!(
+                out["properties"]["kind"],
+                json!({"type": "string", "enum": ["x"]}),
+                "{}",
+                spec.id
+            );
+        }
+    }
+
+    #[test]
+    fn test_root_combiner_conflicting_types_keep_only_the_enum() {
+        // 首个分支的 type 会把其它分支的取值判为非法：enum 已完整约束取值，type 去掉
+        let schema = json!({
+            "anyOf": [
+                {"properties": {"v": {"type": "string", "const": "auto"}}},
+                {"properties": {"v": {"type": "integer", "const": 1}}}
+            ]
+        });
+        for spec in [&OPENAI_COMPATIBLE, &ANTHROPIC] {
+            let out = normalize(&schema, spec);
+            assert_eq!(
+                out["properties"]["v"],
+                json!({"enum": ["auto", 1]}),
+                "{}",
+                spec.id
+            );
+        }
+    }
+
+    #[test]
+    fn test_root_combiner_required_only_when_every_branch_requires_it() {
+        // 有分支不要求（或分支不是 object schema）时不能提升，否则会强制模型发可省略的字段
+        let missing = json!({
+            "anyOf": [
+                {"properties": {"a": {"type": "string"}}, "required": ["a"]},
+                {"properties": {"a": {"type": "string"}, "b": {"type": "string"}}}
+            ]
+        });
+        let boolean_branch = json!({
+            "anyOf": [
+                {"properties": {"a": {"type": "string"}}, "required": ["a"]},
+                true
+            ]
+        });
+        for spec in [&OPENAI_COMPATIBLE, &ANTHROPIC] {
+            for schema in [&missing, &boolean_branch] {
+                let out = normalize(schema, spec);
+                assert!(out.get("required").is_none(), "{}: {out}", spec.id);
+            }
+        }
+    }
+
+    #[test]
+    fn test_root_declared_property_wins_over_branch_alternatives() {
+        // 根上的声明与组合子同时生效，本身就是合法的放宽：保持原样（含 description）
+        let schema = json!({
+            "properties": {"action": {"type": "string", "description": "What to do"}},
+            "oneOf": [
+                {"properties": {"action": {"const": "get"}}, "required": ["action"]},
+                {"properties": {"action": {"const": "list"}}, "required": ["action"]}
+            ]
+        });
+        for spec in [&OPENAI_COMPATIBLE, &ANTHROPIC] {
+            let out = normalize(&schema, spec);
+            assert_eq!(
+                out["properties"]["action"],
+                json!({"type": "string", "description": "What to do"}),
+                "{}",
+                spec.id
+            );
+            assert_eq!(out["required"], json!(["action"]), "{}", spec.id);
+        }
+    }
+
+    #[test]
     fn test_all_of_branches_merge_for_openai() {
         let schema = json!({
             "type": "object",

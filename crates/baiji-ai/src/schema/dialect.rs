@@ -264,6 +264,12 @@ fn prune_dangling_required(out: &mut Map<String, Value>) {
 /// Collapse root combiners into one object schema whose properties union every
 /// branch. Runtime tool deserialization stays the authority on which
 /// combination is actually valid.
+///
+/// The root's own `properties` win a name collision: they apply alongside
+/// whichever branch matches, so they are already a valid widening. Among the
+/// branches, `allOf` keeps the first declaration (its branches all apply at
+/// once), while `anyOf`/`oneOf` alternatives are merged by
+/// [`merge_alternative_declarations`] so no alternative's values are lost.
 fn flatten_top_level_combiners(schema: &mut Value) {
     let Some(output) = schema.as_object_mut() else {
         return;
@@ -273,7 +279,7 @@ fn flatten_top_level_combiners(schema: &mut Value) {
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    let mut all_of_required: Vec<String> = Vec::new();
+    let mut promoted_required: Vec<String> = Vec::new();
     let mut saw_combiner = false;
 
     for keyword in ["oneOf", "anyOf", "allOf"] {
@@ -284,28 +290,44 @@ fn flatten_top_level_combiners(schema: &mut Value) {
             continue;
         };
         saw_combiner = true;
-        for branch in branches {
-            let Some(branch) = branch.as_object() else {
-                continue;
-            };
-            if let Some(properties) = branch.get("properties").and_then(Value::as_object) {
-                for (name, property) in properties {
-                    merged_properties
-                        .entry(name.clone())
-                        .or_insert_with(|| property.clone());
+        let alternatives = keyword != "allOf";
+
+        // Every branch's declaration of each property, in first-seen order.
+        let mut declarations: Vec<(&String, Vec<&Value>)> = Vec::new();
+        for properties in branches
+            .iter()
+            .filter_map(|branch| branch.get("properties"))
+            .filter_map(Value::as_object)
+        {
+            for (name, property) in properties {
+                match declarations.iter_mut().find(|(seen, _)| *seen == name) {
+                    Some((_, all)) => all.push(property),
+                    None => declarations.push((name, vec![property])),
                 }
             }
-            // Only `allOf` branches all apply, so only their `required` is safe
-            // to promote; promoting an `anyOf` branch's would demand fields the
-            // caller may legitimately omit.
-            if keyword == "allOf"
-                && let Some(required) = branch.get("required").and_then(Value::as_array)
-            {
-                for name in required.iter().filter_map(Value::as_str) {
-                    if !all_of_required.iter().any(|e| e == name) {
-                        all_of_required.push(name.to_string());
-                    }
+        }
+        for (name, all) in declarations {
+            merged_properties.entry(name.clone()).or_insert_with(|| {
+                if alternatives {
+                    merge_alternative_declarations(&all)
+                } else {
+                    all[0].clone()
                 }
+            });
+        }
+
+        // Promote only names every matching instance must carry: all of an
+        // `allOf`'s, but only those *every* `anyOf`/`oneOf` alternative
+        // requires; promoting one alternative's would demand fields the
+        // caller may legitimately omit.
+        let required = if alternatives {
+            required_by_every_branch(&branches)
+        } else {
+            branches.iter().flat_map(required_names).collect()
+        };
+        for name in required {
+            if !promoted_required.iter().any(|e| e == name) {
+                promoted_required.push(name.to_string());
             }
         }
     }
@@ -316,12 +338,12 @@ fn flatten_top_level_combiners(schema: &mut Value) {
 
     output.insert("type".into(), Value::String("object".into()));
     output.insert("properties".into(), Value::Object(merged_properties));
-    if !all_of_required.is_empty() {
+    if !promoted_required.is_empty() {
         let required = output
             .entry("required".to_string())
             .or_insert_with(|| Value::Array(Vec::new()));
         if let Value::Array(required) = required {
-            for name in all_of_required {
+            for name in promoted_required {
                 if !required.iter().any(|e| e.as_str() == Some(&name)) {
                     required.push(Value::String(name));
                 }
@@ -332,6 +354,92 @@ fn flatten_top_level_combiners(schema: &mut Value) {
     if let Value::Object(map) = schema {
         prune_dangling_required(map);
     }
+}
+
+/// Merge the declarations that several `anyOf`/`oneOf` branches give one
+/// property into a single schema admitting any value some branch admits.
+///
+/// Only value enumerations are merged, because that is how discriminated
+/// unions differ per branch (`action: {const: "get"}` / `{const: "list"}`):
+/// when every declaration pins the value with `const`/`enum`, the result is
+/// one `enum` holding their de-duplicated union in first-seen order; when any
+/// declaration leaves the value open, so does the union. A `type` the
+/// declarations disagree on is dropped next to such an `enum`, since it would
+/// reject the other branches' values and the `enum` already pins them.
+///
+/// Every other keyword stays first-wins. Merging arbitrary differing
+/// subschemas is not attempted; the tool still validates the real call.
+fn merge_alternative_declarations(declarations: &[&Value]) -> Value {
+    let Some((first, rest)) = declarations.split_first() else {
+        return Value::Object(Map::new());
+    };
+    let mut merged = (*first).clone();
+    if rest.is_empty() {
+        return merged;
+    }
+    let Some(map) = merged.as_object_mut() else {
+        return merged;
+    };
+
+    let union = declarations
+        .iter()
+        .try_fold(Vec::new(), |mut union, declaration| {
+            for value in enumerated_values(declaration)? {
+                if !union.contains(value) {
+                    union.push(value.clone());
+                }
+            }
+            Some(union)
+        });
+    map.remove("const");
+    match union {
+        Some(values) => {
+            let type_agrees = declarations
+                .iter()
+                .filter_map(|declaration| declaration.get("type"))
+                .all(|declared| map.get("type") == Some(declared));
+            if !type_agrees {
+                map.remove("type");
+            }
+            map.insert("enum".into(), Value::Array(values));
+        }
+        None => {
+            map.remove("enum");
+        }
+    }
+    merged
+}
+
+/// The values a property declaration admits when it pins them with `const`
+/// or `enum`; `None` when the value is otherwise open (including boolean
+/// schemas, treated as open).
+fn enumerated_values(declaration: &Value) -> Option<&[Value]> {
+    let map = declaration.as_object()?;
+    if let Some(value) = map.get("const") {
+        return Some(std::slice::from_ref(value));
+    }
+    map.get("enum")?.as_array().map(Vec::as_slice)
+}
+
+/// A branch's `required` names; empty for a non-object branch.
+fn required_names(branch: &Value) -> Vec<&str> {
+    branch
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|names| names.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default()
+}
+
+/// Names every alternative requires. An instance must match some branch, so it
+/// carries these whichever one matches; a branch requiring nothing (or a
+/// boolean branch such as `true`) empties the set.
+fn required_by_every_branch(branches: &[Value]) -> Vec<&str> {
+    let mut per_branch = branches.iter().map(required_names);
+    let mut common = per_branch.next().unwrap_or_default();
+    for names in per_branch {
+        common.retain(|name| names.contains(name));
+    }
+    common
 }
 
 /// Combine two declarations of the same property name, keeping every key
