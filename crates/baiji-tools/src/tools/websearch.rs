@@ -17,8 +17,10 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use super::web::{
-    BROWSER_USER_AGENT, SearchEngine, WebConfig, check_url, decode_entities, error_chain,
+    BROWSER_USER_AGENT, Lookup, SearchEngine, SendError, WebConfig, check_url, decode_entities,
+    error_chain, read_body_capped, send_guarded, system_lookup,
 };
+use super::webfetch::MAX_BODY_BYTES;
 use crate::env::ExecutionEnv;
 
 const DDG_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
@@ -34,6 +36,8 @@ pub struct WebSearchTool {
     engines: Vec<SearchEngine>,
     searxng_url: Option<String>,
     ddg_endpoint: String,
+    /// 预检 DNS 用的解析函数（共享客户端不自动跟随重定向，请求经 `send_guarded` 发出）
+    lookup: Lookup,
 }
 
 impl WebSearchTool {
@@ -41,6 +45,7 @@ impl WebSearchTool {
         Self {
             env,
             client,
+            lookup: system_lookup(),
             engines: config.engines(),
             searxng_url: config
                 .searxng_url
@@ -191,7 +196,7 @@ impl WebSearchTool {
     ) -> Result<Vec<SearchResult>, String> {
         // DuckDuckGo HTML 端点对普通 GET 返回 anti-bot "anomaly" 挑战页（HTTP 202、
         // 无结果）；像真实页面那样以 POST 表单提交仍能拿到标准结果页（200）
-        let response = self
+        let request = self
             .client
             .post(&self.ddg_endpoint)
             .header(reqwest::header::USER_AGENT, BROWSER_USER_AGENT)
@@ -202,12 +207,14 @@ impl WebSearchTool {
             )
             .body(form_encode(&[("q", query), ("kl", DDG_REGION)]))
             .timeout(SEARCH_TIMEOUT)
-            .send()
-            .await
+            .build()
             .map_err(|e| request_error(&e))?;
+        let response = send_guarded(&self.client, request, &self.lookup)
+            .await
+            .map_err(send_error)?;
 
         let status = response.status();
-        let body = response.text().await.map_err(|e| request_error(&e))?;
+        let body = String::from_utf8_lossy(&read_body(response).await?).into_owned();
         if !status.is_success() {
             return Err(match detect_anti_bot_page(&body) {
                 Some(reason) => blocked_message("DuckDuckGo", reason),
@@ -239,14 +246,16 @@ impl WebSearchTool {
             .append_pair("q", query)
             .append_pair("format", "json");
 
-        let response = self
+        let request = self
             .client
             .get(endpoint)
             .header(reqwest::header::ACCEPT, "application/json")
             .timeout(SEARCH_TIMEOUT)
-            .send()
-            .await
+            .build()
             .map_err(|e| request_error(&e))?;
+        let response = send_guarded(&self.client, request, &self.lookup)
+            .await
+            .map_err(send_error)?;
         let status = response.status();
         if !status.is_success() {
             return Err(format!(
@@ -254,10 +263,10 @@ impl WebSearchTool {
                  (search.formats: [html, json])"
             ));
         }
-        let parsed: SearxngResponse = response.json().await.map_err(|e| {
+        let body = read_body(response).await?;
+        let parsed: SearxngResponse = serde_json::from_slice(&body).map_err(|e| {
             format!(
-                "non-JSON response from {base} ({}); enable the json format in the instance settings",
-                error_chain(&e)
+                "non-JSON response from {base} ({e}); enable the json format in the instance settings"
             )
         })?;
         Ok(parse_searxng_results(parsed, limit))
@@ -270,6 +279,25 @@ fn request_error(e: &reqwest::Error) -> String {
     } else {
         error_chain(e)
     }
+}
+
+fn send_error(e: SendError) -> String {
+    match e {
+        SendError::Refused(msg) => msg,
+        SendError::Request(e) => request_error(&e),
+    }
+}
+
+/// 读取响应体，上限同 webfetch（[`MAX_BODY_BYTES`]）：结果页远小于此，
+/// 超限说明端点异常——报错，而不是把整个响应读进内存再解析半截
+async fn read_body(response: reqwest::Response) -> Result<Vec<u8>, String> {
+    let (body, cut) = read_body_capped(response, MAX_BODY_BYTES)
+        .await
+        .map_err(|e| request_error(&e))?;
+    if cut {
+        return Err(format!("response too large (over {MAX_BODY_BYTES} bytes)"));
+    }
+    Ok(body)
 }
 
 fn blocked_message(engine: &str, reason: &str) -> String {
@@ -815,6 +843,17 @@ mod tests {
             "{}",
             out.content
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_engine_response_is_an_error() {
+        // 结果页远小于 webfetch 的 5 MB 上限：超限说明端点异常，报错而不是整页读进内存
+        let huge = "a".repeat(MAX_BODY_BYTES + 1);
+        let (addr, _) = spawn_server(vec![("/html/", "text/html".into(), huge)]).await;
+        let t = tool(&WebConfig::default(), format!("http://{addr}/html/"));
+        let out = t.execute(serde_json::json!({"query": "x"})).await.unwrap();
+        assert!(out.is_error, "{}", out.content);
+        assert!(out.content.contains("too large"), "{}", out.content);
     }
 
     #[tokio::test]

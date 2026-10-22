@@ -1,7 +1,8 @@
 //! webfetch 工具：抓取 http(s) URL，按需转换为 markdown（默认）/ 纯文本 / 原始 HTML
 //!
-//! - 共享 `reqwest::Client`（见 `web.rs`：重定向 ≤5 跳逐跳校验、DNS 结果过滤，
-//!   拒绝链路本地 / 云元数据地址；localhost 与内网开发服务器可访问）；
+//! - 共享 `reqwest::Client`，经 `send_guarded` 发送（见 `web.rs`：重定向 ≤5 跳，
+//!   逐跳 URL 校验 + 预检 DNS，连接阶段再过滤 DNS 结果，拒绝链路本地 / 云元数据
+//!   地址——走系统代理时同样生效；localhost 与内网开发服务器可访问）；
 //! - 响应体上限 5 MB（Content-Length 超限直接拒绝，否则流式读到上限截断）；
 //! - 二进制内容类型（图片/PDF/octet-stream/压缩包…）直接以 is_error 拒绝；
 //! - HTML → markdown / text 走正则管道（`<pre>` 占位保护、相对链接按最终 URL 解析、
@@ -13,13 +14,15 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use baiji_agent::{AgentTool, ToolOutput, estimate_text_tokens};
-use futures::StreamExt;
 use regex::{Captures, Regex};
 use serde_json::Value;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use super::web::{check_url, decode_entities, error_chain};
+use super::web::{
+    Lookup, SendError, check_url, decode_entities, error_chain, read_body_capped, send_guarded,
+    system_lookup,
+};
 use crate::compressors;
 use crate::env::ExecutionEnv;
 
@@ -36,11 +39,24 @@ const ERROR_EXCERPT_BYTES: usize = 2000;
 pub struct WebFetchTool {
     env: Arc<ExecutionEnv>,
     client: reqwest::Client,
+    /// 预检 DNS 用的解析函数（见 [`super::web::preflight_dns`]）
+    lookup: Lookup,
 }
 
 impl WebFetchTool {
     pub fn new(env: Arc<ExecutionEnv>, client: reqwest::Client) -> Self {
-        Self { env, client }
+        Self {
+            env,
+            client,
+            lookup: system_lookup(),
+        }
+    }
+
+    /// 测试注入：预检 DNS 走假解析表（不依赖网络）
+    #[cfg(test)]
+    fn with_lookup(mut self, lookup: Lookup) -> Self {
+        self.lookup = lookup;
+        self
     }
 }
 
@@ -136,7 +152,8 @@ impl AgentTool for WebFetchTool {
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .clamp(1, MAX_TIMEOUT_SECS);
 
-        let fetched = match fetch(&self.client, &url, Duration::from_secs(timeout)).await {
+        let timeout = Duration::from_secs(timeout);
+        let fetched = match fetch(&self.client, &self.lookup, &url, timeout).await {
             Ok(f) => f,
             Err(FetchError::Policy(msg)) => {
                 return Ok(ToolOutput::err(format!("[Policy denied] {msg}")));
@@ -170,19 +187,27 @@ enum FetchError {
 
 async fn fetch(
     client: &reqwest::Client,
+    lookup: &Lookup,
     url: &reqwest::Url,
     timeout: Duration,
 ) -> std::result::Result<Fetched, FetchError> {
-    let response = client
+    let request = client
         .get(url.clone())
         .header(
             reqwest::header::ACCEPT,
             "text/html,application/xhtml+xml,application/json;q=0.9,text/plain;q=0.8,*/*;q=0.5",
         )
         .timeout(timeout)
-        .send()
-        .await
+        .build()
         .map_err(|e| request_error(&e, timeout))?;
+    // 逐跳 URL 校验 + 预检 DNS（走代理时连接阶段的 DNS 过滤不会运行）
+    let response = send_guarded(client, request, lookup)
+        .await
+        .map_err(|e| match e {
+            SendError::Refused(msg) if msg.contains("(blocked)") => FetchError::Policy(msg),
+            SendError::Refused(msg) => FetchError::Other(msg),
+            SendError::Request(e) => request_error(&e, timeout),
+        })?;
 
     let final_url = response.url().clone();
     let status = response.status();
@@ -209,19 +234,9 @@ async fn fetch(
     }
 
     // 流式读取，到上限即截断（无 Content-Length 的分块响应也受控）
-    let mut body: Vec<u8> = Vec::new();
-    let mut body_cut = false;
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| request_error(&e, timeout))?;
-        let room = MAX_BODY_BYTES.saturating_sub(body.len());
-        if chunk.len() > room {
-            body.extend_from_slice(&chunk[..room]);
-            body_cut = true;
-            break;
-        }
-        body.extend_from_slice(&chunk);
-    }
+    let (body, body_cut) = read_body_capped(response, MAX_BODY_BYTES)
+        .await
+        .map_err(|e| request_error(&e, timeout))?;
 
     // 未声明类型时按内容嗅探：前 8KB 出现 NUL 字节视为二进制
     if looks_binary(&body) {

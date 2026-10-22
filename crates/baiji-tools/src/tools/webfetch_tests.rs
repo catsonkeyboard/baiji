@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::tools::ExpandTool;
-use crate::tools::web::client_builder;
+use crate::tools::web::{client_builder, fake_lookup, send_guarded};
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -416,10 +416,15 @@ fn route(path: &str, addr: SocketAddr) -> Reply {
         }
         "/r1" => Reply::redirect("302 Found", "/r2".into()),
         "/r2" => Reply::redirect("301 Moved Permanently", format!("http://{addr}/page")),
+        "/r307" => Reply::redirect("307 Temporary Redirect", "/page".into()),
         "/to-metadata" => Reply::redirect(
             "302 Found",
             "http://169.254.169.254/latest/meta-data/".into(),
         ),
+        // 主机名形式的元数据跳转：evil.test 由测试注入的假解析表指向 169.254.169.254
+        "/to-evil" => Reply::redirect("302 Found", "http://evil.test/latest/meta-data/".into()),
+        // 作为假代理时代"元数据服务"应答：内容出现在输出里即说明防护被绕过
+        "/latest/meta-data/" => Reply::new("200 OK", "text/plain", "SECRET-METADATA"),
         "/big" => Reply::new("200 OK", "text/html", big_page()),
         "/image.png" => Reply::new("200 OK", "image/png", b"\x89PNG\r\n\x1a\n\0\0".to_vec()),
         "/nul" => {
@@ -464,13 +469,23 @@ fn route(path: &str, addr: SocketAddr) -> Reply {
 
 /// 极简 HTTP/1.1 服务器：每连接读请求头 → 按路径路由 → 写响应 → 关闭
 async fn spawn_server() -> SocketAddr {
+    spawn_logged_server().await.0
+}
+
+/// 同 [`spawn_server`]，并记录收到的 `方法 目标`。也可充当正向代理：absolute-form
+/// 目标（`GET http://host/path`）按其路径路由——经代理的请求，主机名由代理
+/// （这里即本服务器）负责，客户端自己的 DNS 解析器不会运行。
+async fn spawn_logged_server() -> (SocketAddr, Arc<std::sync::Mutex<Vec<String>>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let log = seen.clone();
     tokio::spawn(async move {
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
                 break;
             };
+            let log = log.clone();
             tokio::spawn(async move {
                 let mut received = Vec::new();
                 let mut buf = [0u8; 2048];
@@ -481,14 +496,21 @@ async fn spawn_server() -> SocketAddr {
                     }
                 }
                 let request = String::from_utf8_lossy(&received);
-                let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let mut words = request.split_whitespace();
+                let method = words.next().unwrap_or("").to_string();
+                let target = words.next().unwrap_or("/").to_string();
+                log.lock().unwrap().push(format!("{method} {target}"));
+                let path = match target.split_once("://") {
+                    Some((_, rest)) => rest.find('/').map_or("/", |i| &rest[i..]),
+                    None => target.as_str(),
+                };
                 // 客户端提前断开（如超限截断）时写失败是预期内的
-                let _ = stream.write_all(&route(&path, addr).encode()).await;
+                let _ = stream.write_all(&route(path, addr).encode()).await;
                 let _ = stream.shutdown().await;
             });
         }
     });
-    addr
+    (addr, seen)
 }
 
 async fn fetch_ok(tool: &WebFetchTool, url: String, extra: Value) -> ToolOutput {
@@ -622,6 +644,147 @@ async fn follows_redirect_chain_and_reports_final_url() {
         "{}",
         out.content
     );
+}
+
+// ---------------------------------------------------------------------------
+// 预检 DNS：走代理时主机名由代理解析，连接阶段的 GuardedResolver 根本不运行
+// ---------------------------------------------------------------------------
+
+/// 假解析表：evil/ali/v6 指向元数据地址；mixed 公网 + 元数据混合（任一被拦截
+/// 即拒绝）；safe 指向公网地址；表外主机名解析失败
+fn metadata_lookup() -> Lookup {
+    fake_lookup(&[
+        ("evil.test", &["169.254.169.254"]),
+        ("ali.test", &["100.100.100.200"]),
+        ("v6.test", &["fd00:ec2::254"]),
+        ("mixed.test", &["93.184.216.34", "169.254.169.254"]),
+        ("safe.test", &["93.184.216.34"]),
+    ])
+}
+
+/// 所有 http 请求都经 `proxy` 转发的客户端（显式代理同时关闭系统代理探测）
+fn proxied_tool(proxy: SocketAddr) -> WebFetchTool {
+    let client = client_builder()
+        .proxy(reqwest::Proxy::http(format!("http://{proxy}")).unwrap())
+        .build()
+        .unwrap();
+    WebFetchTool::new(Arc::new(ExecutionEnv::new(".")), client).with_lookup(metadata_lookup())
+}
+
+#[tokio::test]
+async fn preflight_refuses_metadata_hostnames_behind_proxy() {
+    let (proxy, seen) = spawn_logged_server().await;
+    let tool = proxied_tool(proxy);
+    for host in ["evil.test", "ali.test", "v6.test", "mixed.test"] {
+        let url = format!("http://{host}/latest/meta-data/");
+        let out = fetch_ok(&tool, url, serde_json::json!({})).await;
+        assert!(out.is_error, "{host}: {}", out.content);
+        assert!(
+            out.content.starts_with("[Policy denied]"),
+            "{host}: {}",
+            out.content
+        );
+        assert!(out.content.contains(host), "{}", out.content);
+        assert!(!out.content.contains("SECRET-METADATA"), "{}", out.content);
+    }
+    // 预检在发请求之前：代理一条请求都没收到
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "{:?}",
+        seen.lock().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn preflight_checks_redirect_hops_behind_proxy() {
+    // 首跳 safe.test 预检通过；重定向到 evil.test 时拦截，第二跳不会发出
+    let (proxy, seen) = spawn_logged_server().await;
+    let tool = proxied_tool(proxy);
+    let out = fetch_ok(
+        &tool,
+        "http://safe.test/to-evil".into(),
+        serde_json::json!({}),
+    )
+    .await;
+    assert!(out.is_error, "{}", out.content);
+    assert!(
+        out.content.starts_with("[Policy denied] redirect refused"),
+        "{}",
+        out.content
+    );
+    assert!(out.content.contains("evil.test"), "{}", out.content);
+    assert!(!out.content.contains("SECRET-METADATA"), "{}", out.content);
+    assert_eq!(*seen.lock().unwrap(), vec!["GET http://safe.test/to-evil"]);
+}
+
+#[tokio::test]
+async fn preflight_checks_redirect_hops_without_proxy() {
+    // 不走代理时同样预检（不依赖连接阶段的系统解析结果）
+    let addr = spawn_server().await;
+    let tool = WebFetchTool::new(Arc::new(ExecutionEnv::new(".")), test_client())
+        .with_lookup(metadata_lookup());
+    let out = fetch_ok(
+        &tool,
+        format!("http://{addr}/to-evil"),
+        serde_json::json!({}),
+    )
+    .await;
+    assert!(out.is_error, "{}", out.content);
+    assert!(
+        out.content.starts_with("[Policy denied] redirect refused"),
+        "{}",
+        out.content
+    );
+    assert!(out.content.contains("evil.test"), "{}", out.content);
+}
+
+#[tokio::test]
+async fn guarded_redirects_follow_reqwest_method_rules() {
+    // 手动跟随（websearch 的 POST 表单也走这里）：302/301 把 POST 改为 GET，
+    // 307 原样重放 POST
+    let (addr, seen) = spawn_logged_server().await;
+    let client = test_client();
+    for path in ["/r1", "/r307"] {
+        let request = client
+            .post(format!("http://{addr}{path}"))
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body("q=rust")
+            .build()
+            .unwrap();
+        let response = match send_guarded(&client, request, &metadata_lookup()).await {
+            Ok(response) => response,
+            Err(_) => panic!("{path}: redirect chain should be followed"),
+        };
+        assert_eq!(response.status(), 200, "{path}");
+        assert_eq!(response.url().path(), "/page", "{path}");
+    }
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            "POST /r1",
+            "GET /r2",
+            "GET /page",
+            "POST /r307",
+            "POST /page"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn preflight_passes_clean_and_unresolvable_hosts_to_proxy() {
+    // 预检解析干净 → 放行；本地解析失败 → 放行（代理可能解析得了本地 DNS
+    // 解析不了的名字，常见于需要代理才能访问的网络环境）
+    let (proxy, seen) = spawn_logged_server().await;
+    let tool = proxied_tool(proxy);
+    for url in ["http://safe.test/page", "http://unknown.test/page"] {
+        let out = fetch_ok(&tool, url.into(), serde_json::json!({})).await;
+        assert!(!out.is_error, "{url}: {}", out.content);
+        assert!(out.content.contains("# Hello"), "{}", out.content);
+    }
+    assert_eq!(seen.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
