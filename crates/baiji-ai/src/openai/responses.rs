@@ -184,7 +184,10 @@ pub fn build_request(model: &str, request: &ChatRequest, stream: bool) -> Respon
                     tool_type: "function",
                     name: t.name.clone(),
                     description: t.description.clone(),
-                    parameters: t.parameters.clone(),
+                    parameters: crate::schema::normalize(
+                        &t.parameters,
+                        &crate::schema::OPENAI_COMPATIBLE,
+                    ),
                 })
                 .collect()
         }),
@@ -241,6 +244,14 @@ pub struct ResponsesUsage {
     pub input_tokens: u32,
     #[serde(default)]
     pub output_tokens: u32,
+    #[serde(default)]
+    pub input_tokens_details: Option<InputTokensDetails>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct InputTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: Option<u32>,
 }
 
 pub fn parse_response(resp: ResponsesApiResponse) -> ChatResponse {
@@ -277,9 +288,12 @@ pub fn parse_response(resp: ResponsesApiResponse) -> ChatResponse {
         } else {
             Some(tool_calls)
         },
-        usage: resp.usage.map(|u| TokenUsage {
-            input_tokens: u.input_tokens,
-            output_tokens: u.output_tokens,
+        usage: resp.usage.map(|u| {
+            let cached = u
+                .input_tokens_details
+                .and_then(|d| d.cached_tokens)
+                .unwrap_or(0);
+            TokenUsage::from_openai(u.input_tokens, u.output_tokens, cached)
         }),
     }
 }
@@ -462,10 +476,12 @@ impl ResponsesStreamState {
         if let (Some(input_tokens), Some(output_tokens)) =
             (read("input_tokens"), read("output_tokens"))
         {
-            self.usage = Some(crate::types::TokenUsage {
+            let cached = read("input_tokens_details/cached_tokens").unwrap_or(0);
+            self.usage = Some(crate::types::TokenUsage::from_openai(
                 input_tokens,
                 output_tokens,
-            });
+                cached,
+            ));
         }
     }
 

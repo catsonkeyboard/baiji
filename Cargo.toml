@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/baiji-telemetry",
+    "crates/baiji-command-risk",
     "crates/baiji-ai",
     "crates/baiji-agent",
     "crates/baiji-tools",
@@ -19,6 +20,7 @@ license = "MIT"
 
 [workspace.dependencies]
 baiji-telemetry = { path = "crates/baiji-telemetry" }
+baiji-command-risk = { path = "crates/baiji-command-risk" }
 baiji-ai = { path = "crates/baiji-ai" }
 baiji-agent = { path = "crates/baiji-agent" }
 baiji-tools = { path = "crates/baiji-tools" }
@@ -49,6 +51,9 @@ ratatui = "0.30"
 crossterm = "0.29"
 dirs = "6"
 unicode-width = "0.2"
+# TUI 聊天渲染：Markdown 解析（仅解析器，无 html/getopts）与内联 diff
+pulldown-cmark = { version = "0.13", default-features = false }
+similar = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"

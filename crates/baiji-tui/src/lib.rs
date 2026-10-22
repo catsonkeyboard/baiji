@@ -5,13 +5,18 @@
 //! - 运行中输入 → steering 队列；Esc → 取消当前运行
 //! - Ctrl+O 打开会话选择器（切换 / 分叉）
 //! - HITL：确认请求弹出对话框（y/a/n），由 [`InteractiveApprover`] 桥接
-//! - PageUp/PageDown 滚动，新内容到达自动回底
+//! - 多行输入框：Shift/Alt+Enter、Ctrl+J、行尾 `\` 换行；光标编辑；粘贴保留换行
+//! - ↑↓ 提示词历史（`~/.baiji/prompt-history.jsonl`）；Shift+↑↓ / PageUp/PageDown 滚动，
+//!   仅在视图贴底时随新内容回底
 
 mod app;
 mod confirm;
+mod diff;
 mod i18n;
+mod markdown;
 mod settings;
 mod theme;
+mod tool_display;
 mod ui;
 
 use anyhow::Result;
@@ -42,7 +47,11 @@ pub async fn run(
     jobs: Option<Arc<baiji_tools::tools::jobs::JobRegistry>>,
     lang: Lang,
 ) -> Result<()> {
-    app::App::new(
+    // 提示词历史与全局配置同目录：~/.baiji/prompt-history.jsonl
+    let history_path = config_path
+        .parent()
+        .map(|dir| dir.join("prompt-history.jsonl"));
+    let mut app = app::App::new(
         harness,
         theme,
         confirm_rx,
@@ -52,9 +61,11 @@ pub async fn run(
         auto_continue,
         jobs,
         lang,
-    )
-    .run()
-    .await
+    );
+    if let Some(path) = history_path {
+        app.set_prompt_history(app::PromptHistory::load(path));
+    }
+    app.run().await
 }
 
 #[cfg(test)]

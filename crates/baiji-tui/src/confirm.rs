@@ -69,10 +69,10 @@ mod tests {
         let handle = tokio::spawn(async move {
             approver
                 .confirm(
-                    ConfirmationRequest {
-                        tool_name: "bash".to_string(),
-                        args: serde_json::json!({"command": "rm -rf ./build"}),
-                    },
+                    ConfirmationRequest::new(
+                        "bash",
+                        serde_json::json!({"command": "rm -rf ./build"}),
+                    ),
                     &CancellationToken::new(),
                 )
                 .await
@@ -102,10 +102,7 @@ mod tests {
             async move {
                 approver
                     .confirm(
-                        ConfirmationRequest {
-                            tool_name: "bash".to_string(),
-                            args: serde_json::json!({}),
-                        },
+                        ConfirmationRequest::new("bash", serde_json::json!({})),
                         &cancel,
                     )
                     .await
@@ -126,10 +123,7 @@ mod tests {
         let approver = InteractiveApprover::new(tx);
         let decision = approver
             .confirm(
-                ConfirmationRequest {
-                    tool_name: "bash".to_string(),
-                    args: serde_json::json!({}),
-                },
+                ConfirmationRequest::new("bash", serde_json::json!({})),
                 &CancellationToken::new(),
             )
             .await;

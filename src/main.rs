@@ -152,6 +152,27 @@ async fn main() -> Result<()> {
         tools.register(tool);
     }
 
+    // ---- web 工具（webfetch / websearch）：web 配置段全局专用，BAIJI_WEB=off 关闭 ----
+    // 须在子代理工具子集收集之前注册（两者都在只读白名单内）
+    let web = baiji_tools::web_tools(agent_env.clone(), &app_config.web);
+    if web.is_empty() {
+        info!("web tools disabled");
+    } else {
+        info!(
+            "web tools registered (search engines: {})",
+            app_config
+                .web
+                .engines()
+                .iter()
+                .map(|e| e.as_str())
+                .collect::<Vec<_>>()
+                .join(" → ")
+        );
+    }
+    for tool in web {
+        tools.register(tool);
+    }
+
     // ---- 跨会话项目记忆（memory 工具 + 系统提示注入）----
     let memory_store = Arc::new(baiji_harness::MemoryStore::open(baiji_dir.join("memory")));
     let memory_project = baiji_harness::project_key(&workdir);
@@ -164,6 +185,13 @@ async fn main() -> Result<()> {
     // ---- 会话任务清单（todo 工具 + 系统提示注入，长程任务状态外置）----
     let todo_store = Arc::new(baiji_harness::TodoStore::new());
     tools.register(Arc::new(baiji_harness::TodoTool::new(todo_store.clone())));
+    // 历史会话检索 / 取回被压缩掉的原始轮次（与 harness 共享当前会话 id）
+    let session_cursor: baiji_harness::SessionCursor = Default::default();
+    tools.register(Arc::new(baiji_harness::RecallTool::new(
+        baiji_dir.join("sessions"),
+        Some(memory_project.clone()),
+        session_cursor.clone(),
+    )));
 
     // skills：同名时项目级 ./.baiji/skills 覆盖用户级 ~/.baiji/skills
     // （load_skills 后者覆盖前者，故用户级在前）。系统提示只列清单，正文经 skill 工具按需加载
@@ -245,7 +273,7 @@ async fn main() -> Result<()> {
     let mut hooks = HookRegistry::new();
     let applied = baiji_extensions::PluginManager::new()
         .add(Box::new(baiji_extensions::ClockPlugin))
-        .add(Box::new(baiji_extensions::SafetyPlugin))
+        .add(Box::new(baiji_extensions::SafetyPlugin::new(&workdir)))
         .apply(&mut tools, &mut hooks)?;
     info!(
         "tools: {} ({}) · plugins: {}",
@@ -341,10 +369,20 @@ async fn main() -> Result<()> {
         runtime_builder = runtime_builder.with_max_tokens(cap);
     }
     if !app_config.policy.require_confirmation_tools.is_empty() {
-        runtime_builder = runtime_builder.with_confirmation(baiji_agent::ConfirmationGate::new(
+        // 不可逆 bash 命令（git reset --hard / curl|sh …）无视 AllowAll 必弹并展示原因；
+        // 只读检查命令（路径都在白名单内）免弹窗——headless 未加 --yes 时也能跑
+        let mut gate = baiji_agent::ConfirmationGate::new(
             app_config.policy.require_confirmation_tools.clone(),
             approver,
-        ));
+        )
+        .with_escalation(baiji_extensions::irreversible_escalation(workdir.clone()));
+        if app_config.policy.auto_approve_readonly {
+            gate = gate.with_auto_approve(baiji_extensions::readonly_auto_approve(
+                agent_env.allowed_roots.clone(),
+                &app_config.policy.trusted_commands,
+            ));
+        }
+        runtime_builder = runtime_builder.with_confirmation(gate);
     }
     if app_config.policy.verbosity_steer {
         info!("verbosity steer enabled (constant conciseness suffix on the last user turn)");
@@ -398,6 +436,7 @@ async fn main() -> Result<()> {
 
     // 任务清单（与已注册的 TodoTool 共享存储）
     harness.set_todos(todo_store);
+    harness.set_session_cursor(session_cursor);
 
     // 子代理角色（与已注册的 task 工具共享注册表：分发 + 系统提示段）
     harness.set_subagents(subagent_registry);
@@ -432,6 +471,13 @@ async fn main() -> Result<()> {
             break;
         }
     }
+
+    // 项目说明（AGENTS.md / CLAUDE.md：~/.baiji 全局 + git 根到当前目录逐级；BAIJI_AGENTS_MD=off 关闭）
+    let instructions = baiji_harness::load_project_instructions(&workdir, Some(&baiji_dir));
+    if instructions.is_some() {
+        info!("project instructions loaded (AGENTS.md / CLAUDE.md)");
+    }
+    harness.set_project_instructions(instructions);
 
     // 用户 prompt 模板（/name 参数）：同名时项目级覆盖用户级
     let templates = baiji_harness::load_templates(&[

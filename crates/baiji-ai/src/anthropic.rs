@@ -25,15 +25,63 @@ pub struct AnthropicProvider {
     base_url: String,
     api_key: String,
     model: String,
+    /// 显式 prompt caching 断点（cache_control）。默认只对官方 api.anthropic.com 开启：
+    /// 官方 API 不加断点就完全不缓存；第三方 Anthropic 兼容端点多为自动前缀缓存，
+    /// 且未必接受该字段
+    prompt_caching: bool,
 }
 
 impl AnthropicProvider {
     pub fn new(base_url: String, api_key: String, model: String) -> Self {
+        let prompt_caching = base_url.contains("api.anthropic.com");
         Self {
             client: Arc::new(crate::error::http_client()),
             base_url,
             api_key,
             model,
+            prompt_caching,
+        }
+    }
+
+    /// 覆盖 prompt caching 开关（测试 / 已知支持 cache_control 的兼容端点）
+    pub fn with_prompt_caching(mut self, on: bool) -> Self {
+        self.prompt_caching = on;
+        self
+    }
+
+    /// 打上缓存断点（最多 4 个，这里用 3 个）：
+    /// - system 末块：缓存 tools + system（tools 在缓存前缀中位于 system 之前）
+    /// - 最后一条消息的末块：滚动断点，下一次请求从这里命中
+    /// - 倒数第二条 user 消息的末块：工具循环里新增块较多时，保证仍落在 20 块回溯窗口内
+    ///
+    /// thinking / redacted_thinking 块不能带 cache_control，取其前最后一个可缓存块。
+    fn apply_prompt_caching(body: &mut AnthropicRequest) {
+        if let Some(SystemPrompt::Text(text)) = body.system.take() {
+            body.system = Some(SystemPrompt::Blocks(vec![SystemBlock {
+                block_type: "text",
+                text,
+                cache_control: Some(CacheControl::EPHEMERAL),
+            }]));
+        }
+        // 滚动断点：最后一条消息 + 上一条 user 消息
+        let last = body.messages.len().checked_sub(1);
+        let prev_user = body
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role == "user")
+            .map(|(i, _)| i)
+            .rev()
+            .find(|i| Some(*i) != last);
+        for index in [last, prev_user].into_iter().flatten() {
+            if let Some(block) = body.messages[index]
+                .content
+                .iter_mut()
+                .rev()
+                .find(|b| !matches!(b.block_type, "thinking" | "redacted_thinking"))
+            {
+                block.cache_control = Some(CacheControl::EPHEMERAL);
+            }
         }
     }
 
@@ -43,7 +91,7 @@ impl AnthropicProvider {
 
     /// 转换消息格式为 Anthropic 格式。
     /// 多条 System 消息（如压缩摘要）以空行拼接为单个 system 字段。
-    fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<AnthropicMessage>) {
+    fn convert_messages(messages: &[Message]) -> (Option<SystemPrompt>, Vec<AnthropicMessage>) {
         let mut system_parts: Vec<String> = Vec::new();
         let mut anthropic_messages: Vec<AnthropicMessage> = Vec::new();
         let turn_start = crate::types::current_turn_start(messages);
@@ -121,7 +169,7 @@ impl AnthropicProvider {
         }
 
         (
-            (!system_parts.is_empty()).then(|| system_parts.join("\n\n")),
+            (!system_parts.is_empty()).then(|| SystemPrompt::Text(system_parts.join("\n\n"))),
             anthropic_messages,
         )
     }
@@ -160,7 +208,10 @@ impl AnthropicProvider {
                     .map(|t| AnthropicTool {
                         name: t.name.clone(),
                         description: t.description.clone(),
-                        input_schema: t.parameters.clone(),
+                        input_schema: crate::schema::normalize(
+                            &t.parameters,
+                            &crate::schema::ANTHROPIC,
+                        ),
                     })
                     .collect()
             }),
@@ -173,7 +224,10 @@ impl AnthropicProvider {
 #[async_trait]
 impl Provider for AnthropicProvider {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let body = Self::build_request_body(&request, &self.model, false);
+        let mut body = Self::build_request_body(&request, &self.model, false);
+        if self.prompt_caching {
+            Self::apply_prompt_caching(&mut body);
+        }
 
         let response = self
             .client
@@ -224,10 +278,12 @@ impl Provider for AnthropicProvider {
             } else {
                 Some(tool_calls)
             },
-            usage: Some(TokenUsage {
-                input_tokens: anthropic_response.usage.input_tokens,
-                output_tokens: anthropic_response.usage.output_tokens,
-            }),
+            usage: Some(TokenUsage::from_anthropic(
+                anthropic_response.usage.input_tokens,
+                anthropic_response.usage.output_tokens,
+                anthropic_response.usage.cache_read_input_tokens,
+                anthropic_response.usage.cache_creation_input_tokens,
+            )),
         })
     }
 
@@ -235,7 +291,10 @@ impl Provider for AnthropicProvider {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
-        let body = Self::build_request_body(&request, &self.model, true);
+        let mut body = Self::build_request_body(&request, &self.model, true);
+        if self.prompt_caching {
+            Self::apply_prompt_caching(&mut body);
+        }
         let url = self.messages_url();
 
         let response = self
@@ -331,8 +390,12 @@ impl AnthropicStreamState {
             "message_start" => {
                 // 输入 token 数在 message_start，输出 token 数在 message_delta
                 if let Some(usage) = event.message.and_then(|m| m.usage) {
-                    self.usage.input_tokens = usage.input_tokens;
-                    self.usage.output_tokens = usage.output_tokens;
+                    self.usage = TokenUsage::from_anthropic(
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.cache_read_input_tokens,
+                        usage.cache_creation_input_tokens,
+                    );
                 }
                 Vec::new()
             }
@@ -400,11 +463,19 @@ impl AnthropicStreamState {
                     self.stop_reason = Some(reason);
                 }
                 if let Some(usage) = event.usage {
-                    self.usage.output_tokens = usage.output_tokens;
-                    // 部分兼容端点只在 message_delta 给出 input_tokens
-                    if usage.input_tokens > 0 {
-                        self.usage.input_tokens = usage.input_tokens;
+                    // 部分兼容端点只在 message_delta 给出 input/缓存 token
+                    if usage.input_tokens > 0
+                        || usage.cache_read_input_tokens > 0
+                        || usage.cache_creation_input_tokens > 0
+                    {
+                        self.usage = TokenUsage::from_anthropic(
+                            usage.input_tokens,
+                            usage.output_tokens,
+                            usage.cache_read_input_tokens,
+                            usage.cache_creation_input_tokens,
+                        );
                     }
+                    self.usage.output_tokens = usage.output_tokens;
                 }
                 Vec::new()
             }
@@ -455,7 +526,7 @@ struct AnthropicRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
+    system: Option<SystemPrompt>,
     messages: Vec<AnthropicMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<AnthropicTool>>,
@@ -463,6 +534,34 @@ struct AnthropicRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<AnthropicThinking>,
     stream: bool,
+}
+
+/// system 字段：纯字符串，或带 cache_control 的文本块数组
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum SystemPrompt {
+    Text(String),
+    Blocks(Vec<SystemBlock>),
+}
+
+#[derive(Debug, Serialize)]
+struct SystemBlock {
+    #[serde(rename = "type")]
+    block_type: &'static str,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
+}
+
+/// prompt caching 断点（`{"type": "ephemeral"}`，默认 5 分钟 TTL）
+#[derive(Debug, Clone, Copy, Serialize)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+impl CacheControl {
+    const EPHEMERAL: Self = Self { kind: "ephemeral" };
 }
 
 /// Anthropic 扩展思考配置（type 恒为 enabled）
@@ -501,6 +600,9 @@ struct ContentBlock {
     /// redacted_thinking 的密文
     #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<String>,
+    /// prompt caching 断点（仅官方端点，见 `apply_prompt_caching`）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
 }
 
 impl ContentBlock {
@@ -536,6 +638,7 @@ impl ContentBlock {
             thinking: None,
             signature: None,
             data: None,
+            cache_control: None,
         }
     }
 
@@ -551,6 +654,7 @@ impl ContentBlock {
             thinking: None,
             signature: None,
             data: None,
+            cache_control: None,
         }
     }
 
@@ -566,6 +670,7 @@ impl ContentBlock {
             thinking: None,
             signature: None,
             data: None,
+            cache_control: None,
         }
     }
 
@@ -584,6 +689,7 @@ impl ContentBlock {
             thinking: None,
             signature: None,
             data: None,
+            cache_control: None,
         }
     }
 }
@@ -629,6 +735,10 @@ struct ResponseContentBlock {
 struct AnthropicUsage {
     input_tokens: u32,
     output_tokens: u32,
+    #[serde(default)]
+    cache_read_input_tokens: u32,
+    #[serde(default)]
+    cache_creation_input_tokens: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -664,6 +774,10 @@ struct StreamUsage {
     input_tokens: u32,
     #[serde(default)]
     output_tokens: u32,
+    #[serde(default)]
+    cache_read_input_tokens: u32,
+    #[serde(default)]
+    cache_creation_input_tokens: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -737,6 +851,86 @@ mod tests {
         let (_, plain) =
             AnthropicProvider::convert_messages(&[Message::user("a"), Message::user("b")]);
         assert_eq!(plain.len(), 2, "no merging without tool_result blocks");
+    }
+
+    #[test]
+    fn test_prompt_caching_defaults_to_official_endpoint_only() {
+        let official = AnthropicProvider::new(
+            "https://api.anthropic.com".into(),
+            "k".into(),
+            "claude-x".into(),
+        );
+        assert!(official.prompt_caching);
+        let compat = AnthropicProvider::new(
+            "https://api.deepseek.com/anthropic".into(),
+            "k".into(),
+            "deepseek-chat".into(),
+        );
+        assert!(!compat.prompt_caching);
+        assert!(compat.with_prompt_caching(true).prompt_caching);
+    }
+
+    #[test]
+    fn test_prompt_caching_marks_system_and_rolling_breakpoints() {
+        let messages = vec![
+            Message::system("sys"),
+            Message::user("q1"),
+            Message::assistant("a1"),
+            Message::user("q2"),
+            Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: Some(vec![ToolCall {
+                    id: "tu_1".to_string(),
+                    name: "grep".to_string(),
+                    arguments: serde_json::json!({}),
+                }]),
+                tool_results: None,
+                reasoning: None,
+            },
+            Message {
+                role: Role::Tool,
+                content: String::new(),
+                tool_calls: None,
+                tool_results: Some(vec![ToolResult {
+                    tool_call_id: "tu_1".to_string(),
+                    content: "r".to_string(),
+                }]),
+                reasoning: None,
+            },
+        ];
+        let mut body =
+            AnthropicProvider::build_request_body(&ChatRequest::new(messages), "claude-x", true);
+        AnthropicProvider::apply_prompt_caching(&mut body);
+        let body = serde_json::to_value(body).unwrap();
+
+        assert_eq!(body["system"][0]["text"], "sys");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        let msgs = body["messages"].as_array().unwrap();
+        let marked: Vec<usize> = msgs
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                m["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|b| b.get("cache_control").is_some())
+            })
+            .map(|(i, _)| i)
+            .collect();
+        // 最后一条（tool_result user 回合）+ 上一条 user 消息（q2）
+        assert_eq!(marked, vec![2, 4], "{body:#}");
+        assert_eq!(msgs[4]["content"][0]["type"], "tool_result");
+        // 未开启时不出现 cache_control
+        let plain = serde_json::to_value(AnthropicProvider::build_request_body(
+            &ChatRequest::new(vec![Message::system("sys"), Message::user("q")]),
+            "claude-x",
+            true,
+        ))
+        .unwrap();
+        assert_eq!(plain["system"], "sys");
+        assert!(!plain.to_string().contains("cache_control"));
     }
 
     #[test]
@@ -933,11 +1127,50 @@ mod tests {
             vec![
                 StreamChunk::Usage(TokenUsage {
                     input_tokens: 0,
-                    output_tokens: 4096
+                    output_tokens: 4096,
+                    ..Default::default()
                 }),
                 StreamChunk::Stop(crate::types::StopReason::MaxTokens),
                 StreamChunk::Done
             ]
+        );
+    }
+
+    #[test]
+    fn test_stream_usage_adds_cache_tokens_to_input() {
+        // Anthropic 的 input_tokens 不含缓存：总输入 = input + cache_read + cache_creation
+        let mut state = AnthropicStreamState::default();
+        state.process_data(
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":12,"cache_read_input_tokens":9000,"cache_creation_input_tokens":300,"output_tokens":1}}}"#,
+        );
+        state.process_data(
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42}}"#,
+        );
+        let chunks = state.process_data(r#"{"type":"message_stop"}"#);
+        assert_eq!(
+            chunks[0],
+            StreamChunk::Usage(TokenUsage {
+                input_tokens: 9312,
+                output_tokens: 42,
+                cache_read_tokens: 9000,
+                cache_write_tokens: 300,
+            })
+        );
+        // 只在 message_delta 给出缓存字段的兼容端点
+        let mut state = AnthropicStreamState::default();
+        state.process_data(r#"{"type":"message_start","message":{}}"#);
+        state.process_data(
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":5,"cache_read_input_tokens":95,"output_tokens":7}}"#,
+        );
+        let chunks = state.process_data(r#"{"type":"message_stop"}"#);
+        assert_eq!(
+            chunks[0],
+            StreamChunk::Usage(TokenUsage {
+                input_tokens: 100,
+                output_tokens: 7,
+                cache_read_tokens: 95,
+                cache_write_tokens: 0,
+            })
         );
     }
 
@@ -963,7 +1196,8 @@ mod tests {
             vec![
                 StreamChunk::Usage(TokenUsage {
                     input_tokens: 120,
-                    output_tokens: 45
+                    output_tokens: 45,
+                    ..Default::default()
                 }),
                 StreamChunk::Stop(crate::types::StopReason::ToolUse),
                 StreamChunk::Done

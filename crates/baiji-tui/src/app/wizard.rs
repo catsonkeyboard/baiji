@@ -148,7 +148,7 @@ impl App {
             }
             WizardStep::Key => {
                 // 输入框内容为 Key；空 = 沿用现有
-                let typed = self.input.trim().to_string();
+                let typed = self.input.text().trim().to_string();
                 self.input.clear();
                 {
                     let wizard = self.wizard.as_mut().unwrap();
@@ -184,7 +184,7 @@ impl App {
                 }
             }
             WizardStep::ModelManual => {
-                let typed = self.input.trim().to_string();
+                let typed = self.input.text().trim().to_string();
                 self.input.clear();
                 if typed.is_empty() {
                     return;

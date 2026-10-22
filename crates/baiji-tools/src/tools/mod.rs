@@ -11,6 +11,9 @@ pub mod jobs;
 pub mod ls;
 pub mod read;
 pub mod search;
+pub mod web;
+pub mod webfetch;
+pub mod websearch;
 pub mod write;
 
 pub use bash::BashTool;
@@ -24,4 +27,7 @@ pub use jobs::{JobRegistry, JobsTool};
 pub use ls::LsTool;
 pub use read::ReadTool;
 pub use search::SearchTool;
+pub use web::WebConfig;
+pub use webfetch::WebFetchTool;
+pub use websearch::WebSearchTool;
 pub use write::WriteTool;

@@ -36,6 +36,11 @@ impl AgentTool for ExpandTool {
         "expand"
     }
 
+    /// 只读取内容寻址存储（写入方是 spill，同句柄内容恒定）：可同轮并发
+    fn parallel(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "Retrieve the FULL content of a previously truncated tool output by its handle \
          (the `ctx:...` value from a [truncated] marker). Supports offset/limit paging."

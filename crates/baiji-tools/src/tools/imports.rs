@@ -29,6 +29,11 @@ impl AgentTool for ImportsTool {
         "imports"
     }
 
+    /// 只读；共享的只有 index.rs 的解析缓存（Mutex 保护、不跨 await 持锁）：可同轮并发
+    fn parallel(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "Query import dependency edges of the codebase (impact analysis). \
          direction='outgoing': what a file imports; \

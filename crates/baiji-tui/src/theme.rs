@@ -13,6 +13,12 @@ pub struct Theme {
     pub error: Color,
     /// 用户消息整行的底色条（`❯` 行高亮背景）
     pub highlight: Color,
+    /// Markdown 行内代码与代码块正文（单色，不做语法高亮）
+    pub code: Color,
+    /// 内联 diff：新增行 `+`
+    pub diff_add: Color,
+    /// 内联 diff：删除行 `-`
+    pub diff_del: Color,
 }
 
 impl Theme {
@@ -26,6 +32,9 @@ impl Theme {
             accent: Color::Cyan,
             error: Color::Red,
             highlight: Color::Rgb(38, 38, 38), // #262626 用户消息底条
+            code: Color::Rgb(206, 145, 120),   // 暖橙（#CE9178）
+            diff_add: Color::Rgb(100, 200, 100),
+            diff_del: Color::Rgb(220, 105, 105),
         }
     }
 
@@ -39,6 +48,9 @@ impl Theme {
             accent: Color::Blue,
             error: Color::Rgb(200, 0, 0),
             highlight: Color::Rgb(228, 228, 228), // 浅灰用户消息底条
+            code: Color::Rgb(163, 21, 21),        // 深红（#A31515）
+            diff_add: Color::Rgb(0, 128, 0),
+            diff_del: Color::Rgb(180, 30, 30),
         }
     }
 

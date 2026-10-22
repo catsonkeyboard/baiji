@@ -26,6 +26,8 @@ impl App {
                     &self.strings.cmd_help_tpl,
                     &[&list.join(" · ")],
                 )));
+                self.lines
+                    .push(ChatLine::System(self.strings.cmd_help_keys.to_string()));
                 if !self.templates.is_empty() {
                     let list: Vec<String> = self
                         .templates

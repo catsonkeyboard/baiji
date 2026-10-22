@@ -11,6 +11,7 @@ pub mod error;
 pub mod models;
 pub mod openai;
 pub mod provider;
+pub mod schema;
 pub mod types;
 pub mod vendors;
 

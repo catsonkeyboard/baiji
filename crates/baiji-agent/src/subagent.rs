@@ -28,8 +28,10 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 /// 子代理默认可用的工具（只读集；写入类工具由装配方显式追加）
-pub const SUBAGENT_ALLOWED_TOOLS: &[&str] =
-    &["read", "grep", "find", "ls", "search", "imports", "expand"];
+pub const SUBAGENT_ALLOWED_TOOLS: &[&str] = &[
+    "read", "grep", "find", "ls", "search", "imports", "expand", "webfetch", "websearch",
+    "recall",
+];
 
 /// 子代理系统提示
 const SUB_SYSTEM_PROMPT: &str = "\

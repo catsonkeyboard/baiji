@@ -3,9 +3,9 @@
 use anyhow::Result;
 use baiji_agent::{AgentEvent, ConfirmationDecision, SteeringQueue};
 use baiji_harness::AgentHarness;
-use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
@@ -15,13 +15,22 @@ use crate::theme::Theme;
 
 use wizard::wizard_input_step_intercept;
 
-/// 聊天区的一行（逻辑行）
-#[derive(Debug, Clone)]
+/// 聊天区的一行（逻辑行）。PartialEq 供渲染缓存校验条目是否变化
+#[derive(Debug, Clone, PartialEq)]
 pub enum ChatLine {
     User(String),
+    /// 助手正文（Markdown 渲染）
     Assistant(String),
-    /// 工具活动行：启动/结束摘要
+    /// 工具活动行：`● name(摘要)` / `⎿ 结果概述`（`⎿ ✗` 失败）
     Tool(String),
+    /// 工具调用行 `● name(摘要)`（带调用 id）：并行工具的结果可能乱序到达，
+    /// `⎿` 结果按 id 插回本行之下，而不是按到达顺序追加
+    ToolCall {
+        id: String,
+        text: String,
+    },
+    /// edit/write 的内联 diff 块（紧跟其 `●` 行；失败时 ToolFinished 标记）
+    Diff(crate::diff::DiffView),
     System(String),
 }
 
@@ -36,10 +45,18 @@ impl ChatLine {
 }
 
 mod helpers;
+mod history;
+mod input;
 mod pickers;
 mod slash;
+mod terminal;
 mod wizard;
 
+/// 聊天渲染（工具摘要 / 内联 diff / Markdown / 渲染缓存 / 确认弹窗 diff）的 App 级测试
+#[cfg(test)]
+mod chat_tests;
+#[cfg(test)]
+mod input_tests;
 #[cfg(test)]
 mod tests;
 
@@ -47,8 +64,22 @@ use helpers::read_git_branch;
 pub use helpers::{
     format_bytes, ghost_completion, sanitize_paste, slash_commands, split_slash,
 };
-pub use pickers::{PendingConfirm, SessionPicker, SubagentsPanel};
+pub(crate) use history::PromptHistory;
+use input::InputBuffer;
+// 输入框可视行布局（ui::draw_input 与 ↑↓ 行间移动共用同一套折行）
+pub(crate) use input::{
+    cursor_row_col as input_cursor, display_width as input_display_width,
+    layout_rows as input_layout,
+};
+pub use pickers::{ConfirmBody, PendingConfirm, SessionPicker, SubagentsPanel};
 pub use wizard::{ConfigWizard, WizardStep};
+
+/// 粘贴守卫窗口：粘贴后这么短时间内到达的 Enter 属于粘贴内容（换行），不是提交
+const PASTE_ENTER_GUARD: Duration = Duration::from_millis(150);
+/// 输入框最多可见行数（超出后滚动、保持光标可见）
+pub(crate) const MAX_INPUT_ROWS: usize = 8;
+/// 首帧渲染前的输入框文本宽度假设（↑↓ 行间移动用；渲染后以真实宽度覆盖）
+const DEFAULT_INPUT_WIDTH: usize = 76;
 
 /// UI 事件：键盘输入 / 粘贴 / Agent 事件
 /// （模型发现结果走专用通道，见事件循环 models_rx）
@@ -67,9 +98,25 @@ pub struct App {
     status_hint: String,
     theme: Theme,
     lines: Vec<ChatLine>,
-    input: String,
+    /// 多行输入框（文本 + 光标 + 粘贴占位符）
+    input: InputBuffer,
+    /// 提示词历史（↑↓ 召回；`~/.baiji/prompt-history.jsonl`，测试为纯内存）
+    history: PromptHistory,
+    /// 最近一次粘贴的时刻（粘贴守卫：紧随其后的 Enter 视为换行）
+    last_paste: Option<Instant>,
+    /// 输入框可视行滚动偏移（光标保持可见；渲染时更新）
+    input_scroll: usize,
+    /// 输入框文本区宽度（列；渲染时更新，↑↓ 按可视行移动光标用）
+    input_width: usize,
     /// 滚动偏移；usize::MAX 为「贴底」哨兵，渲染时钳制
     scroll: usize,
+    /// 视图是否跟随底部：用户上翻后为 false，新内容不再把视图拽回底部；
+    /// 翻回底部（渲染钳制）或提交/Ctrl+End 时恢复
+    follow_bottom: bool,
+    /// 最近一次渲染钳制得到的底部偏移（哨兵态下上翻的起点）
+    chat_bottom: usize,
+    /// 聊天区可视高度（行；渲染时更新，PageUp/PageDown 翻页用）
+    chat_viewport: u16,
     agent_running: bool,
     current_turn: u32,
     tool_calls: u32,
@@ -118,6 +165,8 @@ pub struct App {
     git_branch: Option<String>,
     /// 渲染帧计数（驱动运行中指示器的旋转动画）
     frame: u64,
+    /// 聊天区渲染缓存：已落定条目按 (宽度, 主题, 语言) 缓存可视行，免每帧重排全部历史
+    chat_cache: crate::ui::ChatCache,
     /// 后台任务注册表（/tasks、/kill；headless 装配为 None）
     jobs: Option<Arc<baiji_tools::tools::jobs::JobRegistry>>,
     /// 本次会话累计工具调用次数（/usage；跨 run 累计）
@@ -173,8 +222,15 @@ impl App {
             models_tx: None,
             // 空聊天区由欢迎屏兜底（快捷键提示在那里展示）
             lines: Vec::new(),
-            input: String::new(),
+            input: InputBuffer::new(),
+            history: PromptHistory::in_memory(),
+            last_paste: None,
+            input_scroll: 0,
+            input_width: DEFAULT_INPUT_WIDTH,
             scroll: usize::MAX,
+            follow_bottom: true,
+            chat_bottom: 0,
+            chat_viewport: 0,
             agent_running: false,
             current_turn: 0,
             tool_calls: 0,
@@ -194,6 +250,7 @@ impl App {
             workdir,
             git_branch,
             frame: 0,
+            chat_cache: crate::ui::ChatCache::default(),
             jobs,
             strings: crate::i18n::Strings::for_lang(lang),
             plan_mode,
@@ -201,12 +258,18 @@ impl App {
         }
     }
 
+    /// 注入提示词历史（lib::run 传入落盘历史；默认纯内存，测试不碰真实家目录）
+    pub(crate) fn set_prompt_history(&mut self, history: PromptHistory) {
+        self.history = history;
+    }
+
     pub async fn run(&mut self) -> Result<()> {
         let mut terminal = ratatui::init();
-        // 启用终端 bracketed paste：Cmd+V / Ctrl+Shift+V 粘贴以事件送达
-        crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste).ok();
+        // bracketed paste（粘贴以事件送达）+ kitty 键盘协议（Shift+Enter 可区分）；
+        // 退出与 panic 路径都会恢复（见 terminal.rs）
+        terminal::enable_input_modes();
         let result = self.event_loop(&mut terminal).await;
-        crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste).ok();
+        terminal::restore_input_modes();
         ratatui::restore();
         result
     }
@@ -220,7 +283,10 @@ impl App {
         std::thread::spawn(move || {
             while let Ok(event) = crossterm::event::read() {
                 let forwarded = match event {
-                    CrosstermEvent::Key(key) => Some(UiEvent::Key(key)),
+                    // 只处理按下/重复（Windows 与 kitty 事件类型上报会额外送达松开事件）
+                    CrosstermEvent::Key(key) if key.kind != KeyEventKind::Release => {
+                        Some(UiEvent::Key(key))
+                    }
                     CrosstermEvent::Paste(text) => Some(UiEvent::Paste(text)),
                     _ => None,
                 };
@@ -300,7 +366,7 @@ impl App {
                     }
                 }
                 LoopEvent::Agent(agent_event) => {
-                    self.handle_agent_event(agent_event, &ui_tx);
+                    self.on_agent_event(agent_event, &ui_tx);
                     if terminal.draw(|frame| crate::ui::draw(frame, self)).is_err() {
                         return Ok(());
                     }
@@ -342,7 +408,8 @@ impl App {
         }
 
         // 配置向导模式：列表步骤全权拦截；输入步骤只拦 Enter/Esc，
-        // 字符/退格/粘贴落入下方正常输入处理（进输入框）
+        // 其余只放行单行编辑键（字符/退格/光标移动进输入框；不换行、不召回历史、不补全）
+        let mut wizard_input = false;
         if self.wizard.is_some() {
             let is_input_step = self.wizard.as_ref().is_some_and(|w| w.step.is_input());
             if !is_input_step {
@@ -355,7 +422,7 @@ impl App {
                 }
                 return false;
             }
-            // 其余按键继续走正常输入处理
+            wizard_input = true;
         }
 
         // 确认对话框优先拦截
@@ -363,6 +430,21 @@ impl App {
             self.handle_confirm_key(key);
             return false;
         }
+
+        if wizard_input {
+            self.edit_key(key);
+            return false;
+        }
+
+        // 粘贴守卫：部分终端在 bracketed paste 之后补发一个回车——
+        // 紧随粘贴到达的 Enter 属于粘贴内容，按换行处理而非提交
+        let after_paste = self
+            .last_paste
+            .take()
+            .is_some_and(|at| at.elapsed() < PASTE_ENTER_GUARD);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
         match key.code {
             KeyCode::Esc => {
@@ -376,88 +458,176 @@ impl App {
                     self.lines.push(ChatLine::System(
                         self.strings.plan_confirm_cancelled.to_string(),
                     ));
+                } else if !self.input.is_empty() {
+                    // 有草稿时 Esc 先清空草稿；空输入再按 Esc 才退出（防误触丢稿）
+                    self.input.clear();
+                    self.history.reset_draft();
                 } else {
                     return true;
                 }
             }
+            // 换行：Shift+Enter（需 kitty 键盘协议）/ Alt+Enter / 粘贴尾随回车
+            KeyCode::Enter if shift || alt || after_paste => self.input.insert_newline(),
             KeyCode::Enter => {
-                let text = self.input.trim().to_string();
-                if text.is_empty() {
-                    // 计划等待态：空回车 = 批准执行（退出计划模式并发起执行 run）
-                    if self.awaiting_plan {
-                        self.approve_plan(ui_tx.clone()).await;
-                        self.scroll_to_bottom();
-                    }
+                // 行尾 `\` 续行：任何终端都可用的换行兜底
+                if self.input.consume_backslash_continuation() {
                     return false;
                 }
-                self.awaiting_plan = false; // 任何输入都视为继续对话，批准作废
-                // 斜杠命令（/model /config /status /help …）。
-                // 用户 prompt 模板（/name 参数）不在此处理：当作普通消息交给 Harness 展开
-                let is_template = split_slash(&text)
-                    .is_some_and(|(cmd, _)| self.templates.iter().any(|(name, _)| name == cmd));
-                if let Some((cmd, args)) = split_slash(&text).filter(|_| !is_template) {
-                    self.input.clear();
-                    let quit = self.handle_slash(cmd, args, ui_tx).await;
-                    self.scroll_to_bottom();
-                    return quit; // /quit 请求退出
-                }
-                self.input.clear();
-                if self.agent_running {
-                    // 运行中：作为 steering 注入
-                    self.steering.push(&text);
-                    self.lines.push(ChatLine::System(crate::i18n::fill(
-                        self.strings.steering_prefix_tpl,
-                        &[&text],
-                    )));
-                } else {
-                    self.lines.push(ChatLine::user(&text));
-                    self.auto_turns = 0; // 用户手动输入 = 新的接力链
-                    self.spawn_run(text, ui_tx.clone());
-                }
-                self.scroll_to_bottom();
+                return self.submit_input(ui_tx).await;
             }
-            KeyCode::Backspace => {
-                self.input.pop();
-            }
-            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Ctrl+J（LF）：不依赖修饰键上报的换行
+            KeyCode::Char('j') if ctrl => self.input.insert_newline(),
+            KeyCode::Char('o') if ctrl => {
                 self.open_picker().await;
             }
             KeyCode::Tab => {
                 // Tab 接受输入框里的灰色补全（ghost）——补全为完整命令 + 尾随空格
                 if let Some((name, _)) = self.slash_ghost() {
-                    self.input = format!("/{name} ");
+                    self.input.set(format!("/{name} "));
                 }
             }
-            KeyCode::Up => {
-                if self.scroll == usize::MAX {
-                    self.scroll = 0;
-                } else {
-                    self.scroll = self.scroll.saturating_sub(1);
-                }
+            // 聊天区滚动：Shift+↑↓ 一行、PageUp/PageDown 一页、Ctrl+Home/End 顶/底
+            KeyCode::Up if shift => self.scroll_up(1),
+            KeyCode::Down if shift => self.scroll_down(1),
+            KeyCode::PageUp => self.scroll_up(self.page_size()),
+            KeyCode::PageDown => self.scroll_down(self.page_size()),
+            KeyCode::Home if ctrl => self.scroll_to_top(),
+            KeyCode::End if ctrl => self.jump_to_bottom(),
+            // ↑↓：多行内容行间移动光标 → 到顶/底后走提示词历史；Alt/Ctrl+↑↓ 直接召回
+            KeyCode::Up => self.input_up(ctrl || alt),
+            KeyCode::Down => self.input_down(ctrl || alt),
+            _ => {
+                self.edit_key(key);
             }
-            KeyCode::Down => {
-                if self.scroll != usize::MAX {
-                    self.scroll += 1;
-                }
-            }
-            KeyCode::Char(c) => {
-                self.input.push(c);
-            }
-            KeyCode::PageUp => {
-                if self.scroll == usize::MAX {
-                    self.scroll = 0;
-                } else {
-                    self.scroll = self.scroll.saturating_sub(1);
-                }
-            }
-            KeyCode::PageDown => {
-                if self.scroll != usize::MAX {
-                    self.scroll += 1;
-                }
-            }
-            _ => {}
         }
         false
+    }
+
+    /// Enter 提交：斜杠命令分发 / 运行中转 steering / 否则发起新 run。返回 true = 退出
+    async fn submit_input(&mut self, ui_tx: &UnboundedSender<UiEvent>) -> bool {
+        // 占位符展开回粘贴原文后再提交
+        let text = self.input.expanded().trim().to_string();
+        if text.is_empty() {
+            // 计划等待态：空回车 = 批准执行（退出计划模式并发起执行 run）
+            if self.awaiting_plan {
+                self.approve_plan(ui_tx.clone()).await;
+                self.jump_to_bottom();
+            }
+            return false;
+        }
+        self.awaiting_plan = false; // 任何输入都视为继续对话，批准作废
+        self.history.record(&text);
+        // 斜杠命令（/model /config /status /help …）。
+        // 用户 prompt 模板（/name 参数）不在此处理：当作普通消息交给 Harness 展开
+        let is_template = split_slash(&text)
+            .is_some_and(|(cmd, _)| self.templates.iter().any(|(name, _)| name == cmd));
+        if let Some((cmd, args)) = split_slash(&text).filter(|_| !is_template) {
+            self.input.clear();
+            let quit = self.handle_slash(cmd, args, ui_tx).await;
+            self.jump_to_bottom();
+            return quit; // /quit 请求退出
+        }
+        self.input.clear();
+        if self.agent_running {
+            // 运行中：作为 steering 注入（run 结束仍未消费的会在结束时自动补发）
+            self.steering.push(&text);
+            self.lines.push(ChatLine::System(crate::i18n::fill(
+                self.strings.steering_prefix_tpl,
+                &[&text],
+            )));
+        } else {
+            self.lines.push(ChatLine::user(&text));
+            self.auto_turns = 0; // 用户手动输入 = 新的接力链
+            self.spawn_run(text, ui_tx.clone());
+        }
+        self.jump_to_bottom();
+        false
+    }
+
+    /// 纯编辑键（主输入框与向导输入步骤共用）。返回是否处理
+    fn edit_key(&mut self, key: KeyEvent) -> bool {
+        let mods = key.modifiers;
+        let ctrl = mods.contains(KeyModifiers::CONTROL);
+        let alt = mods.contains(KeyModifiers::ALT);
+        let input = &mut self.input;
+        match key.code {
+            KeyCode::Char('a') if ctrl => input.move_line_start(),
+            KeyCode::Char('e') if ctrl => input.move_line_end(),
+            KeyCode::Char('u') if ctrl => {
+                input.delete_to_line_start();
+            }
+            KeyCode::Char('k') if ctrl => {
+                input.delete_to_line_end();
+            }
+            KeyCode::Char('w') if ctrl => {
+                input.delete_word_back();
+            }
+            // macOS 终端 Option+←/→ 常以 ESC b / ESC f 送达
+            KeyCode::Char('b') if alt && !ctrl => input.move_word_left(),
+            KeyCode::Char('f') if alt && !ctrl => input.move_word_right(),
+            KeyCode::Char(c) if is_text_input(c, mods) => input.insert_char(c),
+            KeyCode::Backspace if ctrl || alt => {
+                input.delete_word_left();
+            }
+            KeyCode::Backspace => {
+                input.backspace();
+            }
+            KeyCode::Delete => {
+                input.delete();
+            }
+            KeyCode::Left if ctrl || alt => input.move_word_left(),
+            KeyCode::Left => input.move_left(),
+            KeyCode::Right if ctrl || alt => input.move_word_right(),
+            KeyCode::Right => input.move_right(),
+            KeyCode::Home => input.move_line_start(),
+            KeyCode::End => input.move_line_end(),
+            _ => return false,
+        }
+        true
+    }
+
+    /// 在输入框可视行间移动光标（保持显示列）；已在首/末行时返回 false
+    fn move_input_row(&mut self, up: bool) -> bool {
+        match input::vertical_move(self.input.text(), self.input.cursor(), self.input_width, up) {
+            Some(pos) => {
+                self.input.set_cursor(pos);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// ↑：多行内容先在可视行间移动光标；到顶后，输入为空或正显示某条历史时召回更旧的一条；
+    /// `explicit`（Alt/Ctrl+↑）不论内容直接召回，并暂存手头草稿（↓ 越过最新一条时恢复）
+    fn input_up(&mut self, explicit: bool) {
+        if !explicit && self.move_input_row(true) {
+            return;
+        }
+        let current = self.input.expanded();
+        let browsing = current.is_empty() || explicit || self.history.contains(&current);
+        if browsing
+            && let Some(entry) = self.history.older(&current, explicit)
+            && entry != current
+        {
+            self.input.set(entry);
+            return;
+        }
+        // 非历史草稿已在首行（或已是最旧一条）：光标到开头
+        self.input.move_buffer_start();
+    }
+
+    /// ↓：多行内容先在可视行间移动光标；到底后，正显示历史时切到更新的一条，
+    /// 越过最新一条恢复草稿（无草稿则清空）
+    fn input_down(&mut self, explicit: bool) {
+        if !explicit && self.move_input_row(false) {
+            return;
+        }
+        let current = self.input.expanded();
+        if let Some(entry) = self.history.newer(&current) {
+            self.input.set(entry);
+            return;
+        }
+        self.input.move_buffer_end();
     }
 
     /// 确认对话框按键：y 允许 / a 全部允许 / n 或 Esc 拒绝
@@ -639,7 +809,7 @@ impl App {
                 )));
             }
         }
-        self.scroll_to_bottom();
+        self.jump_to_bottom();
     }
 
     /// 分叉并回退 `turns_back` 轮；被丢弃的那条提问回填到输入框，便于修改后重发
@@ -668,7 +838,7 @@ impl App {
                     )
                 }));
                 if let Some(input) = dropped {
-                    self.input = sanitize_paste(&input);
+                    self.input.set(input); // 多行原样回填
                 }
             }
             Err(e) => self.lines.push(ChatLine::System(crate::i18n::fill(
@@ -676,7 +846,7 @@ impl App {
                 &[&e],
             ))),
         }
-        self.scroll_to_bottom();
+        self.jump_to_bottom();
     }
 
     async fn branch_session(&mut self) {
@@ -699,31 +869,43 @@ impl App {
                 )));
             }
         }
-        self.scroll_to_bottom();
+        self.jump_to_bottom();
     }
 
+    /// 由会话历史重建聊天行（切换/分叉会话）：与实时事件同一套工具摘要与内联 diff。
+    /// 历史不记录 is_error，失败与否按结果文本推断（baiji 错误前缀 / bash 非零退出码）
     fn rebuild_lines(&mut self, messages: &[baiji_ai::Message]) {
         use baiji_ai::Role;
         self.lines.clear();
+        // tool_call_id → 工具名（结果行的概述按工具区分）
+        let mut call_names: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::new();
         for msg in messages {
             match msg.role {
                 Role::User => self.lines.push(ChatLine::user(&msg.content)),
-                Role::Assistant if !msg.content.is_empty() => {
-                    self.lines.push(ChatLine::assistant(&msg.content))
-                }
                 Role::Assistant => {
-                    let names: Vec<&str> = msg
-                        .tool_calls
-                        .as_ref()
-                        .map(|cs| cs.iter().map(|c| c.name.as_str()).collect())
-                        .unwrap_or_default();
-                    self.lines
-                        .push(ChatLine::Tool(format!("● {}", names.join(", "))));
+                    if !msg.content.is_empty() {
+                        self.lines.push(ChatLine::assistant(&msg.content));
+                    }
+                    for call in msg.tool_calls.iter().flatten() {
+                        call_names.insert(call.id.as_str(), call.name.as_str());
+                        self.push_tool_started(&call.id, &call.name, &call.arguments);
+                    }
                 }
                 Role::Tool => {
                     for result in msg.tool_results.iter().flatten() {
-                        let brief: String = result.content.chars().take(120).collect();
-                        self.lines.push(ChatLine::Tool(format!("⎿ {brief}")));
+                        let name = call_names
+                            .get(result.tool_call_id.as_str())
+                            .copied()
+                            .unwrap_or("");
+                        let is_error =
+                            crate::tool_display::output_looks_failed(name, &result.content);
+                        self.push_tool_finished(
+                            &result.tool_call_id,
+                            name,
+                            &result.content,
+                            is_error,
+                        );
                     }
                 }
                 Role::System => {
@@ -765,14 +947,20 @@ impl App {
                 self.thinking.push_str(&text);
                 self.scroll_to_bottom();
             }
-            AgentEvent::ToolStarted { name, args, .. } => {
+            AgentEvent::ToolStarted { id, name, args } => {
                 self.thinking.clear();
-                let brief: String = args.to_string().chars().take(80).collect();
-                self.lines
-                    .push(ChatLine::Tool(format!("● {name}({brief})")));
+                // 本轮已流出的正文先落定：保持「正文 → 工具调用 → 下一轮正文」的时间顺序
+                //（否则多轮正文首尾相接地堆在全部工具行之后）
+                let text = std::mem::take(&mut self.streaming);
+                if !text.trim().is_empty() {
+                    self.lines.push(ChatLine::assistant(text));
+                }
+                self.push_tool_started(&id, &name, &args);
                 self.scroll_to_bottom();
             }
             AgentEvent::ToolFinished {
+                id,
+                name,
                 output,
                 is_error,
                 original_bytes,
@@ -792,10 +980,7 @@ impl App {
                         .tokens_saved
                         .saturating_add(original.saturating_sub(delivered));
                 }
-                let brief: String = output.chars().take(120).collect();
-                // 工具名已在 ● 行出现过；⎿ 行只给结果摘要，出错时带 ✗ 前缀
-                let mark = if is_error { "✗ " } else { "" };
-                self.lines.push(ChatLine::Tool(format!("⎿ {mark}{brief}")));
+                self.push_tool_finished(&id, &name, &output, is_error);
                 self.scroll_to_bottom();
             }
             AgentEvent::TurnFinished { .. } => self.thinking.clear(),
@@ -833,6 +1018,57 @@ impl App {
                 self.finish_run();
             }
         }
+    }
+
+    /// `● name(摘要)` 行 + edit/write 的内联 diff（建议中的改动，ToolStarted 即展示）
+    fn push_tool_started(&mut self, id: &str, name: &str, args: &serde_json::Value) {
+        let summary = crate::tool_display::tool_summary(name, args, &self.strings);
+        self.lines.push(ChatLine::ToolCall {
+            id: id.to_string(),
+            text: if summary.is_empty() {
+                format!("● {name}")
+            } else {
+                format!("● {name}({summary})")
+            },
+        });
+        if let Some(diff) =
+            crate::diff::DiffView::from_tool(id, name, args, Some(crate::diff::INLINE_DIFF_CAP))
+        {
+            self.lines.push(ChatLine::Diff(diff));
+        }
+    }
+
+    /// `⎿` 结果概述行，按调用 id 配对：插到同 id 的 `●` 行（及其 diff）之下——
+    /// 并行工具（join_all）的 ToolFinished 可能乱序到达。找不到同 id 的调用行
+    /// （空 id / 历史已清空）时按到达顺序追加。失败时把该调用的 diff 标为未应用
+    fn push_tool_finished(&mut self, id: &str, name: &str, output: &str, is_error: bool) {
+        // 工具名已在 ● 行出现过；⎿ 行只给结果概述，出错时带 ✗ 前缀
+        let summary = crate::tool_display::result_summary(name, output, is_error, &self.strings);
+        let mark = if is_error { "✗ " } else { "" };
+        let result = ChatLine::Tool(format!("⎿ {mark}{summary}"));
+        // 最近一次同 id 的调用（部分厂商跨轮复用 call_0 之类的 id，取最新的一次）
+        let call = (!id.is_empty())
+            .then(|| {
+                self.lines
+                    .iter()
+                    .rposition(|l| matches!(l, ChatLine::ToolCall { id: i, .. } if i == id))
+            })
+            .flatten();
+        let Some(call) = call else {
+            self.lines.push(result);
+            return;
+        };
+        let mut at = call + 1;
+        while let Some(ChatLine::Diff(diff)) = self.lines.get_mut(at) {
+            if diff.tool_id != id {
+                break;
+            }
+            if is_error {
+                diff.failed = true;
+            }
+            at += 1;
+        }
+        self.lines.insert(at, result);
     }
 
     fn finish_run(&mut self) {
@@ -885,8 +1121,94 @@ impl App {
         self.spawn_run(baiji_harness::AUTO_CONTINUE_PROMPT.to_string(), ui_tx);
     }
 
+    /// 软贴底：视图本就跟随底部时才回底——用户上翻阅读时，流式回答/工具活动不把视图拽走
     fn scroll_to_bottom(&mut self) {
-        self.scroll = usize::MAX; // 哨兵值，渲染时钳制
+        if self.follow_bottom {
+            self.scroll = usize::MAX; // 哨兵值，渲染时钳制
+        }
+    }
+
+    /// 硬回底（提交 / Ctrl+End / 会话切换）：恢复跟随
+    fn jump_to_bottom(&mut self) {
+        self.follow_bottom = true;
+        self.scroll = usize::MAX;
+    }
+
+    fn scroll_to_top(&mut self) {
+        self.follow_bottom = false;
+        self.scroll = 0;
+    }
+
+    /// 上翻 `rows` 行（离开底部即停止跟随）。内容不足一屏时无处可翻：保持跟随
+    fn scroll_up(&mut self, rows: usize) {
+        let current = if self.scroll == usize::MAX {
+            self.chat_bottom
+        } else {
+            self.scroll
+        };
+        if current == 0 {
+            return;
+        }
+        self.follow_bottom = false;
+        self.scroll = current.saturating_sub(rows);
+    }
+
+    /// 下翻 `rows` 行；越过底部时由渲染钳制（set_scroll）并恢复跟随
+    fn scroll_down(&mut self, rows: usize) {
+        if self.scroll != usize::MAX {
+            self.scroll = self.scroll.saturating_add(rows);
+        }
+    }
+
+    /// 翻页步长：聊天区可视高度 − 2（保留两行上下文）
+    fn page_size(&self) -> usize {
+        (self.chat_viewport as usize).saturating_sub(2).max(1)
+    }
+
+    /// Agent 事件入口（事件循环调用）：先渲染/更新状态，run 结束时再做 steering 兜底
+    fn on_agent_event(&mut self, event: AgentEvent, ui_tx: &UnboundedSender<UiEvent>) {
+        let ends_run = matches!(
+            event,
+            AgentEvent::RunCompleted { .. }
+                | AgentEvent::RunFailed { .. }
+                | AgentEvent::Interrupted
+        );
+        self.handle_agent_event(event, ui_tx);
+        if ends_run {
+            self.resubmit_leftover_steering(ui_tx);
+        }
+    }
+
+    /// run 结束（完成/失败/中断）时队列里仍有未被消费的 steering（典型：最终回答流式
+    /// 输出期间输入的）：合并为下一条用户消息立即发起新 run——steering 永不丢失。
+    /// 中断时同样补发：先输入纠正、再按 Esc = 「停下，改做这个」（redirect 语义）。
+    /// 已因自动接力等开了新 run 时无事可做（spawn_run 已把遗留消息转入新队列）
+    fn resubmit_leftover_steering(&mut self, ui_tx: &UnboundedSender<UiEvent>) -> bool {
+        if self.agent_running {
+            return false;
+        }
+        let pending = self.steering.drain();
+        if pending.is_empty() {
+            return false;
+        }
+        let text = pending.join("\n\n");
+        self.lines
+            .push(ChatLine::System(self.strings.steering_resubmit.to_string()));
+        self.lines.push(ChatLine::user(&text));
+        self.auto_turns = 0; // 用户输入发起 = 新的接力链
+        self.spawn_run(text, ui_tx.clone());
+        self.jump_to_bottom();
+        true
+    }
+
+    /// 轮换 steering 队列：新 run 用新队列，旧队列里未消费的消息转入新队列（不丢）
+    fn rotate_steering(&mut self) -> Arc<SteeringQueue> {
+        let steering = Arc::new(SteeringQueue::new());
+        for message in self.steering.drain() {
+            steering.push(message);
+        }
+        self.steering = Arc::clone(&steering);
+        steering
     }
 
     /// 外部 coding agent 运行（后台任务）：复用 Agent 事件流渲染进度——
@@ -900,6 +1222,8 @@ impl App {
     ) {
         self.agent_running = true;
         self.run_interrupted = false;
+        // 运行中输入进新队列：外部 agent 结束（合成的 RunCompleted）时作为下一条消息补发
+        self.rotate_steering();
         let cancel = CancellationToken::new();
         self.cancel = cancel.clone();
         let workdir = self.workdir.clone();
@@ -949,8 +1273,7 @@ impl App {
         self.run_interrupted = false;
         self.awaiting_plan = false; // 新一轮开始，旧的批准待办作废
 
-        let steering = Arc::new(SteeringQueue::new());
-        self.steering = Arc::clone(&steering);
+        let steering = self.rotate_steering();
         let cancel = CancellationToken::new();
         self.cancel = cancel.clone();
 
@@ -1027,6 +1350,11 @@ impl App {
         &self.lines
     }
 
+    /// 聊天行 + 渲染缓存（拆分借用：缓存按行内容校验、增量重渲染）
+    pub(crate) fn chat_view(&mut self) -> (&[ChatLine], &mut crate::ui::ChatCache) {
+        (&self.lines, &mut self.chat_cache)
+    }
+
     /// 计划模式（展示镜像；门控真相在 AgentRuntime）
     pub(crate) fn plan_mode(&self) -> bool {
         self.plan_mode
@@ -1048,15 +1376,48 @@ impl App {
     }
 
     pub(crate) fn input(&self) -> &str {
+        self.input.text()
+    }
+
+    /// 输入框缓冲区（渲染：光标、占位符高亮）
+    pub(crate) fn input_buffer(&self) -> &InputBuffer {
         &self.input
+    }
+
+    pub(crate) fn input_scroll(&self) -> usize {
+        self.input_scroll
+    }
+
+    /// 渲染回写：输入框滚动偏移与文本区宽度
+    pub(crate) fn set_input_view(&mut self, scroll: usize, width: usize) {
+        self.input_scroll = scroll;
+        self.input_width = width.max(1);
+    }
+
+    /// 渲染回写：聊天区可视高度（翻页步长）
+    pub(crate) fn set_chat_viewport(&mut self, height: u16) {
+        self.chat_viewport = height;
     }
 
     pub(crate) fn scroll(&self) -> usize {
         self.scroll
     }
 
+    /// 渲染钳制回写：值变小说明已到底（贴底哨兵或越界下翻）→ 恢复跟随
     pub(crate) fn set_scroll(&mut self, value: usize) {
+        if value < self.scroll {
+            self.follow_bottom = true;
+            self.chat_bottom = value;
+        }
         self.scroll = value;
+    }
+
+    /// 是否有覆盖层（会话选择器 / 子代理面板 / 向导 / 确认弹窗）：此时不显示输入框光标
+    pub(crate) fn overlay_active(&self) -> bool {
+        self.picker.is_some()
+            || self.subagents_panel.is_some()
+            || self.wizard.is_some()
+            || self.pending.is_some()
     }
 
     pub(crate) fn agent_running(&self) -> bool {
@@ -1206,9 +1567,19 @@ impl App {
         self.subagents_panel.as_ref().map(|p| p.selected)
     }
 
-    /// 粘贴并入输入框（换行折叠为空格，保持单行输入语义）
+    /// 粘贴并入输入框（光标处）：保留多行结构；≥5 行显示为占位符、提交时展开。
+    /// 向导输入步骤（API Key / 模型名）保持单行净化语义
     pub(crate) fn handle_paste(&mut self, text: String) {
-        self.input.push_str(&sanitize_paste(&text));
+        if self.wizard.as_ref().is_some_and(|w| w.step.is_input()) {
+            self.input.insert_str(&sanitize_paste(&text));
+            return;
+        }
+        self.last_paste = Some(Instant::now());
+        let text = input::normalize_paste(&text);
+        if !text.is_empty() {
+            self.input
+                .insert_paste(&text, self.strings.input_paste_placeholder_tpl);
+        }
     }
 
     /// 仅测试使用（lib 构建无调用方，cfg(test) 避免 dead_code 告警）
@@ -1235,9 +1606,10 @@ impl App {
         if self.wizard.is_some() {
             return None;
         }
-        let input = self.input.as_str();
+        let input = self.input.text();
         let rest = input.strip_prefix('/')?;
-        if rest.contains(' ') {
+        // 参数区（含空格）与多行内容不出补全
+        if rest.contains(' ') || rest.contains('\n') {
             return None;
         }
         if rest.is_empty() {
@@ -1357,3 +1729,18 @@ impl App {
     }
 }
 
+/// 按键是否产生文本输入：无修饰（Shift 除外）照常输入；Ctrl+字母是快捷键不插字；
+/// Alt/AltGr 组合出的非字母数字符号（部分键盘布局以 Ctrl+Alt+字符 送达）视为文本
+fn is_text_input(c: char, mods: KeyModifiers) -> bool {
+    if mods.intersects(KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META) {
+        return false;
+    }
+    match (
+        mods.contains(KeyModifiers::CONTROL),
+        mods.contains(KeyModifiers::ALT),
+    ) {
+        (false, false) => true,
+        (_, true) => !c.is_control() && c != ' ' && !c.is_ascii_alphanumeric(),
+        (true, false) => false,
+    }
+}

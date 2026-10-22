@@ -24,6 +24,10 @@ tree-sitter-go = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
 ignore = "0.4"
+# web 工具（webfetch / websearch）
+reqwest = { workspace = true }
+# 非 UTF-8 网页解码（GBK/Shift_JIS 等；reqwest 已间接依赖，不新增 crate）
+encoding_rs = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

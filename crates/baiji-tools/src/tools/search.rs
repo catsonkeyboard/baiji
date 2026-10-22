@@ -176,6 +176,11 @@ impl AgentTool for SearchTool {
         "search"
     }
 
+    /// 只读；共享的只有 index.rs 的解析缓存（Mutex 保护、不跨 await 持锁）：可同轮并发
+    fn parallel(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "Keyword search over the project's symbol index (BM25-ranked, no exact regex needed). \
          Returns symbol anchors like 'src/foo.rs:L12-40' with the declaration line — \

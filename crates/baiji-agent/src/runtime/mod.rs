@@ -34,7 +34,22 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 mod helpers;
+mod markup;
+mod repair;
 mod streaming;
+
+pub(crate) use repair::{coerce_args, resolve_tool_name};
+
+/// 连续空响应最多重试次数（之后报错）
+const MAX_EMPTY_RETRIES: u32 = 3;
+/// 正文工具调用信封解析失败时最多提醒重发次数
+const MAX_MARKUP_RETRIES: u32 = 2;
+/// 最终回答触及 max_tokens 时最多自动续写次数（之后保留截断标记）
+const MAX_CONTINUATIONS: u32 = 2;
+const EMPTY_RESPONSE_NOTICE: &str = "[system notice] Your previous response was empty. Continue \
+the task: call the next tool you need, or give your final answer now.";
+const CONTINUE_NOTICE: &str = "[system notice] Your previous answer was cut off by the output \
+token limit. Continue exactly where you left off — do not repeat anything already written.";
 
 /// Agent 运行时
 pub struct AgentRuntime {
@@ -77,7 +92,7 @@ pub struct AgentRuntime {
 /// MCP 工具）在计划模式下：定义不发给模型，模型经历史发起的调用直接拒绝。
 pub const PLAN_MODE_ALLOWED_TOOLS: &[&str] = &[
     "read", "grep", "find", "ls", "search", "imports", "expand", "task", "todo", "memory", "skill",
-    "now",
+    "now", "webfetch", "websearch", "recall",
 ];
 
 impl AgentRuntime {
@@ -294,9 +309,18 @@ impl AgentRuntime {
         final_answer: &mut String,
     ) -> Result<()> {
         let mut turn: u32 = 0;
+        // 补救用的请求后缀（仅进入下一次请求副本，不进历史）：空响应/信封解析失败提醒、
+        // 截断续写的"半截回答 + 继续"
+        let mut request_suffix: Vec<Message> = Vec::new();
+        let mut empty_retries: u32 = 0;
+        let mut markup_retries: u32 = 0;
+        let mut continuations: u32 = 0;
+        // 已截断的半截最终回答（续写完成后与后续内容拼成一条 assistant 消息）
+        let mut partial_answer = String::new();
 
         loop {
             if cancel.is_cancelled() {
+                self.commit_partial_answer(convo, events, &mut partial_answer);
                 events.send(AgentEvent::Interrupted).ok();
                 return Ok(());
             }
@@ -327,6 +351,7 @@ impl AgentRuntime {
             if self.verbosity_steer {
                 steer_last_user(&mut request_messages);
             }
+            request_messages.append(&mut request_suffix);
             // 轮次预算告急提醒（同样仅请求副本）：倒计时 2 轮起提示收尾，
             // 最后一轮强制"只作答不再调工具"——避免跑满预算直接报
             // "达到最大迭代次数"而拿不到任何结果（子代理尤其常见）
@@ -347,15 +372,63 @@ impl AgentRuntime {
                 .with_tools(self.request_tool_definitions())
                 .with_max_tokens(self.max_tokens)
                 .with_thinking(self.thinking());
-            let response = match self.stream_with_retry(request, events, cancel).await? {
-                Some(response) => response,
-                None => {
+            let mut response = match self.stream_with_retry(request, events, cancel).await {
+                Ok(Some(response)) => response,
+                Ok(None) => {
                     // 用户取消
+                    self.commit_partial_answer(convo, events, &mut partial_answer);
                     events.send(AgentEvent::Interrupted).ok();
                     turn_span.end();
                     return Ok(());
                 }
+                Err(e) => {
+                    self.commit_partial_answer(convo, events, &mut partial_answer);
+                    turn_span.end();
+                    return Err(e);
+                }
             };
+            // 还有轮次可用于补救（最后一轮不再重试/续写，直接收尾）
+            let can_retry = turn < self.max_turns;
+
+            // 正文泄漏的工具调用信封（DSML invoke/parameter、to=functions.X {json}）：
+            // 只在没有结构化调用时扫描，且只认已注册工具
+            if response.tool_calls.as_ref().is_none_or(|c| c.is_empty()) {
+                match repair::recover_text_tool_calls(&response.content, &self.tools) {
+                    repair::TextToolRecovery::Recovered { calls, sanitized } => {
+                        warn!(
+                            "recovered {} tool call(s) written as text markup: {}",
+                            calls.len(),
+                            calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ")
+                        );
+                        // 已流出的正文含信封原文：让 UI 清掉流式缓冲，换成去掉信封后的正文
+                        events.send(AgentEvent::StreamRestarted).ok();
+                        if !sanitized.trim().is_empty() {
+                            events
+                                .send(AgentEvent::TextDelta {
+                                    text: sanitized.clone(),
+                                })
+                                .ok();
+                        }
+                        response.content = sanitized;
+                        response.tool_calls = Some(calls);
+                    }
+                    repair::TextToolRecovery::Unparseable(reason)
+                        if can_retry && markup_retries < MAX_MARKUP_RETRIES =>
+                    {
+                        markup_retries += 1;
+                        warn!("unparseable tool-call markup in text ({reason}); asking to re-issue");
+                        events.send(AgentEvent::StreamRestarted).ok();
+                        request_suffix = vec![
+                            Message::assistant(response.content.clone()),
+                            Message::user(markup::unparsed_markup_notice(&reason)),
+                        ];
+                        events.send(AgentEvent::TurnFinished { turn }).ok();
+                        turn_span.end();
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
 
             debug!(
                 "LLM response: {} chars, {} tool_calls",
@@ -372,10 +445,15 @@ impl AgentRuntime {
                     // 子代理，各自独立上下文）时并发执行，结果按原顺序配对。
                     // steering/取消只在批次级生效——已并发的兄弟调用无法
                     // 中途跳过（并行语义的固有代价）
+                    // HITL 门控的调用不并发：审批一次只能裁决一个请求
+                    // （TUI 里新请求会顶掉未裁决的旧请求，并发即误拒）
                     let all_parallel = tool_calls.len() > 1
                         && tool_calls.iter().all(|c| {
                             !response.invalid_args.contains(&c.id)
-                                && self.tools.get(&c.name).is_some_and(|t| t.parallel())
+                                && resolve_tool_name(&c.name, &self.tools).is_ok_and(|n| {
+                                    !self.confirmation.needs(&n)
+                                        && self.tools.get(&n).is_some_and(|t| t.parallel())
+                                })
                         });
                     if all_parallel {
                         info!(
@@ -467,12 +545,13 @@ impl AgentRuntime {
                         }
                     }
 
+                    empty_retries = 0;
                     commit(
                         convo,
                         events,
                         Message {
                             role: Role::Assistant,
-                            content: response.content.clone(),
+                            content: std::mem::take(&mut partial_answer) + &response.content,
                             tool_calls: Some(tool_calls.clone()),
                             tool_results: None,
                             // 思考模型要求在工具循环内回传（由各 provider 决定如何带上）
@@ -517,13 +596,42 @@ impl AgentRuntime {
                 }
                 _ => {
                     // 无工具调用 — 最终答案
-                    if response.content.is_empty() {
+                    if response.content.trim().is_empty() && partial_answer.is_empty() {
+                        // 空响应（多见于工具结果之后、或只有 reasoning）：提醒后重试，
+                        // 而不是让整个 run 失败
+                        if can_retry && empty_retries < MAX_EMPTY_RETRIES {
+                            empty_retries += 1;
+                            warn!("empty LLM response (retry {empty_retries}/{MAX_EMPTY_RETRIES})");
+                            request_suffix = vec![Message::user(EMPTY_RESPONSE_NOTICE)];
+                            events.send(AgentEvent::TurnFinished { turn }).ok();
+                            turn_span.end();
+                            continue;
+                        }
                         let msg = "LLM 返回了空响应";
                         warn!("{}", msg);
                         return Err(anyhow::anyhow!("{}", msg));
                     }
-                    let mut answer = response.content.clone();
-                    if response.stop == Some(StopReason::MaxTokens) {
+                    empty_retries = 0;
+                    let truncated = response.stop == Some(StopReason::MaxTokens);
+                    // 截断的最终回答：自动续写（半截回答 + 继续提示只进请求副本），
+                    // 续写内容与半截拼成一条 assistant 消息
+                    if truncated && can_retry && continuations < MAX_CONTINUATIONS {
+                        continuations += 1;
+                        partial_answer.push_str(&response.content);
+                        warn!(
+                            "final answer truncated at max_tokens={}; auto-continuing ({continuations}/{MAX_CONTINUATIONS})",
+                            self.max_tokens
+                        );
+                        request_suffix = vec![
+                            Message::assistant(partial_answer.clone()),
+                            Message::user(CONTINUE_NOTICE),
+                        ];
+                        events.send(AgentEvent::TurnFinished { turn }).ok();
+                        turn_span.end();
+                        continue;
+                    }
+                    let mut answer = std::mem::take(&mut partial_answer) + &response.content;
+                    if truncated {
                         warn!("final answer truncated at max_tokens={}", self.max_tokens);
                         // 标记进入答案与历史：用户看到截断提示，
                         // 模型下一轮也能看到并从中断处续写
@@ -536,12 +644,32 @@ impl AgentRuntime {
                     commit(convo, events, Message::assistant(answer));
                     events.send(AgentEvent::TurnFinished { turn }).ok();
                     turn_span.end();
+                    // 最终回答期间到达的 steering 留在队列里：由调用方（TUI）以新 run
+                    // 提交——新 run 有完整轮次预算，答案也不会与下一段输出粘连
                     break;
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// 截断续写途中被取消/出错：已流给用户的半截回答带截断标记落入历史，不丢
+    fn commit_partial_answer(
+        &self,
+        convo: &mut Vec<Message>,
+        events: &UnboundedSender<AgentEvent>,
+        partial_answer: &mut String,
+    ) {
+        if partial_answer.is_empty() {
+            return;
+        }
+        let mut answer = std::mem::take(partial_answer);
+        answer.push_str(&format!(
+            "\n\n[答案因 max_tokens={} 被截断 — 可发送\u{201c}继续\u{201d}获取剩余部分]",
+            self.max_tokens
+        ));
+        commit(convo, events, Message::assistant(answer));
     }
 
     /// 工具执行 + hooks + HITL 确认 + 事件 + 遥测
@@ -551,12 +679,47 @@ impl AgentRuntime {
         events: &UnboundedSender<AgentEvent>,
         cancel: &CancellationToken,
     ) -> Result<ToolOutput> {
-        let name = tool_call.name.as_str();
+        // 工具名修复（functions.read / read_file / Bash → read / bash）；未知名带建议回给模型
+        let resolved = match resolve_tool_name(&tool_call.name, &self.tools) {
+            Ok(resolved) => resolved,
+            Err(message) => {
+                warn!("unknown tool '{}'", tool_call.name);
+                events
+                    .send(AgentEvent::ToolStarted {
+                        id: tool_call.id.clone(),
+                        name: tool_call.name.clone(),
+                        args: tool_call.arguments.clone(),
+                    })
+                    .ok();
+                events
+                    .send(AgentEvent::ToolFinished {
+                        id: tool_call.id.clone(),
+                        name: tool_call.name.clone(),
+                        output: message.clone(),
+                        is_error: true,
+                        duration_ms: 0,
+                        original_bytes: None,
+                        original_tokens: None,
+                    })
+                    .ok();
+                return Ok(ToolOutput::err(message));
+            }
+        };
+        let name = resolved.as_str();
+        if name != tool_call.name {
+            info!("tool name '{}' resolved to '{name}'", tool_call.name);
+        }
+        // 按 schema 宽松纠正参数类型（"true" → true、"10" → 10）；hooks、确认框、
+        // 工具本体看到的都是纠正后的参数
+        let call_args = match self.tools.get(name) {
+            Some(tool) => coerce_args(&tool.parameters(), tool_call.arguments.clone()),
+            None => tool_call.arguments.clone(),
+        };
         events
             .send(AgentEvent::ToolStarted {
                 id: tool_call.id.clone(),
                 name: name.to_string(),
-                args: tool_call.arguments.clone(),
+                args: call_args.clone(),
             })
             .ok();
 
@@ -595,7 +758,7 @@ impl AgentRuntime {
         // Hook 拦截/改写 + HITL 确认。
         // hook 自身报错按拒绝处理（fail closed），而不是中止整个 run：
         // 中止会丢掉本轮已执行工具的结果，留下不配对的 tool_use。
-        let decision = match self.hooks.tool_call(name, &tool_call.arguments).await {
+        let decision = match self.hooks.tool_call(name, &call_args).await {
             Ok(decision) => decision,
             Err(e) => {
                 warn!("hook failed on tool '{}': {e}", name);
@@ -614,16 +777,13 @@ impl AgentRuntime {
                         info!("Tool '{}' arguments rewritten by hook", name);
                         new_args
                     }
-                    _ => tool_call.arguments.clone(),
+                    _ => call_args.clone(),
                 };
                 let denied = if self.confirmation.needs(name) {
                     match self
                         .confirmation
                         .confirm(
-                            ConfirmationRequest {
-                                tool_name: name.to_string(),
-                                args: args.clone(),
-                            },
+                            ConfirmationRequest::new(name, args.clone()),
                             cancel,
                         )
                         .await

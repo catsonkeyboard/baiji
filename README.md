@@ -10,7 +10,7 @@
 
 
 
-![Tests](https://img.shields.io/badge/tests-380_passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-664_passing-brightgreen)
 
 ---
 
@@ -19,13 +19,14 @@
 - 🤖 **Streaming ReAct loop** — reasoning + native tool calling, with steering (inject new instructions mid-run) and instant cancellation (`Esc`)
 - 🔌 **Multi-vendor providers** — Anthropic Messages + OpenAI Chat Completions + OpenAI Responses protocols; 12 vendor presets (OpenAI, Anthropic, DeepSeek, GLM, Kimi, MiniMax, MiMo, Bailian, OpenRouter, xAI Grok, OpenCode Zen, TokenHub) with model auto-discovery
 - 🧠 **Thinking/reasoning support** — hot-swappable reasoning level (`/thinking high`), cross-protocol replay of thinking blocks within the current tool loop
-- 🛠️ **Built-in coding tools** — read / write / edit / bash / grep / find / ls / search (BM25) / imports (tree-sitter index) / expand, plus external agent delegation (`/codex`, `/claude`, …)
-- 🧵 **Context engineering** — reversible tool-output compression (content-addressed store + `expand` to recover), tiered compaction (deterministic or LLM-generated summaries), usage-anchored token estimation
+- 🛠️ **Built-in coding tools** — read / write / edit (multi-edit, mismatch hints, post-edit snippet) / bash / grep (grouped by enclosing symbol) / find / ls / search (BM25) / imports (tree-sitter index) / expand / recall (search past sessions) / webfetch / websearch (DuckDuckGo, no API key), plus external agent delegation (`/codex`, `/claude`, …)
+- 🧵 **Context engineering** — reversible tool-output compression (content-addressed store + `expand` to recover), tiered compaction (deterministic or LLM-generated summaries), usage-anchored token estimation (cache-aware), Anthropic prompt-caching breakpoints, per-provider tool-schema normalization (MCP schemas never 400 a provider)
+- 🩹 **Robust loop** — recovers tool calls leaked as text markup (DSML / `to=functions.*`), retries empty responses, auto-continues truncated answers, repairs tool names and argument types
 - 💾 **Sessions** — tree-structured (fork/branch), JSONL persistence, `--session <id>` resume, cross-session project memory
 - 📋 **Todo & goal & spec modes** — long-horizon task state externalized; auto-continue chains runs until todos complete; spec-driven drafting → approve → implement
 - 👥 **Subagents** — `task` tool spawns isolated-context read-only subagents with role files (`agents/*.md`), optional per-role model/thinking config
-- 🛡️ **Guardrails** — path whitelisting (lexical + realpath), HITL confirmation gates, plan mode (read-only tool gate), hook system (`exit 2` on `tool_call` blocks the call), safety plugin, output truncation
-- 🖥️ **TUI** — Ratatui UI with streaming render, 19 slash commands, fish-style ghost completion, bilingual (en/zh) interface
+- 🛡️ **Guardrails** — blast-radius command-risk classifier (catastrophic commands blocked, irreversible ones must be justified and always confirmed, read-only ones skip the prompt), path whitelisting (lexical + realpath), HITL confirmation gates, plan mode (read-only tool gate), hook system (`exit 2` on `tool_call` blocks the call), AGENTS.md / CLAUDE.md project instructions, output truncation
+- 🖥️ **TUI** — Ratatui UI with streaming Markdown render, inline edit/write diffs, concise tool summaries, multi-line composer (Shift/Alt+Enter, cursor editing, paste preserved), prompt history, 19 slash commands, fish-style ghost completion, bilingual (en/zh) interface
 - 📊 **Observability** — per-run JSONL telemetry (`BAIJI_TELEMETRY=file`), daily-rotated logs, compression savings accounting
 
 ---
@@ -74,8 +75,11 @@ Global config lives at `~/.baiji/config.json` (a template is auto-generated on f
     "require_confirmation_tools": ["bash", "write", "edit"],
     "max_tool_output_bytes": 32768,
     "bash_timeout_secs": 30,
-    "compression_enabled": true
+    "compression_enabled": true,
+    "auto_approve_readonly": true,
+    "trusted_commands": []
   },
+  "web": { "enabled": true, "search_engines": ["duckduckgo", "searxng"], "searxng_url": null },
   "ui": { "theme": "dark", "language": "en" }
 }
 ```
@@ -154,7 +158,7 @@ Between runs, `AgentHarness` handles compaction (keep recent N turns intact, fol
 
 ```bash
 cargo build                # Build the whole workspace
-cargo test --workspace     # Run all tests (380 total, zero warnings)
+cargo test --workspace     # Run all tests (664 total, zero warnings)
 cargo test -p baiji-agent  # Test a single crate
 RUST_LOG=debug cargo run   # Debug logs → ~/.baiji/logs/ (never pollutes the project dir)
 cargo build --release      # Optimized build

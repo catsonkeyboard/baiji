@@ -232,7 +232,8 @@ impl AgentTool for BashTool {
             "properties": {
                 "command": {"type": "string", "description": "Shell command to execute"},
                 "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds (default 30000, max 300000)"},
-                "run_in_background": {"type": "boolean", "description": "Detach: return a job id immediately (no timeout); manage via the jobs tool"}
+                "run_in_background": {"type": "boolean", "description": "Detach: return a job id immediately (no timeout); manage via the jobs tool"},
+                "justification": {"type": "string", "description": "Only after a call was refused as irreversible: which user request requires this exact command"}
             },
             "required": ["command"]
         })

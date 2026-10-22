@@ -1522,3 +1522,302 @@ async fn test_truncated_final_answer_carries_marker() {
         .unwrap();
     assert_eq!(answer, "正常回答");
 }
+
+// ===== 健壮性：空响应 / 截断续写 / 文本信封 / 工具名纠错 / 参数纠正 / 收尾 steering =====
+
+/// 按顺序返回预设响应、并记录每次请求的捕获型 Provider
+struct SeqProvider {
+    responses: std::sync::Mutex<std::collections::VecDeque<Vec<StreamChunk>>>,
+    requests: std::sync::Mutex<Vec<Vec<Message>>>,
+    /// 第一次被调用时向该队列推一条 steering（模拟用户在最终回答流式期间插话）
+    steer_on_first: Option<(Arc<SteeringQueue>, &'static str)>,
+}
+
+impl SeqProvider {
+    fn new(responses: Vec<Vec<StreamChunk>>) -> Self {
+        Self {
+            responses: std::sync::Mutex::new(responses.into()),
+            requests: std::sync::Mutex::new(Vec::new()),
+            steer_on_first: None,
+        }
+    }
+}
+
+#[async_trait]
+impl Provider for SeqProvider {
+    async fn chat(&self, _: ChatRequest) -> Result<ChatResponse> {
+        unreachable!("runtime uses chat_stream")
+    }
+    async fn chat_stream(
+        &self,
+        request: ChatRequest,
+    ) -> Result<futures::stream::BoxStream<'static, Result<StreamChunk>>> {
+        let first = {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request.messages.clone());
+            requests.len() == 1
+        };
+        if first && let Some((queue, text)) = &self.steer_on_first {
+            queue.push(*text);
+        }
+        let chunks = self
+            .responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| vec![StreamChunk::Done]);
+        Ok(futures::stream::iter(chunks.into_iter().map(Ok)).boxed())
+    }
+    fn protocol(&self) -> Protocol {
+        Protocol::Anthropic
+    }
+    fn model(&self) -> &str {
+        "mock"
+    }
+    fn provider_name(&self) -> &str {
+        "mock"
+    }
+}
+
+fn text(s: &str) -> Vec<StreamChunk> {
+    vec![StreamChunk::Content(s.to_string()), StreamChunk::Done]
+}
+
+fn call(id: &str, name: &str, args: &str) -> Vec<StreamChunk> {
+    vec![
+        StreamChunk::ToolCallStart {
+            id: id.to_string(),
+            name: name.to_string(),
+        },
+        StreamChunk::ToolCallArguments {
+            id: id.to_string(),
+            arguments: args.to_string(),
+        },
+        StreamChunk::Done,
+    ]
+}
+
+async fn run_seq(
+    provider: Arc<SeqProvider>,
+    tools: ToolRegistry,
+    steering: &SteeringQueue,
+) -> (Result<String>, Vec<Message>) {
+    let runtime = AgentRuntime::new(provider).with_tools(tools);
+    let mut history = vec![Message::user("q")];
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let result = runtime
+        .run("sys", &mut history, &tx, &CancellationToken::new(), steering)
+        .await;
+    (result, history)
+}
+
+fn append_tools() -> ToolRegistry {
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(AppendTool));
+    tools
+}
+
+#[tokio::test]
+async fn test_empty_response_retries_with_request_copy_notice() {
+    let provider = Arc::new(SeqProvider::new(vec![vec![StreamChunk::Done], text("ok")]));
+    let (answer, history) = run_seq(provider.clone(), ToolRegistry::new(), &SteeringQueue::new()).await;
+    assert_eq!(answer.unwrap(), "ok");
+    // 历史干净：只有 user + 最终 assistant
+    assert_eq!(history.len(), 2);
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].last().unwrap().content.contains("previous response was empty"));
+}
+
+#[tokio::test]
+async fn test_empty_response_gives_up_after_retry_budget() {
+    let provider = Arc::new(SeqProvider::new(vec![vec![StreamChunk::Done]; 5]));
+    let (answer, _) = run_seq(provider.clone(), ToolRegistry::new(), &SteeringQueue::new()).await;
+    assert!(answer.is_err());
+    assert_eq!(provider.requests.lock().unwrap().len(), 1 + MAX_EMPTY_RETRIES as usize);
+}
+
+#[tokio::test]
+async fn test_truncated_final_answer_auto_continues_into_one_message() {
+    let provider = Arc::new(SeqProvider::new(vec![
+        vec![
+            StreamChunk::Content("part one,".into()),
+            StreamChunk::Stop(StopReason::MaxTokens),
+            StreamChunk::Done,
+        ],
+        text(" part two."),
+    ]));
+    let (answer, history) = run_seq(provider.clone(), ToolRegistry::new(), &SteeringQueue::new()).await;
+    let answer = answer.unwrap();
+    assert_eq!(answer, "part one, part two.");
+    assert!(!answer.contains("被截断"));
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[1].content, answer);
+    let requests = provider.requests.lock().unwrap();
+    let second = &requests[1];
+    let n = second.len();
+    assert_eq!(second[n - 2].role, Role::Assistant);
+    assert_eq!(second[n - 2].content, "part one,");
+    assert!(second[n - 1].content.contains("cut off by the output token limit"));
+}
+
+#[tokio::test]
+async fn test_text_markup_tool_call_is_recovered_and_executed() {
+    let provider = Arc::new(SeqProvider::new(vec![
+        text("Appending.\n<invoke name=\"append\">\n<parameter name=\"text\">hi</parameter>\n</invoke>"),
+        text("done"),
+    ]));
+    let (answer, history) = run_seq(provider, append_tools(), &SteeringQueue::new()).await;
+    assert_eq!(answer.unwrap(), "done");
+    let assistant = &history[1];
+    assert_eq!(assistant.content, "Appending.");
+    assert_eq!(assistant.tool_calls.as_ref().unwrap()[0].name, "append");
+    assert_eq!(
+        history[2].tool_results.as_ref().unwrap()[0].content,
+        "appended:hi"
+    );
+}
+
+#[tokio::test]
+async fn test_unparseable_markup_asks_to_reissue_without_polluting_history() {
+    let garbled = "<parameter name=\"text\">hi</parameter>\n</invoke>";
+    let provider = Arc::new(SeqProvider::new(vec![text(garbled), text("fixed answer")]));
+    let (answer, history) = run_seq(provider.clone(), append_tools(), &SteeringQueue::new()).await;
+    assert_eq!(answer.unwrap(), "fixed answer");
+    assert_eq!(history.len(), 2, "garbled turn stays out of history");
+    let requests = provider.requests.lock().unwrap();
+    assert!(requests[1].last().unwrap().content.contains("could not be parsed"));
+}
+
+#[tokio::test]
+async fn test_tool_name_alias_resolved_and_unknown_gets_suggestion() {
+    let provider = Arc::new(SeqProvider::new(vec![
+        call("t1", "functions.append", r#"{"text":"a"}"#),
+        call("t2", "apend", r#"{"text":"b"}"#),
+        text("done"),
+    ]));
+    let (answer, history) = run_seq(provider, append_tools(), &SteeringQueue::new()).await;
+    assert_eq!(answer.unwrap(), "done");
+    let results: Vec<&str> = history
+        .iter()
+        .filter_map(|m| m.tool_results.as_ref())
+        .flatten()
+        .map(|r| r.content.as_str())
+        .collect();
+    assert_eq!(results[0], "appended:a");
+    assert!(results[1].contains("Did you mean 'append'"), "{}", results[1]);
+}
+
+#[tokio::test]
+async fn test_tool_args_coerced_by_schema() {
+    struct FlagTool;
+    #[async_trait]
+    impl AgentTool for FlagTool {
+        fn name(&self) -> &str {
+            "flag"
+        }
+        fn description(&self) -> &str {
+            ""
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {
+                "on": {"type": "boolean"}, "n": {"type": "integer"}
+            }})
+        }
+        async fn execute(&self, args: serde_json::Value) -> Result<ToolOutput> {
+            Ok(ToolOutput::ok(format!("{:?}/{:?}", args["on"].as_bool(), args["n"].as_i64())))
+        }
+    }
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(FlagTool));
+    let provider = Arc::new(SeqProvider::new(vec![
+        call("t1", "flag", r#"{"on":"true","n":"7"}"#),
+        text("done"),
+    ]));
+    let (_, history) = run_seq(provider, tools, &SteeringQueue::new()).await;
+    assert_eq!(
+        history[2].tool_results.as_ref().unwrap()[0].content,
+        "Some(true)/Some(7)"
+    );
+}
+
+#[tokio::test]
+async fn test_steering_during_final_answer_is_left_for_the_caller() {
+    // 最终回答期间到达的 steering 不在本 run 内续跑（会挤占收尾预算），留给 TUI 以新 run 提交
+    let steering = Arc::new(SteeringQueue::new());
+    let mut provider = SeqProvider::new(vec![text("first answer"), text("second answer")]);
+    provider.steer_on_first = Some((steering.clone(), "also check the tests"));
+    let provider = Arc::new(provider);
+    let (answer, history) = run_seq(provider.clone(), ToolRegistry::new(), &steering).await;
+    assert_eq!(answer.unwrap(), "first answer");
+    assert!(!steering.is_empty(), "message stays queued");
+    assert_eq!(history.len(), 2);
+    assert_eq!(provider.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_partial_answer_survives_error_during_continuation() {
+    struct FailSecond(AtomicUsize);
+    #[async_trait]
+    impl Provider for FailSecond {
+        async fn chat(&self, _: ChatRequest) -> Result<ChatResponse> {
+            unreachable!()
+        }
+        async fn chat_stream(
+            &self,
+            _: ChatRequest,
+        ) -> Result<futures::stream::BoxStream<'static, Result<StreamChunk>>> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                let chunks = vec![
+                    Ok(StreamChunk::Content("half an answer".into())),
+                    Ok(StreamChunk::Stop(StopReason::MaxTokens)),
+                    Ok(StreamChunk::Done),
+                ];
+                Ok(futures::stream::iter(chunks).boxed())
+            } else {
+                Err(anyhow::anyhow!("bad request"))
+            }
+        }
+        fn protocol(&self) -> Protocol {
+            Protocol::Anthropic
+        }
+        fn model(&self) -> &str {
+            "mock"
+        }
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+    let runtime = AgentRuntime::new(Arc::new(FailSecond(AtomicUsize::new(0)))).with_max_tokens(64);
+    let mut history = vec![Message::user("q")];
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let result = runtime
+        .run("sys", &mut history, &tx, &CancellationToken::new(), &SteeringQueue::new())
+        .await;
+    assert!(result.is_err());
+    // 已流出的半截回答带截断标记保留在历史里
+    assert_eq!(history.len(), 2);
+    assert!(history[1].content.starts_with("half an answer"));
+    assert!(history[1].content.contains("max_tokens=64"));
+}
+
+#[tokio::test]
+async fn test_recovered_markup_replaces_streamed_text_for_the_ui() {
+    let provider = Arc::new(SeqProvider::new(vec![
+        text("Appending.\n<invoke name=\"append\">\n<parameter name=\"text\">hi</parameter>\n</invoke>"),
+        text("done"),
+    ]));
+    let runtime = AgentRuntime::new(provider).with_tools(append_tools());
+    let mut history = vec![Message::user("q")];
+    let events = drive(&runtime, &mut history).await;
+    // 信封原文流出后：StreamRestarted 清空，随即重发去掉信封的正文，再开始工具调用
+    let restart = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::StreamRestarted))
+        .expect("stream restarted");
+    assert!(matches!(
+        &events[restart + 1],
+        AgentEvent::TextDelta { text } if text == "Appending."
+    ));
+    assert!(matches!(&events[restart + 2], AgentEvent::ToolStarted { name, .. } if name == "append"));
+}

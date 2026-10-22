@@ -5,20 +5,24 @@
 //!
 //! 内置：
 //! - [`ClockPlugin`]：注册 `now` 工具，返回当前时间
-//! - [`SafetyPlugin`]：注册 hook，拦截 `rm -rf /` 等危险 bash 命令
+//! - [`SafetyPlugin`]：bash 命令风险分级 hook（baiji-command-risk：灾难级拒绝、
+//!   不可逆命令要求 justification），另有 HITL 判定闭包 [`readonly_auto_approve`] /
+//!   [`irreversible_escalation`]
 //! - [`mcp`]：MCP 工具桥（原生 stdio 客户端，常驻进程）
 
 pub mod command_hook;
 pub mod mcp;
+pub mod safety;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use baiji_agent::{AgentTool, Hook, HookDecision, HookRegistry, ToolOutput, ToolRegistry};
+use baiji_agent::{AgentTool, Hook, HookRegistry, ToolOutput, ToolRegistry};
 use serde_json::Value;
 use std::sync::Arc;
 
 pub use command_hook::{CommandHookSpec, CommandHooks, HooksConfig};
 pub use mcp::{McpClient, McpTool, ServerSpec, register_mcp_tools};
+pub use safety::{SafetyPlugin, irreversible_escalation, readonly_auto_approve};
 
 /// 插件注册上下文：插件把工具/hooks 塞进来
 #[derive(Default)]
@@ -124,162 +128,15 @@ impl Plugin for ClockPlugin {
     }
 }
 
-/// 危险命令拦截 hook
-struct DangerousCommandHook;
-
-#[async_trait]
-impl Hook for DangerousCommandHook {
-    fn name(&self) -> &str {
-        "dangerous-command-guard"
-    }
-    async fn on_tool_call(&self, name: &str, args: &Value) -> Result<HookDecision> {
-        if name != "bash" {
-            return Ok(HookDecision::Proceed);
-        }
-        let Some(command) = args["command"].as_str() else {
-            return Ok(HookDecision::Proceed);
-        };
-        if rm_targets_root(command) {
-            return Ok(HookDecision::Deny(
-                "refusing to run rm -rf against /, ~ or $HOME".to_string(),
-            ));
-        }
-        Ok(HookDecision::Proceed)
-    }
-}
-
-/// token 级检测：处于命令位置的 `rm` 带递归旗标（-r/-R/--recursive，任意位置），
-/// 且目标归一化后是根/家目录（`/`、`~`、`$HOME`、实际家目录及其 `/*` 通配）即判定危险。
-///
-/// 覆盖：`/bin/rm`、`\rm`、`command rm`、`sudo -n rm`、长选项、引号包裹的目标、
-/// 紧贴分隔符（`cd /tmp;rm -rf /`）、`sh -c "rm -rf /"`、`--no-preserve-root`。
-///
-/// 这是启发式兜底，不是沙箱：变量间接、`find / -delete` 等写法无法穷举，
-/// 真正的防线仍是执行前的人工确认。
-fn rm_targets_root(command: &str) -> bool {
-    const SEPARATORS: &[&str] = &[";", "&&", "||", "|", "&", "(", ")", "{", "}"];
-    const PREFIXES: &[&str] = &[
-        "sudo", "doas", "nohup", "nice", "xargs", "env", "command", "exec", "time", "then", "do",
-        "else",
-    ];
-
-    // 分隔符两侧补空格，使 `/tmp;rm` 也能切开
-    let mut spaced = String::with_capacity(command.len() + 16);
-    let chars: Vec<char> = command.chars().collect();
-    let mut k = 0;
-    while k < chars.len() {
-        let c = chars[k];
-        let pair = matches!((c, chars.get(k + 1)), ('&', Some('&')) | ('|', Some('|')));
-        if pair {
-            spaced.push(' ');
-            spaced.push(c);
-            spaced.push(c);
-            spaced.push(' ');
-            k += 2;
-            continue;
-        }
-        if matches!(c, ';' | '|' | '&' | '(' | ')' | '\n') {
-            spaced.push(' ');
-            spaced.push(if c == '\n' { ';' } else { c });
-            spaced.push(' ');
-        } else {
-            spaced.push(c);
-        }
-        k += 1;
-    }
-
-    // 去引号与反斜杠（`"/"`、`\rm`）
-    let tokens: Vec<String> = spaced
-        .split_whitespace()
-        .map(|t| {
-            t.chars()
-                .filter(|c| !matches!(c, '"' | '\'' | '\\'))
-                .collect()
-        })
-        .collect();
-
-    let home = std::env::var("HOME").ok();
-    let is_rootish = |target: &str| -> bool {
-        let mut t = target.trim_end_matches("/*").trim_end_matches("/.");
-        if t.len() > 1 {
-            t = t.trim_end_matches('/');
-        }
-        if t.is_empty() {
-            return true; // 原 token 为 "/"、"//"、"/*"
-        }
-        matches!(t, "/" | "~" | "$HOME" | "${HOME}") || home.as_deref() == Some(t)
-    };
-
-    let mut i = 0;
-    while i < tokens.len() {
-        let token = tokens[i].as_str();
-        let is_rm = token == "rm" || token.ends_with("/rm");
-        // 命令位置：首 token；或向前跳过旗标后，紧邻分隔符/前缀命令/`sh -c`
-        let is_command_position = {
-            let mut p = i;
-            let mut via_dash_c = false;
-            while p > 0 && tokens[p - 1].starts_with('-') {
-                via_dash_c |= tokens[p - 1] == "-c";
-                p -= 1;
-            }
-            p == 0
-                || via_dash_c
-                || SEPARATORS.contains(&tokens[p - 1].as_str())
-                || PREFIXES.contains(&tokens[p - 1].as_str())
-        };
-        if !is_rm || !is_command_position {
-            i += 1;
-            continue;
-        }
-
-        // 本条 rm 的参数：直到下一个分隔符
-        let mut j = i + 1;
-        let (mut recursive, mut rootish) = (false, false);
-        while j < tokens.len() && !SEPARATORS.contains(&tokens[j].as_str()) {
-            let arg = tokens[j].as_str();
-            if arg == "--no-preserve-root" {
-                return true;
-            } else if arg == "--recursive" {
-                recursive = true;
-            } else if arg.starts_with('-') && !arg.starts_with("--") {
-                recursive |= arg.contains('r') || arg.contains('R');
-            } else if !arg.starts_with('-') {
-                rootish |= is_rootish(arg);
-            }
-            j += 1;
-        }
-        if recursive && rootish {
-            return true;
-        }
-        i = j.max(i + 1);
-    }
-    false
-}
-
-/// 安全插件
-pub struct SafetyPlugin;
-
-impl Plugin for SafetyPlugin {
-    fn id(&self) -> &str {
-        "safety"
-    }
-    fn description(&self) -> &str {
-        "Blocks destructive bash commands (rm -rf on / or ~)"
-    }
-    fn register(&self, ctx: &mut PluginContext) -> Result<()> {
-        ctx.add_hook(Arc::new(DangerousCommandHook));
-        Ok(())
-    }
-}
-
 /// 默认启用的内置插件
 pub fn builtin_plugins() -> Vec<Box<dyn Plugin>> {
-    vec![Box::new(ClockPlugin), Box::new(SafetyPlugin)]
+    vec![Box::new(ClockPlugin), Box::new(SafetyPlugin::default())]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use baiji_agent::HookDecision;
 
     #[tokio::test]
     async fn test_builtin_plugins_register() {
@@ -288,7 +145,7 @@ mod tests {
 
         let applied = PluginManager::new()
             .add(Box::new(ClockPlugin))
-            .add(Box::new(SafetyPlugin))
+            .add(Box::new(SafetyPlugin::default()))
             .apply(&mut tools, &mut hooks)
             .unwrap();
 
@@ -312,7 +169,7 @@ mod tests {
         let mut tools = ToolRegistry::new();
         let mut hooks = HookRegistry::new();
         PluginManager::new()
-            .add(Box::new(SafetyPlugin))
+            .add(Box::new(SafetyPlugin::default()))
             .apply(&mut tools, &mut hooks)
             .unwrap();
 

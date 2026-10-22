@@ -348,7 +348,7 @@ async fn test_render_all_layouts_no_panic() {
     assert!(app.subagents_rows().is_none(), "panel closes");
 
     // 外部 coding agent 动态命令：ghost 提示 → Tab 补全 → 分发执行
-    app.input = "/fak".to_string();
+    app.input.set("/fak");
     let ghost = app.slash_ghost().expect("dynamic agent ghost");
     assert_eq!(ghost.0, "fakeagent");
     assert!(ghost.1.contains("外部"), "{}", ghost.1);
@@ -437,7 +437,7 @@ async fn test_render_all_layouts_no_panic() {
         status: baiji_harness::TodoStatus::Done,
         note: None,
     }]);
-    app.input = "/todos".to_string();
+    app.input.set("/todos");
     app.handle_key(KeyEvent::new(K::Enter, M::NONE), &ui_tx)
         .await;
     assert!(
@@ -446,7 +446,7 @@ async fn test_render_all_layouts_no_panic() {
             .any(|l| matches!(l, ChatLine::System(s) if s.contains("[x] 分析依赖"))),
         "/todos prints the list"
     );
-    app.input = "/quit".to_string();
+    app.input.set("/quit");
     assert!(
         app.handle_key(KeyEvent::new(K::Enter, M::NONE), &ui_tx)
             .await,
@@ -455,7 +455,7 @@ async fn test_render_all_layouts_no_panic() {
 
     // 输入框灰色补全（ghost）：补全紧跟已输入文本（颜色边界即光标，
     // 不再有 ▏ 分隔），状态栏右侧临时显示用法；Tab 接受补全
-    app.input = "/mo".to_string();
+    app.input.set("/mo");
     terminal.clear().unwrap();
     terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
     let rows = screen(&terminal);
@@ -481,12 +481,12 @@ async fn test_render_all_layouts_no_panic() {
     assert_eq!(app.input(), "/model ", "Tab accepts the ghost completion");
     // 参数区不再出补全；未知前缀也没有
     for input in ["/model glm-4.7", "/zzz", "普通消息"] {
-        app.input = input.to_string();
+        app.input.set(input);
         terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
     }
 
     // 裸 "/"：展示全部命令清单（灰字，宽度内尽量多列）+ Tab 补全首个
-    app.input = "/".to_string();
+    app.input.set("/");
     terminal.clear().unwrap();
     terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
     let rows = screen(&terminal);
@@ -512,7 +512,7 @@ async fn test_render_all_layouts_no_panic() {
     app.input.clear();
 
     // 输入单字符渲染恰好一次（回归：输入框曾把已输入文本重复渲染两遍）
-    app.input = "s".to_string();
+    app.input.set("s");
     terminal.clear().unwrap();
     terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
     let rows = screen(&terminal);

@@ -24,6 +24,11 @@ impl AgentTool for LsTool {
         "ls"
     }
 
+    /// 只读、无共享状态：可与其它只读工具同轮并发
+    fn parallel(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "List entries of a directory (default '.'). Directories are prefixed with 'd/'."
     }

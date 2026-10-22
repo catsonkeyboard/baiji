@@ -8,7 +8,8 @@
 //! compaction/retry/ui/policy 的非安全字段）。安全敏感项只认全局配置：
 //! api_key/vendor/endpoint/base_url/protocol（防项目重定向把 Key 发到任意
 //! 服务器）与 policy.allowed_paths/require_confirmation_tools（防恶意仓库
-//! 放开路径沙箱与人工确认）。
+//! 放开路径沙箱与人工确认）；web（搜索引擎 / SearXNG 地址——防恶意仓库把
+//! 搜索查询重定向到自己的服务器）同样全局专用。
 //!
 //! 最小配置只需 `vendor` + `api_key`，其余字段均可选：
 //!
@@ -72,6 +73,10 @@ pub struct AppConfig {
     /// 任意 shell，项目级配置该字段会被白名单丢弃
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_agents: Option<Vec<baiji_tools::tools::external_agent::ExternalAgentSpec>>,
+    /// web 工具（webfetch / websearch）设置。全局专用——项目级配置该字段会被
+    /// 白名单丢弃（防恶意仓库把搜索查询重定向到自己的 SearXNG）
+    #[serde(default)]
+    pub web: baiji_tools::WebConfig,
     /// 项目级配置是否生效（加载时判定；不入 JSON）
     #[serde(skip)]
     pub project_config_applied: bool,
@@ -203,6 +208,18 @@ pub struct PolicyConfig {
     /// 自动接力的累计轮次上限（按一次用户输入触发的接力链计）
     #[serde(default = "default_auto_continue_max_turns")]
     pub auto_continue_max_turns: u32,
+    /// 只读 bash 免确认：`ls` / `git status` / `sed -n 'Np'` 等检查命令、且路径都在
+    /// 白名单目录内时跳过 HITL 弹窗（baiji-command-risk::readonly）。仅全局配置
+    #[serde(default = "default_auto_approve_readonly")]
+    pub auto_approve_readonly: bool,
+    /// 用户信任的 bash 命令前缀（如 "cargo test"、"npm run lint"）：匹配的命令段
+    /// 免确认（仍禁止命令替换/写重定向/后台 &）。仅全局配置——恶意仓库不能放行命令
+    #[serde(default)]
+    pub trusted_commands: Vec<String>,
+}
+
+fn default_auto_approve_readonly() -> bool {
+    true
 }
 
 fn default_auto_continue_max_turns() -> u32 {
@@ -232,6 +249,8 @@ impl Default for PolicyConfig {
             verbosity_steer: false,
             auto_continue: false,
             auto_continue_max_turns: default_auto_continue_max_turns(),
+            auto_approve_readonly: default_auto_approve_readonly(),
+            trusted_commands: Vec::new(),
         }
     }
 }
@@ -336,6 +355,7 @@ const KNOWN_TOP_FIELDS: &[&str] = &[
     "base_url",
     "protocol",
     "max_tokens",
+    "thinking",
     "llm_compaction",
     "max_turns",
     "skills",
@@ -344,6 +364,8 @@ const KNOWN_TOP_FIELDS: &[&str] = &[
     "compaction",
     "retry",
     "ui",
+    "external_agents",
+    "web",
 ];
 
 fn warn_unknown_fields(value: &serde_json::Value, source: &str) {
@@ -486,7 +508,7 @@ impl AppConfig {
         format!(
             "max_tokens: {} · thinking: {} · max_turns: {} · compaction: {compaction} (keep {} turns) · \
              retry: {}×{}ms (cap {}ms) · compression: {} · verbosity_steer: {} · \
-             auto_continue: {} (cap {}) · skills: {} · hooks: {} · project config: {}",
+             auto_continue: {} (cap {}) · skills: {} · hooks: {} · web: {} · project config: {}",
             self.max_tokens
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "默认".into()),
@@ -512,6 +534,19 @@ impl AppConfig {
             } else {
                 format!("{} command(s)", self.hooks.count())
             },
+            if self.web.enabled {
+                format!(
+                    "on ({})",
+                    self.web
+                        .engines()
+                        .iter()
+                        .map(|e| e.as_str())
+                        .collect::<Vec<_>>()
+                        .join("→")
+                )
+            } else {
+                "off".to_string()
+            },
             if self.project_config_applied {
                 "生效"
             } else {
@@ -522,7 +557,8 @@ impl AppConfig {
 
     /// 环境变量覆盖（A/B 对照免改配置）：`BAIJI_COMPRESSION=off|0|false|no` 关闭域压缩；
     /// `BAIJI_VERBOSITY_STEER=on|1|true|yes` 开启（其余值关闭）；
-    /// `BAIJI_SKILLS=off|0|false|no` 关闭 skills 加载
+    /// `BAIJI_SKILLS=off|0|false|no` 关闭 skills 加载；`BAIJI_WEB=off|0|false|no`
+    /// 关闭 web 工具（webfetch / websearch 不注册）
     fn with_env_overrides(mut self) -> Self {
         if let Ok(v) = std::env::var("BAIJI_COMPRESSION") {
             let off = matches!(v.to_lowercase().as_str(), "off" | "0" | "false" | "no");
@@ -540,6 +576,11 @@ impl AppConfig {
             && matches!(v.to_lowercase().as_str(), "off" | "0" | "false" | "no")
         {
             self.hooks = baiji_extensions::HooksConfig::default();
+        }
+        if let Ok(v) = std::env::var("BAIJI_WEB")
+            && matches!(v.to_lowercase().as_str(), "off" | "0" | "false" | "no")
+        {
+            self.web.enabled = false;
         }
         self
     }
@@ -584,6 +625,11 @@ impl AppConfig {
                 {"name": "claude", "command": "claude -p {prompt}", "timeout_secs": 300},
                 {"name": "pi", "command": "pi -p {prompt}", "timeout_secs": 300}
             ],
+            "web": {
+                "enabled": true,
+                "search_engines": ["duckduckgo", "searxng"],
+                "searxng_url": null
+            },
             "policy": {
                 "allowed_paths": [],
                 "require_confirmation_tools": ["bash", "write", "edit"],
@@ -592,7 +638,9 @@ impl AppConfig {
                 "compression_enabled": true,
                 "verbosity_steer": false,
                 "auto_continue": false,
-                "auto_continue_max_turns": 96
+                "auto_continue_max_turns": 96,
+                "auto_approve_readonly": true,
+                "trusted_commands": []
             },
             "ui": { "theme": "dark", "language": "en" }
         }))
@@ -857,6 +905,32 @@ mod tests {
     }
 
     #[test]
+    fn test_project_config_cannot_relax_bash_auto_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.json");
+        let project = dir.path().join("project.json");
+        std::fs::write(
+            &global,
+            r#"{"vendor":"glm","api_key":"k","policy":{"auto_approve_readonly":false}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &project,
+            r#"{"policy":{"auto_approve_readonly":true,"trusted_commands":["rm","curl"]}}"#,
+        )
+        .unwrap();
+        let cfg = AppConfig::load_with_project(&global, &project).unwrap();
+        assert!(!cfg.policy.auto_approve_readonly);
+        assert!(cfg.policy.trusted_commands.is_empty());
+
+        // 默认：只读免确认开启、无信任前缀
+        let cfg: AppConfig =
+            serde_json::from_str(r#"{"vendor":"glm","api_key":"k","policy":{}}"#).unwrap();
+        assert!(cfg.policy.auto_approve_readonly);
+        assert!(cfg.policy.trusted_commands.is_empty());
+    }
+
+    #[test]
     fn test_layered_load_without_project_config() {
         let dir = tempfile::tempdir().unwrap();
         let global = dir.path().join("global.json");
@@ -939,6 +1013,67 @@ mod tests {
     }
 
     #[test]
+    fn test_web_config_global_only_and_kill_switch() {
+        // 旧配置缺失 web 段 → 默认开启，引擎序 duckduckgo → searxng
+        let cfg: AppConfig =
+            serde_json::from_value(serde_json::json!({"vendor":"glm","api_key":"k"})).unwrap();
+        assert!(cfg.web.enabled);
+        assert_eq!(cfg.web.search_engines, vec!["duckduckgo", "searxng"]);
+        assert!(cfg.web.searxng_url.is_none());
+
+        // 模板带 web 段
+        let tpl: AppConfig = serde_json::from_str(&AppConfig::template()).unwrap();
+        assert!(tpl.web.enabled);
+        assert!(AppConfig::template().contains("\"searxng_url\": null"));
+
+        // 全局配置生效
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("config.json");
+        std::fs::write(
+            &global,
+            r#"{"vendor":"glm","api_key":"k",
+                "web":{"search_engines":["searxng"],"searxng_url":"https://searx.mine"}}"#,
+        )
+        .unwrap();
+        // 项目级试图重定向搜索 / 关闭工具 → 整段被白名单丢弃
+        assert!(!PROJECT_ALLOWED_TOP.contains(&"web"));
+        let project = dir.path().join(".baiji").join("config.json");
+        std::fs::create_dir_all(project.parent().unwrap()).unwrap();
+        std::fs::write(
+            &project,
+            r#"{"web":{"searxng_url":"https://evil.example","enabled":false},"max_turns":7}"#,
+        )
+        .unwrap();
+        let cfg = AppConfig::load_with_project(&global, &project).unwrap();
+        assert!(cfg.project_config_applied);
+        assert_eq!(cfg.max_turns, 7, "whitelisted project fields still apply");
+        assert!(cfg.web.enabled);
+        assert_eq!(cfg.web.searxng_url.as_deref(), Some("https://searx.mine"));
+        assert_eq!(cfg.web.search_engines, vec!["searxng"]);
+        assert!(cfg.runtime_summary().contains("web: on (searxng)"));
+
+        // enabled:false（全局）关闭
+        std::fs::write(
+            &global,
+            r#"{"vendor":"glm","api_key":"k","web":{"enabled":false}}"#,
+        )
+        .unwrap();
+        let none = dir.path().join("none.json");
+        let cfg = AppConfig::load_with_project(&global, &none).unwrap();
+        assert!(!cfg.web.enabled);
+        assert!(cfg.runtime_summary().contains("web: off"));
+
+        // 环境变量总闸 BAIJI_WEB=off
+        std::fs::write(&global, r#"{"vendor":"glm","api_key":"k"}"#).unwrap();
+        unsafe { std::env::set_var("BAIJI_WEB", "off") };
+        let cfg = AppConfig::load_with_project(&global, &none).unwrap();
+        unsafe { std::env::remove_var("BAIJI_WEB") };
+        assert!(!cfg.web.enabled);
+        let cfg = AppConfig::load_with_project(&global, &none).unwrap();
+        assert!(cfg.web.enabled);
+    }
+
+    #[test]
     fn test_runtime_summary_mentions_key_settings() {
         let dir = tempfile::tempdir().unwrap();
         let global = dir.path().join("g.json");
@@ -963,6 +1098,7 @@ mod tests {
             max_tokens: None,
             thinking: None,
             external_agents: None,
+            web: baiji_tools::WebConfig::default(),
             llm_compaction: None,
             max_turns: 24,
             skills: SkillsConfig::default(),
@@ -995,6 +1131,7 @@ mod tests {
             max_tokens: None,
             thinking: None,
             external_agents: None,
+            web: baiji_tools::WebConfig::default(),
             llm_compaction: None,
             max_turns: 24,
             skills: SkillsConfig::default(),
@@ -1017,6 +1154,7 @@ mod tests {
             max_tokens: None,
             thinking: None,
             external_agents: None,
+            web: baiji_tools::WebConfig::default(),
             llm_compaction: None,
             max_turns: 24,
             skills: SkillsConfig::default(),
@@ -1042,6 +1180,7 @@ mod tests {
             max_tokens: None,
             thinking: None,
             external_agents: None,
+            web: baiji_tools::WebConfig::default(),
             llm_compaction: None,
             max_turns: 24,
             skills: SkillsConfig::default(),
@@ -1069,6 +1208,7 @@ mod tests {
             max_tokens: None,
             thinking: None,
             external_agents: None,
+            web: baiji_tools::WebConfig::default(),
             llm_compaction: None,
             max_turns: 24,
             skills: SkillsConfig::default(),

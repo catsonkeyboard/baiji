@@ -299,10 +299,23 @@ pub fn spill_to_store(dir: &Path, content: &str) -> Option<String> {
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
     let file = dir.join(&handle);
-    // 已存在则跳过写入（去重）；目录可能尚未创建（如 harness 单独配置时）
-    if !file.exists() {
+    // 已存在且长度一致则跳过写入（去重）；长度不符 = 上次写入中途崩溃留下的截断文件，重写修复。
+    // 先写临时文件再 rename（同目录原子替换）：并发 spill 同一内容、或写到一半崩溃，
+    // 都不会让句柄指向半截内容。目录可能尚未创建（如 harness 单独配置时）
+    let complete = std::fs::metadata(&file).is_ok_and(|m| m.len() == content.len() as u64);
+    if !complete {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         std::fs::create_dir_all(dir).ok()?;
-        std::fs::write(&file, content).ok()?;
+        let tmp = dir.join(format!(
+            ".{handle}.tmp-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let written = std::fs::write(&tmp, content).and_then(|()| std::fs::rename(&tmp, &file));
+        if written.is_err() {
+            std::fs::remove_file(&tmp).ok();
+            return None;
+        }
     }
     Some(handle)
 }
@@ -471,6 +484,23 @@ mod tests {
         // 中文按字符边界截断，不 panic
         let cjk = env.truncate_output("你好世界你好世界");
         assert!(cjk.contains("[truncated"));
+    }
+
+    #[test]
+    fn test_spill_heals_truncated_handle_and_leaves_no_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "spilled content ".repeat(100);
+        let handle = spill_to_store(dir.path(), &content).unwrap();
+        // 模拟上次写入中途崩溃：句柄文件只剩一半
+        std::fs::write(dir.path().join(&handle), &content[..content.len() / 2]).unwrap();
+        assert_eq!(spill_to_store(dir.path(), &content).as_deref(), Some(handle.as_str()));
+        assert_eq!(std::fs::read_to_string(dir.path().join(&handle)).unwrap(), content);
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec![handle], "no temp files left behind");
     }
 
     #[test]

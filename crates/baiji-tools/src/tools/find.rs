@@ -27,6 +27,11 @@ impl AgentTool for FindTool {
         "find"
     }
 
+    /// 只读、无共享状态：可与其它只读工具同轮并发
+    fn parallel(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "Find files or directories whose name contains a pattern (case-insensitive), \
          starting from a path (default '.'). Optional kind filter: 'file' or 'dir'."

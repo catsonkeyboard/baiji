@@ -155,24 +155,49 @@ impl SubagentsPanel {
     }
 }
 
+/// 确认弹窗正文
+#[derive(Debug)]
+pub enum ConfirmBody {
+    /// 原文：bash 命令（保留换行）/ 其它工具的 pretty JSON
+    Text(String),
+    /// edit / write：完整 diff（不截断，弹窗内折行）——不再让用户批准转义后的 `\n` 字符串
+    Diff(crate::diff::DiffView),
+}
+
 /// 待用户裁决的确认
 pub struct PendingConfirm {
     pub tool_name: String,
-    pub args: String,
+    pub body: ConfirmBody,
+    /// bash 后台运行（无超时）：弹窗多一行附注
+    pub background: bool,
+    /// 升级确认的原因（不可逆命令：无视 AllowAll 必弹）；None = 普通确认
+    pub reason: Option<String>,
     pub reply: oneshot::Sender<ConfirmationDecision>,
 }
 
 impl PendingConfirm {
     pub(crate) fn from_dialog(dialog: ConfirmDialog) -> Self {
-        Self {
-            // 完整展示：用户必须能看到自己批准的全部内容（UI 负责折行与溢出提示）
-            args: match dialog.request.args.get("command").and_then(|c| c.as_str()) {
-                // bash：直接展示命令原文（保留换行）
-                Some(command) if dialog.request.tool_name == "bash" => command.to_string(),
-                _ => serde_json::to_string_pretty(&dialog.request.args)
-                    .unwrap_or_else(|_| dialog.request.args.to_string()),
+        let request = dialog.request;
+        let args = &request.args;
+        let is_bash = request.tool_name == "bash";
+        let background =
+            is_bash && args.get("run_in_background").and_then(|v| v.as_bool()) == Some(true);
+        // 完整展示：用户必须能看到自己批准的全部内容（UI 负责折行与溢出提示）
+        let body = match args.get("command").and_then(|c| c.as_str()) {
+            // bash：直接展示命令原文（保留换行）
+            Some(command) if is_bash => ConfirmBody::Text(command.to_string()),
+            _ => match crate::diff::DiffView::from_tool("", &request.tool_name, args, None) {
+                Some(view) => ConfirmBody::Diff(view),
+                None => ConfirmBody::Text(
+                    serde_json::to_string_pretty(args).unwrap_or_else(|_| args.to_string()),
+                ),
             },
-            tool_name: dialog.request.tool_name,
+        };
+        Self {
+            tool_name: request.tool_name,
+            body,
+            background,
+            reason: request.reason,
             reply: dialog.reply,
         }
     }

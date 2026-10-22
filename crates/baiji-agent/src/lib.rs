@@ -15,8 +15,8 @@ pub mod subagent;
 pub mod tool;
 
 pub use confirmation::{
-    Approver, AutoApprover, ConfirmationDecision, ConfirmationGate, ConfirmationRequest,
-    DenyAllApprover,
+    Approver, AutoApproveFn, AutoApprover, ConfirmationDecision, ConfirmationGate,
+    ConfirmationRequest, DenyAllApprover, EscalateFn,
 };
 pub use event::AgentEvent;
 pub use hooks::{Hook, HookDecision, HookRegistry};

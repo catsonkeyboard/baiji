@@ -45,11 +45,29 @@ pub struct Message {
 /// 「当前轮」的起点：最后一条 User 消息的下标。思考内容只在其后的工具循环内回传——
 /// 更早轮次的思考对模型无用，且部分厂商会因此报错（旧版 deepseek-reasoner 返回 400），
 /// 换模型后旧签名也会失效。
+///
+/// 紧跟在 Tool 结果之后的 User 消息（运行中的 steering、收尾/空响应/续写提示等请求副本
+/// 注入）不算新一轮：它们在 Anthropic 协议里会并入 tool_result 回合，请求仍处于工具循环
+/// 中——若把它们当作轮次起点，循环里 assistant 的思考块会被丢掉，开启 thinking 时被 API 拒绝。
 pub fn current_turn_start(messages: &[Message]) -> usize {
-    messages
-        .iter()
-        .rposition(|m| m.role == Role::User)
-        .unwrap_or(0)
+    let mut i = messages.len();
+    while i > 0 {
+        i -= 1;
+        if messages[i].role != Role::User {
+            continue;
+        }
+        // 这一串连续 User 消息的起点
+        let mut run_start = i;
+        while run_start > 0 && messages[run_start - 1].role == Role::User {
+            run_start -= 1;
+        }
+        if run_start > 0 && messages[run_start - 1].role == Role::Tool {
+            i = run_start;
+            continue;
+        }
+        return i;
+    }
+    0
 }
 
 impl Message {
@@ -228,10 +246,43 @@ pub struct ChatResponse {
 }
 
 /// Token 使用情况
+///
+/// `input_tokens` 已在各 provider 归一化为**本次请求的全部输入 token（含缓存命中）**：
+/// Anthropic 协议的 `input_tokens` 不含缓存部分，需加上 cache_read + cache_creation；
+/// OpenAI 协议的 `prompt_tokens` 本身已包含 cached_tokens，不能重复相加。
+/// 上下文占用估算（压缩锚点、ctx 显示）因此对两类协议口径一致。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// 其中命中 provider 前缀缓存的输入 token（未上报 = 0）
+    #[serde(default)]
+    pub cache_read_tokens: u32,
+    /// 其中写入缓存的输入 token（Anthropic cache_creation；未上报 = 0）
+    #[serde(default)]
+    pub cache_write_tokens: u32,
+}
+
+impl TokenUsage {
+    /// Anthropic 口径：input 不含缓存 → 归一化为总输入
+    pub fn from_anthropic(input: u32, output: u32, cache_read: u32, cache_write: u32) -> Self {
+        Self {
+            input_tokens: input.saturating_add(cache_read).saturating_add(cache_write),
+            output_tokens: output,
+            cache_read_tokens: cache_read,
+            cache_write_tokens: cache_write,
+        }
+    }
+
+    /// OpenAI 口径：prompt_tokens 已含 cached_tokens
+    pub fn from_openai(prompt: u32, completion: u32, cached: u32) -> Self {
+        Self {
+            input_tokens: prompt,
+            output_tokens: completion,
+            cache_read_tokens: cached.min(prompt),
+            cache_write_tokens: 0,
+        }
+    }
 }
 
 /// 模型停止生成的原因（各协议归一化）
@@ -295,6 +346,40 @@ pub enum StreamChunk {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tool_result_msg() -> Message {
+        Message {
+            role: Role::Tool,
+            content: String::new(),
+            tool_calls: None,
+            tool_results: Some(vec![ToolResult {
+                tool_call_id: "t".into(),
+                content: "r".into(),
+            }]),
+            reasoning: None,
+        }
+    }
+
+    #[test]
+    fn test_turn_start_skips_users_injected_inside_a_tool_loop() {
+        let msgs = vec![
+            Message::user("q1"),
+            Message::assistant("a1"),
+            Message::user("q2"),
+            Message::assistant(""),
+            tool_result_msg(),
+            Message::user("[system notice] empty response, continue"),
+            Message::user("steering"),
+        ];
+        // 注入的两条 User 跟在 Tool 之后：轮次起点仍是 q2
+        assert_eq!(current_turn_start(&msgs), 2);
+        // 普通新问题（跟在 assistant 最终回答之后）照常开启新一轮
+        let mut msgs = msgs;
+        msgs.push(Message::assistant("done"));
+        msgs.push(Message::user("q3"));
+        assert_eq!(current_turn_start(&msgs), 8);
+        assert_eq!(current_turn_start(&[]), 0);
+    }
 
     #[test]
     fn test_thinking_level_parse_and_mapping() {

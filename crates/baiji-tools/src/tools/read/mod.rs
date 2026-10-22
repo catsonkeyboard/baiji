@@ -341,6 +341,12 @@ impl AgentTool for ReadTool {
         "read"
     }
 
+    /// 只读；重读缓存是 std Mutex（只在同步的 cache_stub/cache_store 内短暂持锁，
+    /// 不跨 await），并发同参读取至多重复一次 spill（内容寻址、结果相同）：可同轮并发
+    fn parallel(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "Read files or directory structure. Modes: 'signatures' (symbol outline with line \
          numbers — best first look), 'map' (compact directory tree), 'full' (numbered lines, \

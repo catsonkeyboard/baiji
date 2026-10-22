@@ -6,7 +6,9 @@
 //! - 信息全部退到边缘一行（顶栏）与半行（状态栏），正文区零装饰
 //! - todo 清单悬浮在聊天区右上角，有任务时才出现
 
-use crate::app::{App, ChatLine};
+use crate::app::{App, ChatLine, ConfirmBody};
+use crate::i18n::{Lang, Strings};
+use crate::theme::Theme;
 use baiji_harness::TodoStatus;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -33,17 +35,20 @@ const LOGO: &[&str] = &[
 /// 渲染一帧。消耗 &mut App：滚动哨兵值在每帧渲染后钳制，帧计数驱动指示器动画。
 pub fn draw(frame: &mut Frame, app: &mut App) {
     app.bump_frame();
-    // [顶栏, 聊天区, 输入框, 状态栏]；斜杠补全在输入框内以灰色 ghost 呈现
+    // [顶栏, 聊天区, 输入框, 状态栏]；斜杠补全在输入框内以灰色 ghost 呈现。
+    // 输入框随内容增高（1..=8 行可见 + 上下边框），聊天区让出空间
+    let input_height = input_box_height(app, frame.area().width);
     let chunks = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(3),
-        Constraint::Length(3),
+        Constraint::Length(input_height),
         Constraint::Length(1),
     ])
     .split(frame.area());
 
     draw_header(frame, app, chunks[0]);
     let chat = chunks[1];
+    app.set_chat_viewport(chat.height); // PageUp/PageDown 翻页步长
     if app.is_fresh() {
         draw_welcome(frame, app, chat);
     } else {
@@ -131,9 +136,127 @@ fn kind_of(line: &ChatLine) -> u8 {
     match line {
         ChatLine::User(_) => 0,
         ChatLine::Assistant(_) => 1,
-        ChatLine::Tool(_) => 2,
+        ChatLine::Tool(_) | ChatLine::ToolCall { .. } | ChatLine::Diff(_) => 2,
         ChatLine::System(_) => 3,
     }
+}
+
+/// 聊天区渲染缓存：每个已落定的聊天行缓存其可视行（Markdown 解析、折行、diff 只做一次）。
+///
+/// 失效规则：
+/// - (宽度, 主题, 语言) 变化 → 整体清空（终端缩放 / 换肤）
+/// - 逐条比较源内容（字符串 memcmp 级开销）：行被替换、清空重建（会话切换/分叉）、
+///   原地修改（diff 被标记失败）都只重渲染变化的那几条
+/// - 进行中的思考与流式回答不入缓存，每帧重渲染
+#[derive(Default)]
+pub(crate) struct ChatCache {
+    key: Option<(usize, Theme, Lang)>,
+    entries: Vec<CachedEntry>,
+    /// 全部缓存行数（含组间空行）
+    total_rows: usize,
+    blank: Line<'static>,
+}
+
+struct CachedEntry {
+    source: ChatLine,
+    kind: u8,
+    rows: Vec<Line<'static>>,
+}
+
+impl ChatCache {
+    /// 与当前聊天行对齐：只重渲染新增或变化的条目
+    pub(crate) fn sync(
+        &mut self,
+        lines: &[ChatLine],
+        width: usize,
+        theme: &Theme,
+        strings: &Strings,
+    ) {
+        let key = (width, *theme, strings.lang);
+        if self.key != Some(key) {
+            self.entries.clear();
+            self.key = Some(key);
+        }
+        self.entries.truncate(lines.len());
+        for (i, line) in lines.iter().enumerate() {
+            if self.entries.get(i).is_some_and(|e| e.source == *line) {
+                continue;
+            }
+            let entry = CachedEntry {
+                source: line.clone(),
+                kind: kind_of(line),
+                rows: entry_rows(line, width, theme, strings),
+            };
+            if i < self.entries.len() {
+                self.entries[i] = entry;
+            } else {
+                self.entries.push(entry);
+            }
+        }
+        let mut total = 0;
+        let mut prev: Option<u8> = None;
+        for entry in &self.entries {
+            if prev.is_some_and(|p| p != entry.kind) {
+                total += 1;
+            }
+            prev = Some(entry.kind);
+            total += entry.rows.len();
+        }
+        self.total_rows = total;
+    }
+
+    pub(crate) fn total_rows(&self) -> usize {
+        self.total_rows
+    }
+
+    /// 全部缓存行（不同类的条目之间插空行）；调用方只克隆可见窗口
+    pub(crate) fn rows(&self) -> impl Iterator<Item = &Line<'static>> + '_ {
+        let mut prev: Option<u8> = None;
+        let blank = &self.blank;
+        self.entries.iter().flat_map(move |entry| {
+            let sep = prev.is_some_and(|p| p != entry.kind);
+            prev = Some(entry.kind);
+            sep.then_some(blank).into_iter().chain(entry.rows.iter())
+        })
+    }
+}
+
+/// 单个聊天行的可视行（至少一行，保证分组空行计数稳定）
+fn entry_rows(
+    line: &ChatLine,
+    width: usize,
+    theme: &Theme,
+    strings: &Strings,
+) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(theme.system);
+    let mut rows = match line {
+        ChatLine::User(s) => user_rows(s, width, theme),
+        ChatLine::Assistant(s) => crate::markdown::render(s, width, theme),
+        ChatLine::Tool(s) | ChatLine::ToolCall { text: s, .. } => tool_rows(s, width, theme),
+        // diff 块与 ⎿ 结果行同样缩进 2 列，挂在 ● 行之下
+        ChatLine::Diff(view) => crate::diff::render(
+            view,
+            width.saturating_sub(2),
+            theme,
+            strings,
+            crate::diff::DiffStyle { wrap: false },
+        )
+        .into_iter()
+        .map(|row| {
+            let mut spans = vec![Span::raw("  ")];
+            spans.extend(row.spans);
+            Line::from(spans)
+        })
+        .collect(),
+        ChatLine::System(s) => wrap_by_width(s, width)
+            .into_iter()
+            .map(|row| Line::styled(row, dim.add_modifier(Modifier::ITALIC)))
+            .collect(),
+    };
+    if rows.is_empty() {
+        rows.push(Line::default());
+    }
+    rows
 }
 
 /// 用户消息：`❯ ` 加粗前缀 + 整行底色条（首行文本区宽 = width-2，续行悬挂缩进对齐）
@@ -158,47 +281,66 @@ fn user_rows(content: &str, width: usize, theme: &crate::theme::Theme) -> Vec<Li
 }
 
 /// 工具活动行：
-/// - `● Name(args)`：点亮色圆点 + 加粗名字 + 默认色参数（Claude Code 树形）
-/// - `⎿ …`：结果行缩进 2 列暗色（`⎿ ✗` 失败为错误色），续行对齐内容
+/// - `● Name(摘要)`：点亮色圆点 + 加粗名字 + 默认色摘要，单行；
+///   摘要超宽时按显示宽度中间省略（长命令/路径保留头尾）
+/// - `⎿ …`：结果行缩进 2 列暗色单行；`⎿ ✗` 失败为错误色，折行至多 3 行（错误值得看全）
 fn tool_rows(content: &str, width: usize, theme: &crate::theme::Theme) -> Vec<Line<'static>> {
+    use crate::tool_display::{truncate_end_display, truncate_middle_display};
     let dim = Style::default().fg(theme.system);
-    if content.starts_with("● ") {
-        let wrapped = wrap_by_width(content, width);
-        let mut out = Vec::new();
-        for (i, row) in wrapped.iter().enumerate() {
-            if i == 0 {
-                let rest = row.strip_prefix("● ").unwrap_or(row.as_str());
-                let (name, tail) = match rest.split_once('(') {
-                    Some((n, t)) => (n, format!("({t}")),
-                    None => (rest, String::new()),
-                };
-                let mut spans = vec![
-                    Span::styled("● ", Style::default().fg(theme.tool)),
-                    Span::styled(
-                        name.to_string(),
-                        Style::default().fg(theme.user).add_modifier(Modifier::BOLD),
-                    ),
-                ];
-                if !tail.is_empty() {
-                    spans.push(Span::styled(tail, Style::default()));
-                }
-                out.push(Line::from(spans));
-            } else {
-                out.push(Line::styled(row.clone(), Style::default()));
-            }
+    let content = crate::markdown::sanitize(content);
+    if let Some(rest) = content.strip_prefix("● ") {
+        let (name, args) = match rest.split_once('(') {
+            Some((n, t)) => (n, Some(t.strip_suffix(')').unwrap_or(t))),
+            None => (rest, None),
+        };
+        let mut spans = vec![
+            Span::styled("● ", Style::default().fg(theme.tool)),
+            Span::styled(
+                name.to_string(),
+                Style::default().fg(theme.user).add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if let Some(args) = args {
+            let budget = width.saturating_sub(display_width(name) + 4);
+            spans.push(Span::styled(
+                format!("({})", truncate_middle_display(args, budget)),
+                Style::default(),
+            ));
         }
-        return out;
+        return vec![Line::from(spans)];
     }
-    let error = content.starts_with("⎿ ✗");
-    let style = if error {
-        Style::default().fg(theme.error)
-    } else {
-        dim
-    };
-    wrap_by_width_indented(&format!("  {content}"), width, "    ")
-        .into_iter()
-        .map(|row| Line::styled(row, style))
-        .collect()
+    if let Some(message) = content.strip_prefix("⎿ ✗") {
+        const MAX_ERROR_ROWS: usize = 3;
+        // `  ⎿ ✗ ` 占 6 列：按词折行，续行悬挂对齐到消息正文
+        const LEAD: &str = "  ⎿ ✗ ";
+        let indent = " ".repeat(display_width(LEAD));
+        let style = Style::default().fg(theme.error);
+        let wrapped = crate::markdown::wrap_spans(
+            &[Span::raw(message.trim_start().to_string())],
+            width.saturating_sub(indent.len()),
+        );
+        let mut rows: Vec<String> = wrapped
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let text: String = row.iter().map(|s| s.content.as_ref()).collect();
+                format!("{}{text}", if i == 0 { LEAD } else { indent.as_str() })
+            })
+            .collect();
+        if rows.len() > MAX_ERROR_ROWS {
+            rows.truncate(MAX_ERROR_ROWS);
+            let last = format!("{}…", rows[MAX_ERROR_ROWS - 1]);
+            rows[MAX_ERROR_ROWS - 1] = truncate_end_display(&last, width);
+        }
+        return rows
+            .into_iter()
+            .map(|row| Line::styled(row, style))
+            .collect();
+    }
+    vec![Line::styled(
+        truncate_end_display(&format!("  {content}"), width),
+        dim,
+    )]
 }
 
 /// 用空格补齐到目标显示宽度（已超出则原样返回）
@@ -211,10 +353,11 @@ fn pad_to_width(s: &str, target: usize) -> String {
 }
 
 /// 聊天区：无边框、水平留白 2 列。消息样式 —
-/// 用户 `❯ ` 加粗 + 整行底色条 / 助手正文灰 / 工具 `● Name(args)` 点亮名粗、
-/// `⎿` 结果缩进暗色 / 系统行暗斜体
+/// 用户 `❯ ` 加粗 + 整行底色条 / 助手正文 Markdown（基色灰）/ 工具 `● Name(摘要)`
+/// 点亮名粗、edit/write 内联 diff、`⎿` 结果缩进暗色 / 系统行暗斜体
 fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme();
+    let strings = *app.strings();
     let dim = Style::default().fg(theme.system);
     let block = Block::new().padding(Padding::horizontal(2));
     let inner = block.inner(area);
@@ -223,57 +366,38 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
     // 自行按显示宽度折行成「可视行」：
     // - 消息里的换行得以保留（Line 不能含 '\n'，否则代码块会被压成一行）
     // - CJK 按 2 列计宽，行数精确 → 滚动范围精确，长中文回复能滚到底
-    let mut rows: Vec<Line> = Vec::new();
-    let mut prev_kind: Option<u8> = None;
-    for line in app.lines() {
-        let kind = kind_of(line);
-        if !rows.is_empty() && prev_kind != Some(kind) {
-            rows.push(Line::from(""));
-        }
-        prev_kind = Some(kind);
-        match line {
-            ChatLine::User(s) => rows.extend(user_rows(s, width, &theme)),
-            ChatLine::Assistant(s) => rows.extend(
-                wrap_by_width(s, width)
-                    .into_iter()
-                    .map(|row| Line::styled(row, Style::default().fg(theme.assistant))),
-            ),
-            ChatLine::Tool(s) => rows.extend(tool_rows(s, width, &theme)),
-            ChatLine::System(s) => rows.extend(
-                wrap_by_width(s, width)
-                    .into_iter()
-                    .map(|row| Line::styled(row, dim.add_modifier(Modifier::ITALIC))),
-            ),
-        }
-    }
+    // 已落定的历史走渲染缓存；进行中的思考与流式回答（尾部）每帧重渲染
+    let mut tail: Vec<Line<'static>> = Vec::new();
+    let has_history = !app.lines().is_empty();
     // 进行中的思考（暗色斜体）：全文进入行流，与回答正文共用贴底滚动——
     // 旧实现是 400 字符固定尾部窗口，前沿不断消失像"收缩"而非滚动
     let thinking = app.thinking();
     if !thinking.trim().is_empty() {
-        if !rows.is_empty() {
-            rows.push(Line::from(""));
+        if has_history {
+            tail.push(Line::from(""));
         }
         let style = dim.add_modifier(Modifier::ITALIC);
-        rows.extend(
+        tail.extend(
             wrap_by_width(&format!("✻ {thinking}"), width)
                 .into_iter()
                 .map(|row| Line::styled(row, style)),
         );
     }
-    // 流式中的部分回答
+    // 流式中的部分回答（Markdown；未闭合的围栏按代码块渲染）
     if !app.streaming().is_empty() {
-        if !rows.is_empty() {
-            rows.push(Line::from(""));
+        if has_history || !tail.is_empty() {
+            tail.push(Line::from(""));
         }
-        rows.extend(
-            wrap_by_width(app.streaming(), width)
-                .into_iter()
-                .map(|row| Line::styled(row, Style::default().fg(theme.assistant))),
-        );
+        tail.extend(crate::markdown::render(app.streaming(), width, &theme));
     }
 
+    let history_rows = {
+        let (lines, cache) = app.chat_view();
+        cache.sync(lines, width, &theme, &strings);
+        cache.total_rows()
+    };
     let visible = inner.height as usize;
-    let max_scroll = rows.len().saturating_sub(visible);
+    let max_scroll = (history_rows + tail.len()).saturating_sub(visible);
 
     // 哨兵 usize::MAX = 贴底
     if app.scroll() > max_scroll {
@@ -281,8 +405,15 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     let scroll = app.scroll().min(max_scroll);
 
-    // 只渲染可见窗口（Paragraph::scroll 是 u16，长会话会溢出；也省去整段重排）
-    let window: Vec<Line> = rows.into_iter().skip(scroll).take(visible).collect();
+    // 只克隆可见窗口（Paragraph::scroll 是 u16，长会话会溢出；也省去整段重排）
+    let (_, cache) = app.chat_view();
+    let window: Vec<Line> = cache
+        .rows()
+        .chain(tail.iter())
+        .skip(scroll)
+        .take(visible)
+        .cloned()
+        .collect();
     frame.render_widget(Paragraph::new(Text::from(window)).block(block), area);
 
     if max_scroll > 0 {
@@ -396,10 +527,22 @@ fn draw_todo_panel(frame: &mut Frame, app: &App, chat: Rect) {
     );
 }
 
-/// 输入框：圆角边框 + `> ` 提示符；厂商·模型退到右下角边框标题。
-/// 命令输入态在光标后以灰色 ghost 展示首个匹配命令的余下部分（Tab 接受）；
-/// 运行中边框转强调色，顶边提示 steering 语义
-fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
+/// 输入框文本区宽度：终端宽 − 左右边框 2 − 提示符 2
+fn input_text_width(total_width: u16) -> usize {
+    total_width.saturating_sub(4).max(1) as usize
+}
+
+/// 输入框总高度：可视行数（1..=MAX_INPUT_ROWS）+ 上下边框
+fn input_box_height(app: &App, total_width: u16) -> u16 {
+    let rows = crate::app::input_layout(app.input(), input_text_width(total_width)).len();
+    rows.clamp(1, crate::app::MAX_INPUT_ROWS) as u16 + 2
+}
+
+/// 输入框：圆角边框 + `> ` 提示符（续行 2 列缩进对齐）；厂商·模型退到右下角边框标题。
+/// 多行内容按显示宽度折行，超过 8 行时滚动并保持光标可见；真实终端光标落在编辑位置。
+/// 单行 `/` 命令输入态在文本后以灰色 ghost 展示首个匹配命令的余下部分（Tab 接受）；
+/// ≥5 行粘贴的占位符高亮显示；运行中边框转强调色，顶边提示 steering 语义
+fn draw_input(frame: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme();
     let dim = Style::default().fg(theme.system);
     let running = app.agent_running();
@@ -427,26 +570,72 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         };
         block = block.title_top(Line::styled(tip, Style::default().fg(theme.accent)));
     }
+    let inner = block.inner(area);
+    let width = input_text_width(area.width);
+    let visible = (inner.height as usize).max(1);
 
-    let mut spans = vec![Span::styled(
-        "> ",
-        Style::default()
-            .fg(theme.accent)
-            .add_modifier(Modifier::BOLD),
-    )];
-    if app.input().is_empty() {
-        spans.push(Span::styled(app.strings().input_placeholder, dim));
-    }
-    let app_input = app.input().to_string();
-    spans.push(Span::raw(app_input.clone()));
-    // ghost 显示时不再画 ▏ 光标符——补全与已输入文本的颜色边界即光标位置
-    //（避免"输入与补全之间隔了一个字符"的观感）；无补全时 ▏ 指示光标
-    match input_ghost(app, &app_input, area.width.saturating_sub(6) as usize) {
-        Some(ghost) => spans.push(Span::styled(ghost, dim)),
-        None => spans.push(Span::raw("▏")),
-    }
+    let prompt_style = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let text = app.input().to_string();
+    let rows = crate::app::input_layout(&text, width);
+    let (cursor_row, cursor_col) =
+        crate::app::input_cursor(&text, &rows, app.input_buffer().cursor());
 
-    frame.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
+    // 视口：光标越出时最小幅度滚动（保持稳定，不随每次移动跳动）
+    let mut top = app.input_scroll().min(rows.len().saturating_sub(visible));
+    if cursor_row < top {
+        top = cursor_row;
+    } else if cursor_row >= top + visible {
+        top = cursor_row + 1 - visible;
+    }
+    app.set_input_view(top, width);
+
+    let placeholders = app.input_buffer().placeholder_ranges();
+    let token_style = Style::default().fg(theme.tool).add_modifier(Modifier::BOLD);
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, row) in rows.iter().enumerate().skip(top).take(visible) {
+        let mut spans = vec![if i == 0 {
+            Span::styled("> ", prompt_style)
+        } else {
+            Span::raw("  ")
+        }];
+        if text.is_empty() {
+            spans.push(Span::styled(app.strings().input_placeholder, dim));
+        }
+        // 行内按占位符区间切段：占位符高亮，其余原样
+        let mut pos = row.start;
+        for &(start, end) in &placeholders {
+            if end <= pos || start >= row.end {
+                continue;
+            }
+            let (s, e) = (start.max(pos), end.min(row.end));
+            if s > pos {
+                spans.push(Span::raw(text[pos..s].to_string()));
+            }
+            spans.push(Span::styled(text[s..e].to_string(), token_style));
+            pos = e;
+        }
+        if pos < row.end {
+            spans.push(Span::raw(text[pos..row.end].to_string()));
+        }
+        // 单行命令输入态：ghost 紧跟已输入文本（颜色边界即补全起点）
+        if i + 1 == rows.len() && rows.len() == 1 {
+            let used = crate::app::input_display_width(&text);
+            if let Some(ghost) = input_ghost(app, &text, width.saturating_sub(used + 1)) {
+                spans.push(Span::styled(ghost, dim));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+
+    // 覆盖层打开时光标交给覆盖层（不显示 = ratatui 隐藏光标）
+    if !app.overlay_active() && inner.width > 0 && inner.height > 0 {
+        let x = inner.x + (2 + cursor_col).min(inner.width.saturating_sub(1) as usize) as u16;
+        let y = inner.y + (cursor_row - top).min(visible - 1) as u16;
+        frame.set_cursor_position(ratatui::layout::Position::new(x, y));
+    }
 }
 
 /// 输入框灰色补全文本：
@@ -519,49 +708,77 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(right).right_aligned(), cols[1]);
 }
 
-/// HITL 确认对话框：居中弹窗，完整展示待执行内容（按显示宽度折行）。
+/// HITL 确认对话框：居中弹窗，完整展示待执行内容（按显示宽度折行）——
+/// bash 命令原文（保留换行）/ edit·write 的完整 diff（不截断）/ 其它工具 pretty JSON。
 /// 放不下时明确标出被隐藏的行数——用户不会在不知情的情况下批准看不到的内容。
 fn draw_confirm(frame: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme();
+    let strings = app.strings();
     let Some(pending) = app.pending_confirm() else {
         return;
     };
     let popup = centered_rect(area, 90, 70);
     let inner_width = popup.width.saturating_sub(2).max(1) as usize;
-    // 边框 2 行 + 标题行 + 操作提示行
-    let body_height = popup.height.saturating_sub(4) as usize;
-
-    let wrapped = wrap_by_width(&pending.args, inner_width);
-    let hidden = wrapped.len().saturating_sub(body_height);
     let warn = Style::default()
         .fg(theme.error)
         .add_modifier(Modifier::BOLD);
 
+    // 正文上方的标题与附注行（每条一行）；新增附注（如升级确认的原因）在此 push 即可，
+    // 正文高度自动让出
     let mut lines = vec![Line::styled(
-        crate::i18n::fill(app.strings().confirm_warn_tpl, &[&pending.tool_name]),
+        crate::i18n::fill(strings.confirm_warn_tpl, &[&pending.tool_name]),
         warn,
     )];
-    if hidden > 0 {
+    if pending.background {
+        lines.push(Line::styled(
+            format!("↳ {}", strings.confirm_bg_note),
+            Style::default().fg(theme.accent),
+        ));
+    }
+    // 升级原因（不可逆命令）：逐行折行展示，`a` 在这里只算本次允许
+    if let Some(reason) = &pending.reason {
+        lines.push(Line::styled(strings.confirm_reason_title.to_string(), warn));
+        for line in reason.lines().filter(|l| !l.trim().is_empty()) {
+            for row in wrap_by_width(&format!("  {line}"), inner_width) {
+                lines.push(Line::styled(row, Style::default().fg(theme.error)));
+            }
+        }
+    }
+
+    let body: Vec<Line<'static>> = match &pending.body {
+        ConfirmBody::Text(text) => wrap_by_width(text, inner_width)
+            .into_iter()
+            .map(Line::raw)
+            .collect(),
+        ConfirmBody::Diff(view) => crate::diff::render(
+            view,
+            inner_width,
+            &theme,
+            strings,
+            crate::diff::DiffStyle { wrap: true },
+        ),
+    };
+    // 边框 2 行 + 标题/附注行 + 操作提示行
+    let body_height = (popup.height as usize).saturating_sub(2 + lines.len() + 1);
+    let total = body.len();
+    if total > body_height {
         // 留一行给溢出提示
         let shown = body_height.saturating_sub(1);
-        lines.extend(wrapped.iter().take(shown).cloned().map(Line::raw));
+        lines.extend(body.into_iter().take(shown));
         lines.push(Line::styled(
-            crate::i18n::fill(
-                app.strings().confirm_hidden_tpl,
-                &[&(wrapped.len() - shown)],
-            ),
+            crate::i18n::fill(strings.confirm_hidden_tpl, &[&(total - shown)]),
             warn,
         ));
     } else {
-        lines.extend(wrapped.into_iter().map(Line::raw));
+        lines.extend(body);
     }
-    lines.push(Line::styled(app.strings().confirm_keys, warn));
+    lines.push(Line::styled(strings.confirm_keys, warn));
 
     let widget = Paragraph::new(lines).block(
         Block::new()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .title(" Confirm execution? ")
+            .title(strings.confirm_title)
             .border_style(Style::default().fg(theme.error)),
     );
     frame.render_widget(Clear, popup);
@@ -749,9 +966,10 @@ fn draw_wizard(frame: &mut Frame, app: &App) {
             let Some(prompt) = app.wizard_input_prompt() else {
                 return;
             };
+            let (before, after) = app.input().split_at(app.input_buffer().cursor());
             let paragraph = Paragraph::new(vec![
                 Line::styled(prompt.clone(), Style::default().fg(theme.tool)),
-                Line::from(format!("{}▏", app.input())),
+                Line::from(format!("{before}▏{after}")),
             ])
             .block(
                 Block::new()
@@ -824,6 +1042,86 @@ mod tests {
     fn test_display_width_cjk() {
         assert_eq!(display_width("abc"), 3);
         assert_eq!(display_width("你好"), 4);
+    }
+
+    #[test]
+    fn test_chat_cache_reuse_and_invalidation() {
+        let dark = Theme::dark();
+        let strings = Strings::en();
+        let mut lines = vec![ChatLine::user("hi"), ChatLine::assistant("**a** b")];
+        let mut cache = ChatCache::default();
+        cache.sync(&lines, 40, &dark, &strings);
+        // 用户行 + 组间空行 + 助手行
+        assert_eq!(cache.total_rows(), 3);
+        let rendered = cache.entries[1].rows.as_ptr();
+
+        // 追加条目：已有条目不重渲染（同一份缓存行）
+        lines.push(ChatLine::Tool("● read(a.rs)".into()));
+        lines.push(ChatLine::Tool("⎿ 10 lines".into()));
+        cache.sync(&lines, 40, &dark, &strings);
+        assert_eq!(cache.entries[1].rows.as_ptr(), rendered);
+        // 同组（工具）之间不插空行
+        assert_eq!(cache.total_rows(), 6);
+        assert_eq!(cache.rows().count(), cache.total_rows());
+
+        // 原地修改：只有该条重渲染
+        lines[2] = ChatLine::Tool("● read(b.rs)".into());
+        cache.sync(&lines, 40, &dark, &strings);
+        assert_eq!(cache.entries[1].rows.as_ptr(), rendered);
+        let text: String = cache.entries[2].rows[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains("b.rs"));
+
+        // 换肤：整体失效，样式跟随新主题
+        let light = Theme::light();
+        cache.sync(&lines, 40, &light, &strings);
+        assert_eq!(cache.entries[1].rows[0].spans[0].style.fg, Some(light.user));
+
+        // 缩窄：重新折行
+        lines.push(ChatLine::assistant("one two three four five six"));
+        cache.sync(&lines, 40, &light, &strings);
+        assert_eq!(cache.entries[4].rows.len(), 1);
+        cache.sync(&lines, 10, &light, &strings);
+        assert!(cache.entries[4].rows.len() > 1);
+
+        // 清空后重建（会话切换）：条目截断
+        lines.truncate(1);
+        cache.sync(&lines, 10, &light, &strings);
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.total_rows(), 1);
+    }
+
+    #[test]
+    fn test_tool_rows_truncate_and_errors() {
+        let theme = Theme::dark();
+        let text = |lines: &[Line]| -> Vec<String> {
+            lines
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect()
+        };
+        // ● 行单行、中间省略，宽度不超
+        let rows = tool_rows(&format!("● bash($ {}tail)", "a".repeat(100)), 30, &theme);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].width() <= 30);
+        let row = &text(&rows)[0];
+        assert!(
+            row.starts_with("● bash($ a") && row.ends_with("tail)"),
+            "{row}"
+        );
+        // 成功结果单行截断；失败结果折行至多 3 行
+        let rows = tool_rows(&format!("⎿ {}", "b".repeat(100)), 30, &theme);
+        assert_eq!(rows.len(), 1);
+        assert!(text(&rows)[0].ends_with('…'));
+        let rows = tool_rows(&format!("⎿ ✗ {}", "c".repeat(200)), 30, &theme);
+        assert_eq!(rows.len(), 3);
+        assert!(text(&rows)[2].ends_with('…'));
+        assert_eq!(rows[0].style.fg, Some(theme.error));
+        // 名字之外无括号：不画参数
+        assert_eq!(text(&tool_rows("● now", 30, &theme)), vec!["● now"]);
     }
 
     #[test]

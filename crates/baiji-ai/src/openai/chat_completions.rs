@@ -101,7 +101,10 @@ pub fn build_request(model: &str, request: &ChatRequest, stream: bool) -> ChatCo
                     function: FunctionDef {
                         name: t.name.clone(),
                         description: t.description.clone(),
-                        parameters: t.parameters.clone(),
+                        parameters: crate::schema::normalize(
+                            &t.parameters,
+                            &crate::schema::OPENAI_COMPATIBLE,
+                        ),
                     },
                 })
                 .collect()
@@ -239,6 +242,37 @@ pub struct Usage {
     pub prompt_tokens: u32,
     #[serde(default)]
     pub completion_tokens: u32,
+    /// OpenAI：prompt_tokens_details.cached_tokens
+    #[serde(default)]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+    /// DeepSeek：prompt_cache_hit_tokens
+    #[serde(default)]
+    pub prompt_cache_hit_tokens: Option<u32>,
+    /// Kimi 等：顶层 cached_tokens
+    #[serde(default)]
+    pub cached_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: Option<u32>,
+}
+
+impl Usage {
+    /// 各厂商缓存命中字段的并集（prompt_tokens 已包含缓存部分）
+    fn cached(&self) -> u32 {
+        self.prompt_tokens_details
+            .as_ref()
+            .and_then(|d| d.cached_tokens)
+            .or(self.prompt_cache_hit_tokens)
+            .or(self.cached_tokens)
+            .unwrap_or(0)
+    }
+
+    fn to_token_usage(&self) -> TokenUsage {
+        TokenUsage::from_openai(self.prompt_tokens, self.completion_tokens, self.cached())
+    }
 }
 
 pub fn parse_response(resp: ChatCompletionsResponse) -> ChatResponse {
@@ -275,10 +309,7 @@ pub fn parse_response(resp: ChatCompletionsResponse) -> ChatResponse {
         } else {
             Some(tool_calls)
         },
-        usage: resp.usage.map(|u| TokenUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-        }),
+        usage: resp.usage.as_ref().map(Usage::to_token_usage),
     }
 }
 
@@ -335,10 +366,7 @@ impl ChatStreamState {
         }
 
         if let Some(usage) = chunk.usage {
-            self.usage = Some(TokenUsage {
-                input_tokens: usage.prompt_tokens,
-                output_tokens: usage.completion_tokens,
-            });
+            self.usage = Some(usage.to_token_usage());
         }
 
         let mut out = Vec::new();
@@ -442,17 +470,9 @@ struct ChatStreamChunk {
     choices: Vec<StreamChoice>,
     /// include_usage 时末尾 chunk 携带（此时 choices 为空）
     #[serde(default)]
-    usage: Option<StreamUsage>,
+    usage: Option<Usage>,
     #[serde(default)]
     error: Option<ApiError>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StreamUsage {
-    #[serde(default)]
-    prompt_tokens: u32,
-    #[serde(default)]
-    completion_tokens: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -757,11 +777,36 @@ mod tests {
             vec![
                 StreamChunk::Usage(TokenUsage {
                     input_tokens: 900,
-                    output_tokens: 30
+                    output_tokens: 30,
+                    ..Default::default()
                 }),
                 StreamChunk::Done
             ]
         );
+    }
+
+    #[test]
+    fn test_stream_usage_reads_cached_tokens_per_vendor() {
+        // prompt_tokens 已含缓存：input 不变，cache_read 取各厂商字段
+        for usage in [
+            r#"{"prompt_tokens":1000,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":800}}"#,
+            r#"{"prompt_tokens":1000,"completion_tokens":5,"prompt_cache_hit_tokens":800,"prompt_cache_miss_tokens":200}"#,
+            r#"{"prompt_tokens":1000,"completion_tokens":5,"cached_tokens":800}"#,
+        ] {
+            let mut state = ChatStreamState::default();
+            state.process_data(&format!(r#"{{"choices":[],"usage":{usage}}}"#));
+            let chunks = state.process_data("[DONE]");
+            assert_eq!(
+                chunks[0],
+                StreamChunk::Usage(TokenUsage {
+                    input_tokens: 1000,
+                    output_tokens: 5,
+                    cache_read_tokens: 800,
+                    cache_write_tokens: 0,
+                }),
+                "{usage}"
+            );
+        }
     }
 
     #[test]

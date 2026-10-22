@@ -49,12 +49,15 @@ pub async fn run_once(
     let printer = tokio::spawn(async move {
         use std::io::Write as _;
         let mut denied = 0usize;
+        let mut by_user = 0usize;
         let mut turns = 0u32;
         while let Some(event) = rx.recv().await {
             if let AgentEvent::ToolFinished { output, .. } = &event
                 && output.starts_with("[Denied")
             {
                 denied += 1;
+                // HITL 拒绝（-y 可放行）与 hook/安全规则拦截（-y 也放不行）分开提示
+                by_user += usize::from(output.starts_with("[Denied by user]"));
             }
             if matches!(event, AgentEvent::TurnStarted { .. }) {
                 turns += 1;
@@ -68,7 +71,7 @@ pub async fn run_once(
                     let _ = std::io::stdout().flush();
                 }
                 AgentEvent::StreamRestarted => {
-                    eprintln!("\n[retrying — the partial answer above is discarded]");
+                    eprintln!("\n[stream reset — the partial text above is discarded]");
                 }
                 AgentEvent::ToolStarted { name, .. } => {
                     eprintln!("→ {name}");
@@ -91,22 +94,28 @@ pub async fn run_once(
                 _ => {}
             }
         }
-        (denied, turns)
+        (denied, by_user, turns)
     });
 
     let result = harness
         .run(input, &tx, &cancel, &SteeringQueue::new())
         .await;
     drop(tx);
-    let (denied_tools, turns) = printer.await.unwrap_or((0, 0));
+    let (denied_tools, denied_by_user, turns) = printer.await.unwrap_or((0, 0, 0));
 
     if !quiet && result.is_ok() {
         // 流式答案收尾换行
         println!();
     }
-    if !quiet && denied_tools > 0 {
+    if !quiet && denied_by_user > 0 {
         eprintln!(
-            "[warning] {denied_tools} tool call(s) were denied (headless 默认拒绝需确认的工具；加 -y 放行)"
+            "[warning] {denied_by_user} tool call(s) were denied (headless 默认拒绝需确认的工具；加 -y 放行)"
+        );
+    }
+    if !quiet && denied_tools > denied_by_user {
+        eprintln!(
+            "[warning] {} tool call(s) were blocked by safety rules / hooks (not unlockable with -y)",
+            denied_tools - denied_by_user
         );
     }
     Ok(Outcome {
